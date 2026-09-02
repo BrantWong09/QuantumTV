@@ -82,6 +82,8 @@ async fn main() {
         .route("/api/proxy/ts", get(proxy_ts_handler))
         // Spider JAR 代理路由
         .route("/api/proxy/spider.jar", get(proxy_spider_jar_handler))
+        // 搜索端点（Spider 站点搜索）
+        .route("/api/search", get(tvbox::search_handler))
         .layer(cors)
         // 5. 注入状态
         .with_state(state);

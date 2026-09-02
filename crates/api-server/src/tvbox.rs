@@ -1047,3 +1047,54 @@ pub async fn proxy_spider_jar_handler(State(state): State<AppState>) -> impl Int
         )
     }
 }
+
+// ================== 搜索端点 ==================
+
+#[derive(Deserialize)]
+pub struct SearchParams {
+    site_key: String,
+    query: String,
+}
+
+#[derive(Serialize)]
+pub struct SearchResponse {
+    results: Vec<SearchResultItem>,
+    java_available: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SearchResultItem {
+    vod_id: i64,
+    vod_name: String,
+    vod_pic: String,
+    #[serde(default)]
+    vod_year: String,
+    #[serde(default)]
+    vod_remarks: String,
+    #[serde(default)]
+    vod_play_url: String,
+}
+
+fn check_java_available() -> bool {
+    std::process::Command::new("java")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub async fn search_handler(Query(params): Query<SearchParams>) -> Json<SearchResponse> {
+    let java_available = check_java_available();
+
+    if !java_available {
+        return Json(SearchResponse {
+            results: vec![],
+            java_available: false,
+        });
+    }
+
+    Json(SearchResponse {
+        results: vec![],
+        java_available: true,
+    })
+}
