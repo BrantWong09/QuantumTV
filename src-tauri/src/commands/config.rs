@@ -267,7 +267,7 @@ pub(crate) fn persist_source_config_values(
                 site_type: normalized
                     .get("site_type")
                     .and_then(|value| value.as_i64())
-                    .unwrap_or(0) as i32,
+                    .unwrap_or(1) as i32,
                 spider: normalized
                     .get("spider")
                     .and_then(|value| value.as_str())

@@ -191,8 +191,8 @@ pub fn init_db(app: &tauri::AppHandle) -> Connection {
             sort_order INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
-            site_type INTEGER NOT NULL DEFAULT 0,
-            spider TEXT,
+            site_type INTEGER NOT NULL DEFAULT 1,
+            spider TEXT NOT NULL DEFAULT '',
             searchable INTEGER NOT NULL DEFAULT 1
         );
 
@@ -287,8 +287,8 @@ pub fn init_db(app: &tauri::AppHandle) -> Connection {
         if !has_site_type_column {
             conn.execute_batch(
                 r#"
-                ALTER TABLE video_sources ADD COLUMN site_type INTEGER NOT NULL DEFAULT 0;
-                ALTER TABLE video_sources ADD COLUMN spider TEXT;
+                ALTER TABLE video_sources ADD COLUMN site_type INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE video_sources ADD COLUMN spider TEXT NOT NULL DEFAULT '';
                 ALTER TABLE video_sources ADD COLUMN searchable INTEGER NOT NULL DEFAULT 1;
                 "#,
             )
