@@ -89,6 +89,9 @@ pub enum Type {
     Movie,
     TV,
 }
+fn default_site_type() -> i32 { 1 }
+fn default_searchable() -> i32 { 1 }
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SourceConfig {
     pub key: String,
@@ -98,11 +101,11 @@ pub struct SourceConfig {
     pub from: From,
     pub disabled: bool,
     pub is_adult: bool,
-    #[serde(default)]
+    #[serde(default = "default_site_type")]
     pub site_type: i32,
     #[serde(default)]
     pub spider: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_searchable")]
     pub searchable: i32,
 }
 #[derive(Debug, Serialize, Deserialize)]
