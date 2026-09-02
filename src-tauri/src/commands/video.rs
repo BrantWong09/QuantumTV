@@ -1182,14 +1182,29 @@ pub(crate) async fn search_with_cache_hit(
 
         let handle = tokio::spawn(async move {
             let _permit = semaphore.acquire().await.ok()?;
-            let url = format!(
-                "{}?ac=videolist&wd={}",
-                site_clone.api,
-                urlencoding::encode(&query)
-            );
+            
+            // Route search based on site_type
+            let search_url = if site_clone.site_type.unwrap_or(1) == 3 {
+                // Spider site: route through API Server
+                if site_clone.searchable.unwrap_or(1) != 1 {
+                    return None; // Skip non-searchable sites
+                }
+                format!(
+                    "http://127.0.0.1:3000/api/search?site_key={}&query={}",
+                    urlencoding::encode(&site_clone.key),
+                    urlencoding::encode(&query)
+                )
+            } else {
+                // CMS site: direct API call
+                format!(
+                    "{}?ac=videolist&wd={}",
+                    site_clone.api,
+                    urlencoding::encode(&query)
+                )
+            };
 
             // 单个源请求超时 6 秒
-            let resp = match timeout(Duration::from_secs(6), client.get(&url).send()).await {
+            let resp = match timeout(Duration::from_secs(6), client.get(&search_url).send()).await {
                 Ok(Ok(res)) if res.status().is_success() => res,
                 _ => {
                     // 如果启用了流式搜索，即使失败也要发送事件
