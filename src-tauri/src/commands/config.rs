@@ -98,6 +98,12 @@ pub struct SourceConfig {
     pub from: From,
     pub disabled: bool,
     pub is_adult: bool,
+    #[serde(default)]
+    pub site_type: i32,
+    #[serde(default)]
+    pub spider: Option<String>,
+    #[serde(default)]
+    pub searchable: i32,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CustomCategory {

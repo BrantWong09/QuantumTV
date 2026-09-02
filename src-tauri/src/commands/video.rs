@@ -663,6 +663,12 @@ pub struct ApiSite {
     pub name: String,
     pub detail: Option<String>,
     pub is_adult: Option<bool>,
+    #[serde(default)]
+    pub site_type: Option<i32>,
+    #[serde(default)]
+    pub spider: Option<String>,
+    #[serde(default)]
+    pub searchable: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -827,6 +833,12 @@ pub(crate) fn resolve_enabled_source(config: &Value, source_key: &str) -> Option
                         .and_then(|v| v.as_str())
                         .map(|v| v.to_string()),
                     is_adult: s.get("is_adult").and_then(|v| v.as_bool()),
+                    site_type: s.get("site_type").and_then(|v| v.as_i64()).map(|v| v as i32),
+                    spider: s
+                        .get("spider")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.to_string()),
+                    searchable: s.get("searchable").and_then(|v| v.as_i64()).map(|v| v as i32),
                 };
                 validate_remote_url_against_config(&site.api, config).ok()?;
                 Some(site)
@@ -1108,6 +1120,15 @@ pub(crate) async fn search_with_cache_hit(
                             .and_then(|v| v.as_str())
                             .map(|v| v.to_string()),
                         is_adult: s.get("is_adult").and_then(|v| v.as_bool()),
+                        site_type: s.get("site_type").and_then(|v| v.as_i64()).map(|v| v as i32),
+                        spider: s
+                            .get("spider")
+                            .and_then(|v| v.as_str())
+                            .map(|v| v.to_string()),
+                        searchable: s
+                            .get("searchable")
+                            .and_then(|v| v.as_i64())
+                            .map(|v| v as i32),
                     })
                 })
                 .collect::<Vec<ApiSite>>()
