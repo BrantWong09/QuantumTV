@@ -26,6 +26,9 @@ struct VideoSourceExport {
     sort_order: i32,
     created_at: i64,
     updated_at: i64,
+    site_type: i32,
+    spider: Option<String>,
+    searchable: i32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,7 +84,7 @@ impl Db {
                 let mut search_history = conn.prepare("SELECT * FROM search_history")?;
                 let mut skip_configs = conn.prepare("SELECT * FROM skip_configs")?;
                 let mut video_sources = conn.prepare(
-                    "SELECT source_key, name, api, detail, from_type, disabled, is_adult, sort_order, created_at, updated_at
+                    "SELECT source_key, name, api, detail, from_type, disabled, is_adult, sort_order, created_at, updated_at, site_type, spider, searchable
                      FROM video_sources
                      ORDER BY sort_order ASC, updated_at DESC, source_key ASC",
                 )?;
@@ -144,6 +147,9 @@ impl Db {
                         sort_order: row.get(7)?,
                         created_at: row.get(8)?,
                         updated_at: row.get(9)?,
+                        site_type: row.get(10)?,
+                        spider: row.get(11)?,
+                        searchable: row.get(12)?,
                     })
                 })?;
                 let source_stats_iter = source_stats.query_map([], |row| {
@@ -205,8 +211,8 @@ impl Db {
             {
                 let mut source_stmt = tx.prepare(
                     "INSERT OR REPLACE INTO video_sources
-                     (source_key, name, api, detail, from_type, disabled, is_adult, sort_order, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     (source_key, name, api, detail, from_type, disabled, is_adult, sort_order, created_at, updated_at, site_type, spider, searchable)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 )?;
                 for source in video_sources_data {
                     source_stmt.execute(params![
@@ -220,6 +226,9 @@ impl Db {
                         source.sort_order,
                         source.created_at,
                         source.updated_at,
+                        source.site_type,
+                        source.spider,
+                        source.searchable,
                     ])?;
                 }
             }
@@ -383,7 +392,10 @@ mod tests {
               is_adult INTEGER NOT NULL DEFAULT 0,
               sort_order INTEGER NOT NULL DEFAULT 0,
               created_at INTEGER NOT NULL,
-              updated_at INTEGER NOT NULL
+              updated_at INTEGER NOT NULL,
+              site_type INTEGER NOT NULL DEFAULT 0,
+              spider TEXT,
+              searchable INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE source_intelligence_stats (
@@ -541,8 +553,8 @@ mod tests {
 
         db.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO video_sources (source_key, name, api, detail, from_type, disabled, is_adult, sort_order, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, '', 'custom', 0, 0, 0, 1, 1)",
+                "INSERT INTO video_sources (source_key, name, api, detail, from_type, disabled, is_adult, sort_order, created_at, updated_at, site_type, spider, searchable)
+                 VALUES (?1, ?2, ?3, '', 'custom', 0, 0, 0, 1, 1, 0, NULL, 1)",
                 params!["vs1", "Source 1", "https://source1.example.com"],
             )?;
             conn.execute(
@@ -624,7 +636,10 @@ mod tests {
                     "is_adult": 0,
                     "sort_order": 0,
                     "created_at": 1,
-                    "updated_at": 1
+                    "updated_at": 1,
+                    "site_type": 0,
+                    "spider": null,
+                    "searchable": 1
                 }
             ],
             "source_intelligence_stats": [

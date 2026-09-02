@@ -574,7 +574,10 @@ mod tests {
                 is_adult INTEGER NOT NULL DEFAULT 0,
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                site_type INTEGER NOT NULL DEFAULT 0,
+                spider TEXT,
+                searchable INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE source_intelligence_stats (
@@ -599,8 +602,8 @@ mod tests {
     fn seed_source(db: &Db, source_key: &str) {
         db.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO video_sources (source_key, name, api, detail, from_type, disabled, is_adult, sort_order, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, '', 'custom', 0, 0, 0, 1, 1)",
+                "INSERT INTO video_sources (source_key, name, api, detail, from_type, disabled, is_adult, sort_order, created_at, updated_at, site_type, spider, searchable)
+                 VALUES (?1, ?2, ?3, '', 'custom', 0, 0, 0, 1, 1, 0, NULL, 1)",
                 params![source_key, source_key, format!("https://{}.example.com", source_key)],
             )?;
             Ok(())

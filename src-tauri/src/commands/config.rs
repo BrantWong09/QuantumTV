@@ -183,7 +183,7 @@ fn merge_config_with_sources(config: &Value, sources: Vec<Value>) -> Value {
 pub(crate) fn load_source_config_values(db: &Db) -> Result<Vec<Value>, String> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT source_key, name, api, detail, from_type, disabled, is_adult
+            "SELECT source_key, name, api, detail, from_type, disabled, is_adult, site_type, spider, searchable
              FROM video_sources
              ORDER BY sort_order ASC, updated_at DESC, source_key ASC",
         )?;
@@ -198,6 +198,9 @@ pub(crate) fn load_source_config_values(db: &Db) -> Result<Vec<Value>, String> {
                     "from": row.get::<_, String>(4)?,
                     "disabled": row.get::<_, i32>(5)? != 0,
                     "is_adult": row.get::<_, i32>(6)? != 0,
+                    "site_type": row.get::<_, i32>(7)?,
+                    "spider": row.get::<_, Option<String>>(8)?,
+                    "searchable": row.get::<_, i32>(9)?,
                 }))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -220,6 +223,9 @@ pub(crate) fn persist_source_config_values(
         disabled: bool,
         is_adult: bool,
         sort_order: i64,
+        site_type: i32,
+        spider: Option<String>,
+        searchable: i32,
     }
 
     let rows = sources
@@ -258,6 +264,18 @@ pub(crate) fn persist_source_config_values(
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false),
                 sort_order: index as i64,
+                site_type: normalized
+                    .get("site_type")
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or(0) as i32,
+                spider: normalized
+                    .get("spider")
+                    .and_then(|value| value.as_str())
+                    .map(|s| s.to_string()),
+                searchable: normalized
+                    .get("searchable")
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or(1) as i32,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -288,8 +306,11 @@ pub(crate) fn persist_source_config_values(
                     is_adult,
                     sort_order,
                     created_at,
-                    updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    updated_at,
+                    site_type,
+                    spider,
+                    searchable
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 ON CONFLICT(source_key) DO UPDATE SET
                     name = excluded.name,
                     api = excluded.api,
@@ -298,7 +319,10 @@ pub(crate) fn persist_source_config_values(
                     disabled = excluded.disabled,
                     is_adult = excluded.is_adult,
                     sort_order = excluded.sort_order,
-                    updated_at = excluded.updated_at",
+                    updated_at = excluded.updated_at,
+                    site_type = excluded.site_type,
+                    spider = excluded.spider,
+                    searchable = excluded.searchable",
                 params![
                     &row.key,
                     &row.name,
@@ -310,6 +334,9 @@ pub(crate) fn persist_source_config_values(
                     row.sort_order,
                     created_at,
                     now,
+                    row.site_type,
+                    &row.spider,
+                    row.searchable,
                 ],
             )?;
         }
@@ -1948,7 +1975,10 @@ mod tests {
                 is_adult INTEGER NOT NULL DEFAULT 0,
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                site_type INTEGER NOT NULL DEFAULT 0,
+                spider TEXT,
+                searchable INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE source_intelligence_stats (

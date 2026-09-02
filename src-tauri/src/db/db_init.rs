@@ -190,7 +190,10 @@ pub fn init_db(app: &tauri::AppHandle) -> Connection {
             is_adult INTEGER NOT NULL DEFAULT 0,
             sort_order INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
+            updated_at INTEGER NOT NULL,
+            site_type INTEGER NOT NULL DEFAULT 0,
+            spider TEXT,
+            searchable INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE INDEX IF NOT EXISTS idx_video_sources_sort_order
@@ -266,6 +269,33 @@ pub fn init_db(app: &tauri::AppHandle) -> Connection {
 
     if user_version < 2 {
         conn.execute("PRAGMA user_version = 2", [])
+            .expect("failed to update database version");
+    }
+
+    if user_version < 3 {
+        let has_site_type_column: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('video_sources') WHERE name='site_type'",
+                [],
+                |row| {
+                    let count: i32 = row.get(0)?;
+                    Ok(count > 0)
+                },
+            )
+            .unwrap_or(false);
+
+        if !has_site_type_column {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE video_sources ADD COLUMN site_type INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE video_sources ADD COLUMN spider TEXT;
+                ALTER TABLE video_sources ADD COLUMN searchable INTEGER NOT NULL DEFAULT 1;
+                "#,
+            )
+            .expect("failed to add columns to video_sources table");
+        }
+
+        conn.execute("PRAGMA user_version = 3", [])
             .expect("failed to update database version");
     }
 
