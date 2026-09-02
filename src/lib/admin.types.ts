@@ -43,7 +43,14 @@ export interface AdminConfig {
     detail?: string;
     from: 'config' | 'custom';
     disabled?: boolean;
-    is_adult?: boolean; // 标记是否为成人资源
+    is_adult?: boolean;
+    site_type?: number;
+    spider?: string;
+    searchable?: number;
+    quick_search?: number;
+    filterable?: number;
+    changeable?: string;
+    jar?: string;
   }[];
   CustomCategories: {
     name?: string;

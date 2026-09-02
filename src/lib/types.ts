@@ -6,6 +6,9 @@ export interface ApiSite {
   name: string;
   detail?: string;
   is_adult?: boolean;
+  site_type?: number;
+  spider?: string;
+  searchable?: number;
 }
 // 播放记录数据结构
 export interface PlayRecord {
@@ -205,6 +208,7 @@ export interface SearchResult {
   desc?: string;
   type_name?: string;
   douban_id?: number;
+  source_site_type?: number;
 }
 
 /** 聚合后的分组*/
