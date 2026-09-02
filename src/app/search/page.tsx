@@ -633,7 +633,12 @@ function SearchPageClient() {
                           const type = episodes === 1 ? 'movie' : 'tv';
 
                           return (
-                            <div key={`agg-${mapKey}`} className='w-full'>
+                            <div key={`agg-${mapKey}`} className='w-full relative'>
+                              {rep.source_site_type === 3 && (
+                                <span className='absolute top-1 right-1 px-1 py-0.5 text-[9px] rounded bg-purple-500/30 text-purple-200 z-10'>
+                                  Spider
+                                </span>
+                              )}
                               <VideoCard
                                 ref={getGroupRef(mapKey)}
                                 from='search'
@@ -658,8 +663,13 @@ function SearchPageClient() {
                     : filteredAllResults.map((item) => (
                         <div
                           key={`all-${item.source}-${item.id}`}
-                          className='w-full'
+                          className='w-full relative'
                         >
+                          {item.source_site_type === 3 && (
+                            <span className='absolute top-1 right-1 px-1 py-0.5 text-[9px] rounded bg-purple-500/30 text-purple-200 z-10'>
+                              Spider
+                            </span>
+                          )}
                           <VideoCard
                             id={item.id}
                             title={item.title}
