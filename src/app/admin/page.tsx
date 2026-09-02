@@ -448,6 +448,16 @@ const SortableSourceItem = ({
           <span className='text-sm font-medium text-gray-900 dark:text-gray-100 truncate'>
             {source.name}
           </span>
+          {source.site_type === 3 && (
+            <span className='px-1.5 py-0.5 text-[10px] rounded-full bg-purple-500/20 text-purple-300 ml-2'>
+              Spider
+            </span>
+          )}
+          {source.site_type === 1 && (
+            <span className='px-1.5 py-0.5 text-[10px] rounded-full bg-blue-500/20 text-blue-300 ml-2'>
+              CMS
+            </span>
+          )}
           {source.is_adult && (
             <span className='px-1.5 py-0.5 text-xs bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-400 rounded'>
               18+
@@ -528,6 +538,9 @@ const SourceConfig = ({ config, onUpdate, showAlert }: SourceConfigProps) => {
     api: '',
     detail: '',
     is_adult: false,
+    site_type: 1,
+    spider: '',
+    searchable: 1,
   });
 
   const sensors = useSensors(
@@ -657,7 +670,7 @@ const SourceConfig = ({ config, onUpdate, showAlert }: SourceConfigProps) => {
         },
       });
       onUpdate(newConfig);
-      setNewSource({ key: '', name: '', api: '', detail: '', is_adult: false });
+      setNewSource({ key: '', name: '', api: '', detail: '', is_adult: false, site_type: 1, spider: '', searchable: 1 });
       setIsAddModalOpen(false);
       showAlert('success', '添加成功');
     } catch (error) {
