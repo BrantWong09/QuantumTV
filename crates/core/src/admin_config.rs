@@ -41,7 +41,8 @@ fn normalize_admin_config_value(value: Value) -> Result<Value, String> {
                 let sources = normalize_source_config_array(sites, "config", global_spider);
                 Ok(build_config_with_sources(sources))
             } else if let Some(api_site) = map.get("api_site").and_then(|v| v.as_object()) {
-                let sources = normalize_api_site_object(api_site);
+                let global_spider = map.get("spider").and_then(|v| v.as_str()).unwrap_or("");
+                let sources = normalize_api_site_object(api_site, global_spider);
                 Ok(build_config_with_sources(sources))
             } else {
                 Err("配置格式错误".to_string())
@@ -122,7 +123,7 @@ fn normalize_admin_config_object(map: &Map<String, Value>) -> Result<Value, Stri
 
 fn extract_sources_from_value(value: &Value, global_spider: &str) -> Option<Vec<Value>> {
     if let Some(api_site) = value.get("api_site").and_then(|v| v.as_object()) {
-        return Some(normalize_api_site_object(api_site));
+        return Some(normalize_api_site_object(api_site, global_spider));
     }
 
     if let Some(sites) = value.get("sites").and_then(|v| v.as_array()) {
@@ -259,7 +260,7 @@ fn normalize_source_config_item(
     Some(Value::Object(obj))
 }
 
-fn normalize_api_site_object(api_site: &Map<String, Value>) -> Vec<Value> {
+fn normalize_api_site_object(api_site: &Map<String, Value>, global_spider: &str) -> Vec<Value> {
     let mut sources = Vec::new();
     for (key, value) in api_site {
         let api = value
@@ -302,7 +303,7 @@ fn normalize_api_site_object(api_site: &Map<String, Value>) -> Vec<Value> {
         obj.insert("disabled".to_string(), Value::Bool(disabled));
         obj.insert("is_adult".to_string(), Value::Bool(is_adult));
 
-        let tvbox_fields = extract_tvbox_fields(value, "");
+        let tvbox_fields = extract_tvbox_fields(value, global_spider);
         for (k, v) in tvbox_fields {
             obj.insert(k, v);
         }
