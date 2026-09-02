@@ -1184,27 +1184,42 @@ pub(crate) async fn search_with_cache_hit(
             let _permit = semaphore.acquire().await.ok()?;
             
             // Route search based on site_type
-            let search_url = if site_clone.site_type.unwrap_or(1) == 3 {
+            let (search_url, request_timeout) = if site_clone.site_type.unwrap_or(1) == 3 {
                 // Spider site: route through API Server
                 if site_clone.searchable.unwrap_or(1) != 1 {
                     return None; // Skip non-searchable sites
                 }
-                format!(
-                    "http://127.0.0.1:3000/api/search?site_key={}&query={}",
-                    urlencoding::encode(&site_clone.key),
-                    urlencoding::encode(&query)
+                // 类名: api 去掉 csp_ 前缀; spider: 站点/全局 JAR URL(可能带 ;md5; 后缀)
+                let class_name = site_clone
+                    .api
+                    .strip_prefix("csp_")
+                    .unwrap_or(&site_clone.api);
+                let spider = site_clone.spider.clone().unwrap_or_default();
+                (
+                    format!(
+                        "http://127.0.0.1:3000/api/search?site_key={}&query={}&class_name={}&spider={}",
+                        urlencoding::encode(&site_clone.key),
+                        urlencoding::encode(&query),
+                        urlencoding::encode(class_name),
+                        urlencoding::encode(&spider)
+                    ),
+                    // JVM 启动 + JAR 加载较慢,给更长时间
+                    Duration::from_secs(20),
                 )
             } else {
                 // CMS site: direct API call
-                format!(
-                    "{}?ac=videolist&wd={}",
-                    site_clone.api,
-                    urlencoding::encode(&query)
+                (
+                    format!(
+                        "{}?ac=videolist&wd={}",
+                        site_clone.api,
+                        urlencoding::encode(&query)
+                    ),
+                    Duration::from_secs(6),
                 )
             };
 
-            // 单个源请求超时 6 秒
-            let resp = match timeout(Duration::from_secs(6), client.get(&search_url).send()).await {
+            // 单个源请求超时(普通源 6 秒,spider 源 20 秒)
+            let resp = match timeout(request_timeout, client.get(&search_url).send()).await {
                 Ok(Ok(res)) if res.status().is_success() => res,
                 _ => {
                     // 如果启用了流式搜索，即使失败也要发送事件

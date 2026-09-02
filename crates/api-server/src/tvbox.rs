@@ -6,7 +6,7 @@ use quantumtv_core::is_adult_source;
 use quantumtv_core::playback::filter_ads_from_m3_u8;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
@@ -1050,29 +1050,48 @@ pub async fn proxy_spider_jar_handler(State(state): State<AppState>) -> impl Int
 
 // ================== 搜索端点 ==================
 
+const SEARCH_CACHE_DIR: &str = ".cache/sites";
+const RUNNER_CACHE_DIR: &str = ".cache/runner";
+const SPIDER_RUNNER_SOURCE: &str = include_str!("../resources/SpiderRunner.java");
+const SEARCH_TIMEOUT_SECS: u64 = 20;
+
 #[derive(Deserialize)]
 pub struct SearchParams {
     site_key: String,
     query: String,
+    #[serde(default)]
+    spider: Option<String>,
+    #[serde(default)]
+    class_name: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct SearchResponse {
-    results: Vec<SearchResultItem>,
-    java_available: bool,
+/// 对齐 src-tauri 端 ApiSearchItem 的字段(serde 按 key 匹配)
+#[derive(Serialize, Deserialize)]
+pub struct SearchResultItem {
+    pub vod_id: serde_json::Value,
+    pub vod_name: String,
+    pub vod_pic: String,
+    #[serde(default)]
+    pub vod_remarks: Option<String>,
+    #[serde(default)]
+    pub vod_play_url: Option<String>,
+    #[serde(default)]
+    pub vod_class: Option<String>,
+    #[serde(default)]
+    pub vod_year: Option<String>,
+    #[serde(default)]
+    pub vod_content: Option<String>,
+    #[serde(default)]
+    pub vod_douban_id: Option<serde_json::Value>,
+    #[serde(default)]
+    pub type_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct SearchResultItem {
-    vod_id: i64,
-    vod_name: String,
-    vod_pic: String,
-    #[serde(default)]
-    vod_year: String,
-    #[serde(default)]
-    vod_remarks: String,
-    #[serde(default)]
-    vod_play_url: String,
+pub struct SearchResponse {
+    pub list: Vec<SearchResultItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pagecount: Option<i32>,
 }
 
 fn check_java_available() -> bool {
@@ -1083,18 +1102,225 @@ fn check_java_available() -> bool {
         .unwrap_or(false)
 }
 
-pub async fn search_handler(Query(params): Query<SearchParams>) -> Json<SearchResponse> {
-    let java_available = check_java_available();
+/// 解析 spider 配置: "URL;md5;<hash>" -> (url, Option<md5>)
+fn parse_spider_spec(spec: &str) -> (String, Option<String>) {
+    let mut parts = spec.splitn(3, ';');
+    let url = parts.next().unwrap_or("").trim().to_string();
+    let md5 = if parts.next() == Some("md5") {
+        parts.next().map(|s| s.trim().to_string())
+    } else {
+        None
+    };
+    (url, md5)
+}
 
-    if !java_available {
-        return Json(SearchResponse {
-            results: vec![],
-            java_available: false,
-        });
+/// 下载(或从磁盘缓存读取)站点 spider JAR,返回 jar 文件路径
+async fn get_site_spider_jar(site_key: &str, spec: &str) -> Result<PathBuf, String> {
+    let (url, expected_md5) = parse_spider_spec(spec);
+    if url.is_empty() {
+        return Err(format!("站点 {} 的 spider 配置为空", site_key));
     }
 
+    // 缓存目录按 md5(无则按 url 哈希)命名,多个站点共享同一 JAR 时只下载一次
+    let cache_name = expected_md5
+        .clone()
+        .unwrap_or_else(|| format!("{:x}", md5::compute(url.as_bytes())));
+    let dir = PathBuf::from(CACHE_DIR).join(SEARCH_CACHE_DIR).join(&cache_name);
+    let jar_path = dir.join(SPIDER_JAR_FILE);
+
+    // 磁盘缓存命中
+    if jar_path.exists() {
+        if let Ok(data) = std::fs::read(&jar_path) {
+            if let Some(exp) = &expected_md5 {
+                if calculate_md5(&data) == *exp {
+                    tracing::info!("站点 {} 使用磁盘缓存的 spider jar ({})", site_key, cache_name);
+                    return Ok(jar_path);
+                }
+                tracing::warn!("站点 {} 缓存 jar MD5 不匹配,重新下载", site_key);
+            } else {
+                tracing::info!("站点 {} 使用磁盘缓存的 spider jar ({})", site_key, cache_name);
+                return Ok(jar_path);
+            }
+        }
+    }
+
+    // 下载
+    let data = fetch_remote(&url, 8000, 1)
+        .await
+        .ok_or_else(|| format!("下载 spider jar 失败: {}", url))?;
+
+    if let Some(exp) = &expected_md5 {
+        let actual = calculate_md5(&data);
+        if &actual != exp {
+            tracing::warn!("站点 {} jar MD5 不匹配: 期望 {} 实际 {}", site_key, exp, actual);
+        }
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Err(format!("创建缓存目录失败: {}", e));
+    }
+    std::fs::write(&jar_path, &data).map_err(|e| format!("写入 jar 失败: {}", e))?;
+    tracing::info!("站点 {} 下载 spider jar: {} bytes", site_key, data.len());
+    Ok(jar_path)
+}
+
+/// 编译 SpiderRunner.java(首次),返回 runner 类目录
+async fn ensure_runner_compiled() -> Result<PathBuf, String> {
+    let runner_dir = PathBuf::from(CACHE_DIR).join(RUNNER_CACHE_DIR);
+    let class_file = runner_dir.join("SpiderRunner.class");
+    if class_file.exists() {
+        return Ok(runner_dir);
+    }
+
+    if let Err(e) = tokio::fs::create_dir_all(&runner_dir).await {
+        return Err(format!("创建 runner 目录失败: {}", e));
+    }
+
+    let src_path = runner_dir.join("SpiderRunner.java");
+    if let Err(e) = tokio::fs::write(&src_path, SPIDER_RUNNER_SOURCE).await {
+        return Err(format!("写入 runner 源码失败: {}", e));
+    }
+
+    let output = tokio::process::Command::new("javac")
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-d")
+        .arg(&runner_dir)
+        .arg(&src_path)
+        .output()
+        .await
+        .map_err(|e| format!("执行 javac 失败: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("编译 SpiderRunner 失败: {}", stderr.trim()));
+    }
+
+    tracing::info!("SpiderRunner 编译完成");
+    Ok(runner_dir)
+}
+
+/// 执行 java 子进程调用 spider 类搜索,返回解析后的结果列表
+async fn run_java_search(
+    jar_path: &Path,
+    runner_dir: &Path,
+    class_name: &str,
+    query: &str,
+) -> Result<Vec<SearchResultItem>, String> {
+    if !check_java_available() {
+        return Err("Java 运行时不可用".to_string());
+    }
+
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let classpath = format!("{}{}{}", jar_path.display(), sep, runner_dir.display());
+
+    let output = tokio::process::Command::new("java")
+        .arg("-Dfile.encoding=UTF-8")
+        .arg("-cp")
+        .arg(&classpath)
+        .arg("SpiderRunner")
+        .arg(class_name)
+        .arg(query)
+        .output()
+        .await
+        .map_err(|e| format!("执行 java 失败: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("java 执行失败: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: SearchResponse = serde_json::from_str(&stdout)
+        .map_err(|e| format!("解析 spider 搜索结果失败: {}, body: {}", e, &stdout[..stdout.len().min(300)]))?;
+    Ok(parsed.list)
+}
+
+/// 从内存订阅缓存按 site_key 解析站点(参数缺失时的兜底)
+async fn resolve_site_from_config(state: &AppState, site_key: &str) -> Option<(String, String)> {
+    let config = state.subscription_cache.lock().await.as_ref()?.config.clone();
+    let site = config.sites?.into_iter().find(|s| s.key == site_key)?;
+    let class_name = site
+        .api
+        .strip_prefix("csp_")
+        .unwrap_or(&site.api)
+        .to_string();
+    let spider_spec = site.jar.or(config.spider).unwrap_or_default();
+    Some((class_name, spider_spec))
+}
+
+pub async fn search_handler(
+    Query(params): Query<SearchParams>,
+    State(state): State<AppState>,
+) -> Json<SearchResponse> {
+    let empty = SearchResponse {
+        list: vec![],
+        pagecount: None,
+    };
+
+    // 1. 解析类名与 spider 配置(优先用调用方传入的参数)
+    let mut class_name = params.class_name.clone().unwrap_or_default();
+    let mut spider_spec = params.spider.clone().unwrap_or_default();
+
+    if class_name.is_empty() || spider_spec.is_empty() {
+        if let Some((cn, ss)) = resolve_site_from_config(&state, &params.site_key).await {
+            if class_name.is_empty() {
+                class_name = cn;
+            }
+            if spider_spec.is_empty() {
+                spider_spec = ss;
+            }
+        }
+    }
+
+    // 防御: 去掉残留的 csp_ 前缀
+    let class_name = class_name.strip_prefix("csp_").unwrap_or(&class_name);
+    if class_name.is_empty() {
+        tracing::warn!("search: 站点 {} 无类名", params.site_key);
+        return Json(empty);
+    }
+
+    // 2. 获取站点 spider JAR
+    let jar_path = match get_site_spider_jar(&params.site_key, &spider_spec).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("search: 站点 {} 获取 jar 失败: {}", params.site_key, e);
+            return Json(empty);
+        }
+    };
+
+    // 3. 编译 runner
+    let runner_dir = match ensure_runner_compiled().await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("search: 编译 runner 失败: {}", e);
+            return Json(empty);
+        }
+    };
+
+    // 4. 执行 java 搜索(超时控制)
+    let fut = run_java_search(&jar_path, &runner_dir, class_name, &params.query);
+    let result = match tokio::time::timeout(Duration::from_secs(SEARCH_TIMEOUT_SECS), fut).await {
+        Ok(Ok(list)) => list,
+        Ok(Err(e)) => {
+            tracing::warn!("search: 站点 {} 搜索失败: {}", params.site_key, e);
+            vec![]
+        }
+        Err(_) => {
+            tracing::warn!("search: 站点 {} 搜索超时({}s)", params.site_key, SEARCH_TIMEOUT_SECS);
+            vec![]
+        }
+    };
+
+    tracing::info!(
+        "search: 站点 {} 类 {} 查询 '{}' -> {} 条结果",
+        params.site_key,
+        class_name,
+        params.query,
+        result.len()
+    );
     Json(SearchResponse {
-        results: vec![],
-        java_available: true,
+        list: result,
+        pagecount: None,
     })
 }
