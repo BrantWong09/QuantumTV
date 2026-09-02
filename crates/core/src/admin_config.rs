@@ -20,7 +20,7 @@ pub fn parse_admin_config(raw_json: &str) -> Result<Value, String> {
 
 pub fn normalize_source_config(source: &Value, default_from: &str) -> Result<Value, String> {
     let now_ms = current_time_ms();
-    normalize_source_config_item(source, default_from, now_ms, 0)
+    normalize_source_config_item(source, default_from, now_ms, 0, "")
         .ok_or_else(|| "视频源格式错误".to_string())
 }
 
@@ -30,14 +30,15 @@ fn normalize_admin_config_value(value: Value) -> Result<Value, String> {
             if !is_source_array(&items) {
                 return Err("配置格式错误".to_string());
             }
-            let sources = normalize_source_config_array(&items, "custom");
+            let sources = normalize_source_config_array(&items, "custom", "");
             Ok(build_config_with_sources(sources))
         }
         Value::Object(map) => {
             if is_admin_config(&map) {
                 normalize_admin_config_object(&map)
             } else if let Some(sites) = map.get("sites").and_then(|v| v.as_array()) {
-                let sources = normalize_source_config_array(sites, "config");
+                let global_spider = map.get("spider").and_then(|v| v.as_str()).unwrap_or("");
+                let sources = normalize_source_config_array(sites, "config", global_spider);
                 Ok(build_config_with_sources(sources))
             } else if let Some(api_site) = map.get("api_site").and_then(|v| v.as_object()) {
                 let sources = normalize_api_site_object(api_site);
@@ -84,7 +85,7 @@ fn normalize_admin_config_object(map: &Map<String, Value>) -> Result<Value, Stri
 
     if let Some(source_config) = get_value(map, &["SourceConfig", "source_config"]) {
         if let Some(arr) = source_config.as_array() {
-            let sources = normalize_source_config_array(arr, "custom");
+            let sources = normalize_source_config_array(arr, "custom", "");
             set_value(&mut config, "SourceConfig", Value::Array(sources));
         }
     }
@@ -105,7 +106,11 @@ fn normalize_admin_config_object(map: &Map<String, Value>) -> Result<Value, Stri
     if needs_sources {
         if let Some(config_file) = config.get("ConfigFile").and_then(|v| v.as_str()) {
             if let Ok(config_file_value) = serde_json::from_str::<Value>(config_file) {
-                if let Some(sources) = extract_sources_from_value(&config_file_value) {
+                if let Some(sites) = config_file_value.get("sites").and_then(|v| v.as_array()) {
+                    let global_spider = config_file_value.get("spider").and_then(|v| v.as_str()).unwrap_or("");
+                    let sources = normalize_source_config_array(sites, "config", global_spider);
+                    set_value(&mut config, "SourceConfig", Value::Array(sources));
+                } else if let Some(sources) = extract_sources_from_value(&config_file_value, "") {
                     set_value(&mut config, "SourceConfig", Value::Array(sources));
                 }
             }
@@ -115,35 +120,62 @@ fn normalize_admin_config_object(map: &Map<String, Value>) -> Result<Value, Stri
     Ok(config)
 }
 
-fn extract_sources_from_value(value: &Value) -> Option<Vec<Value>> {
+fn extract_sources_from_value(value: &Value, global_spider: &str) -> Option<Vec<Value>> {
     if let Some(api_site) = value.get("api_site").and_then(|v| v.as_object()) {
         return Some(normalize_api_site_object(api_site));
     }
 
     if let Some(sites) = value.get("sites").and_then(|v| v.as_array()) {
-        return Some(normalize_source_config_array(sites, "config"));
+        return Some(normalize_source_config_array(sites, "config", global_spider));
     }
 
     if let Some(source_config) = value.get("SourceConfig").and_then(|v| v.as_array()) {
-        return Some(normalize_source_config_array(source_config, "config"));
+        return Some(normalize_source_config_array(source_config, "config", global_spider));
     }
 
     if let Some(arr) = value.as_array() {
         if is_source_array(arr) {
-            return Some(normalize_source_config_array(arr, "config"));
+            return Some(normalize_source_config_array(arr, "config", global_spider));
         }
     }
 
     None
 }
 
-fn normalize_source_config_array(items: &[Value], default_from: &str) -> Vec<Value> {
+fn normalize_source_config_array(items: &[Value], default_from: &str, global_spider: &str) -> Vec<Value> {
     let now_ms = current_time_ms();
     items
         .iter()
         .enumerate()
-        .filter_map(|(idx, item)| normalize_source_config_item(item, default_from, now_ms, idx))
+        .filter_map(|(idx, item)| normalize_source_config_item(item, default_from, now_ms, idx, global_spider))
         .collect()
+}
+
+fn extract_tvbox_fields(item: &Value, global_spider: &str) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::new();
+    
+    let site_type = item.get("type").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+    fields.insert("site_type".to_string(), serde_json::json!(site_type));
+    
+    let searchable = item.get("searchable").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+    fields.insert("searchable".to_string(), serde_json::json!(searchable));
+    
+    if let Some(qs) = item.get("quick_search").and_then(|v| v.as_i64()) {
+        fields.insert("quick_search".to_string(), serde_json::json!(qs));
+    }
+    if let Some(f) = item.get("filterable").and_then(|v| v.as_i64()) {
+        fields.insert("filterable".to_string(), serde_json::json!(f));
+    }
+    if let Some(c) = item.get("changeable").and_then(|v| v.as_str()) {
+        fields.insert("changeable".to_string(), serde_json::json!(c));
+    }
+    
+    let jar = item.get("jar").and_then(|v| v.as_str()).unwrap_or(global_spider);
+    if !jar.is_empty() {
+        fields.insert("spider".to_string(), serde_json::json!(jar));
+    }
+    
+    fields
 }
 
 fn normalize_source_config_item(
@@ -151,6 +183,7 @@ fn normalize_source_config_item(
     default_from: &str,
     now_ms: i64,
     index: usize,
+    global_spider: &str,
 ) -> Option<Value> {
     let mut obj = item.as_object().cloned().unwrap_or_default();
 
@@ -218,6 +251,11 @@ fn normalize_source_config_item(
     obj.insert("disabled".to_string(), Value::Bool(disabled));
     obj.insert("is_adult".to_string(), Value::Bool(is_adult));
 
+    let tvbox_fields = extract_tvbox_fields(item, global_spider);
+    for (k, v) in tvbox_fields {
+        obj.insert(k, v);
+    }
+
     Some(Value::Object(obj))
 }
 
@@ -263,6 +301,11 @@ fn normalize_api_site_object(api_site: &Map<String, Value>) -> Vec<Value> {
         obj.insert("from".to_string(), Value::String("config".to_string()));
         obj.insert("disabled".to_string(), Value::Bool(disabled));
         obj.insert("is_adult".to_string(), Value::Bool(is_adult));
+
+        let tvbox_fields = extract_tvbox_fields(value, "");
+        for (k, v) in tvbox_fields {
+            obj.insert(k, v);
+        }
 
         sources.push(Value::Object(obj));
     }
