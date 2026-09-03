@@ -297,6 +297,113 @@ pub async fn spider_detail(
     items.pop().ok_or_else(|| "详情返回空".to_string())
 }
 
+/// Bridge 模式搜索: wex Guard 类(含 OLLVM/DexNative 保护)走 Android 桥接路径
+/// 通过 adb forward 访问 127.0.0.1:8080 的桥接 APK 服务
+pub async fn spider_bridge_search(
+    class_name: &str,
+    query: &str,
+    bridge_url: &str,
+) -> Result<Vec<SpiderSearchItem>, String> {
+    let body = serde_json::json!({
+        "class": class_name,
+        "keyword": query,
+    });
+    let data = bridge_post(bridge_url, "/search", &body).await?;
+    parse_catvod_list(&data)
+}
+
+/// Bridge 模式详情
+pub async fn spider_bridge_detail(
+    class_name: &str,
+    video_id: &str,
+    bridge_url: &str,
+) -> Result<SpiderSearchItem, String> {
+    let body = serde_json::json!({
+        "class": class_name,
+        "ids": video_id,
+    });
+    let data = bridge_post(bridge_url, "/detail", &body).await?;
+    let mut items = parse_catvod_list(&data)?;
+    items.pop().ok_or_else(|| "详情返回空".to_string())
+}
+
+/// Bridge 模式 homeContent (分类列表)
+pub async fn spider_bridge_home(
+    class_name: &str,
+    bridge_url: &str,
+) -> Result<String, String> {
+    let body = serde_json::json!({"class": class_name});
+    bridge_post(bridge_url, "/home", &body).await
+}
+
+/// Bridge 模式 categoryContent
+pub async fn spider_bridge_category(
+    class_name: &str,
+    tid: &str,
+    pg: &str,
+    bridge_url: &str,
+) -> Result<String, String> {
+    let body = serde_json::json!({
+        "class": class_name,
+        "tid": tid,
+        "pg": pg,
+    });
+    bridge_post(bridge_url, "/category", &body).await
+}
+
+/// 桥接通用 POST: 触发 /init (首次),然后调用指定端点
+async fn bridge_post(bridge_url: &str, path: &str, body: &serde_json::Value) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("bridge client: {}", e))?;
+
+    // First call ensures Init.init() is done on the device
+    let _ = client
+        .post(format!("{}/init", bridge_url))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .map_err(|e| format!("bridge /init: {}", e))?;
+
+    let resp = client
+        .post(format!("{}{}", bridge_url, path))
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("bridge {}: {}", path, e))?;
+
+    let text = resp.text().await.map_err(|e| format!("bridge body: {}", e))?;
+    // 响应格式: {"code":200,"data":"<spider json string>"} 或 {"code":4xx,"err":"..."}
+    let env: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("bridge response not JSON: {} body={}", e, &text[..text.len().min(200)]))?;
+    if env["code"] != serde_json::json!(200) {
+        return Err(format!(
+            "bridge error: {} ({})",
+            env["err"].as_str().unwrap_or("unknown"),
+            text
+        ));
+    }
+    let data = env["data"]
+        .as_str()
+        .ok_or_else(|| format!("bridge data not string: {}", text))?
+        .to_string();
+    Ok(data)
+}
+
+/// 解析 CatVod spider 的标准 JSON: {"list":[...], "page":..., "pagecount":..., "total":..., ...}
+fn parse_catvod_list(json: &str) -> Result<Vec<SpiderSearchItem>, String> {
+    let parsed: SpiderSearchResponse = serde_json::from_str(json)
+        .map_err(|e| format!("解析 bridge 结果失败: {}, body: {}", e, &json[..json.len().min(200)]))?;
+    Ok(parsed.list)
+}
+
+/// 判断 class_name 是否需要走桥接路径 (wex Guard 类)
+pub fn is_bridge_class(class_name: &str) -> bool {
+    class_name.contains("Wex") || class_name.contains("Guard")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
