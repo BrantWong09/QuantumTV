@@ -1,1 +1,233 @@
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 const SPIDER_RUNNER_SOURCE: &str = include_str!("SpiderRunner.java");
+
+pub fn calculate_md5(data: &[u8]) -> String {
+    format!("{:x}", md5::compute(data))
+}
+
+pub fn parse_spider_spec(spec: &str) -> (String, Option<String>) {
+    let mut parts = spec.splitn(3, ';');
+    let url = parts.next().unwrap_or("").trim().to_string();
+    let md5 = if parts.next() == Some("md5") {
+        parts.next().map(|s| s.trim().to_string())
+    } else {
+        None
+    };
+    (url, md5)
+}
+
+#[derive(Debug)]
+pub struct SpiderJarHandle {
+    pub path: PathBuf,
+}
+
+async fn fetch_remote_once(url: &str, timeout_ms: u64) -> Result<Vec<u8>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("Accept", "*/*".parse().unwrap());
+    headers.insert("Accept-Encoding", "identity".parse().unwrap());
+    headers.insert("Cache-Control", "no-cache".parse().unwrap());
+    headers.insert("Connection", "close".parse().unwrap());
+
+    let ua = if url.contains("github") || url.contains("raw.githubusercontent") {
+        "curl/7.68.0"
+    } else if url.contains("gitee") || url.contains("gitcode") {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    } else if url.contains("jsdelivr") || url.contains("fastly") {
+        "DecoTV/1.0"
+    } else {
+        "Mozilla/5.0 (Linux; Android 11; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Mobile Safari/537.36"
+    };
+    headers.insert("User-Agent", ua.parse().unwrap());
+
+    let response = client
+        .get(url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "HTTP {}: {}",
+            response.status(),
+            response.status().canonical_reason().unwrap_or("Unknown")
+        ));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?
+        .to_vec();
+
+    if bytes.len() < 1000 {
+        return Err(format!("File too small: {} bytes", bytes.len()));
+    }
+    if bytes[0] != 0x50 || bytes[1] != 0x4B {
+        return Err("Invalid JAR file format (missing PK header)".to_string());
+    }
+
+    Ok(bytes)
+}
+
+async fn fetch_remote(url: &str, timeout_ms: u64, retry_count: usize) -> Option<Vec<u8>> {
+    for attempt in 0..=retry_count {
+        match fetch_remote_once(url, timeout_ms).await {
+            Ok(data) => return Some(data),
+            Err(_) => {
+                if attempt < retry_count {
+                    tokio::time::sleep(Duration::from_secs((attempt + 1) as u64)).await;
+                }
+            }
+        }
+    }
+    None
+}
+
+pub async fn ensure_site_spider_jar(
+    site_key: &str,
+    spec: &str,
+    cache_root: &Path,
+) -> Result<SpiderJarHandle, String> {
+    let (url, expected_md5) = parse_spider_spec(spec);
+    if url.is_empty() {
+        return Err(format!("站点 {} 的 spider 配置为空", site_key));
+    }
+
+    let cache_name = expected_md5
+        .clone()
+        .unwrap_or_else(|| format!("{:x}", md5::compute(url.as_bytes())));
+    let dir = cache_root
+        .join(".cache")
+        .join("sites")
+        .join(&cache_name);
+    let jar_path = dir.join("spider.jar");
+
+    if jar_path.exists() {
+        let data = std::fs::read(&jar_path).map_err(|e| format!("读取缓存 jar 失败: {}", e))?;
+        if let Some(exp) = &expected_md5 {
+            if calculate_md5(&data) == *exp {
+                return Ok(SpiderJarHandle { path: jar_path });
+            }
+        } else {
+            return Ok(SpiderJarHandle { path: jar_path });
+        }
+    }
+
+    let data = fetch_remote(&url, 8000, 1)
+        .await
+        .ok_or_else(|| format!("下载 spider jar 失败: {}", url))?;
+
+    if let Some(exp) = &expected_md5 {
+        let actual = calculate_md5(&data);
+        if &actual != exp {
+            return Err(format!("MD5 不匹配: 期望 {} 实际 {}", exp, actual));
+        }
+    }
+
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建缓存目录失败: {}", e))?;
+    std::fs::write(&jar_path, &data).map_err(|e| format!("写入 jar 失败: {}", e))?;
+    Ok(SpiderJarHandle { path: jar_path })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_spider_spec_with_md5() {
+        let (url, md5) = parse_spider_spec("https://a.jar;md5;abc123");
+        assert_eq!(url, "https://a.jar");
+        assert_eq!(md5.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn parse_spider_spec_without_md5() {
+        let (url, md5) = parse_spider_spec("https://a.jar");
+        assert_eq!(url, "https://a.jar");
+        assert_eq!(md5, None);
+    }
+
+    #[test]
+    fn parse_spider_spec_empty() {
+        let (url, md5) = parse_spider_spec("");
+        assert_eq!(url, "");
+        assert_eq!(md5, None);
+    }
+
+    #[test]
+    fn calculate_md5_known_vector() {
+        assert_eq!(calculate_md5(b"hello"), "5d41402abc4b2a76b9719d911017c592");
+    }
+
+    #[test]
+    fn empty_spec_returns_err() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = std::env::temp_dir().join("qtw_spider_test_empty");
+        let result = rt.block_on(ensure_site_spider_jar("site", "", &tmp));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn disk_cache_hit_returns_existing_jar() {
+        let jar_bytes = b"PK\x03\x04valid-jar-content";
+        let known_md5 = "a3262411aaf2f68634eff02b21ea157f";
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let cache_root = std::env::temp_dir().join("qtw_spider_test_cache_hit");
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let cache_dir = cache_root.join(".cache").join("sites").join(known_md5);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("spider.jar"), jar_bytes).unwrap();
+
+        let spec = format!("https://example.com/s.jar;md5;{}", known_md5);
+        let result = rt.block_on(ensure_site_spider_jar("site", &spec, &cache_root));
+        assert!(result.is_ok(), "缓存命中应返回 Ok,stub 返回 Err");
+    }
+
+    #[test]
+    fn download_and_cache_jar_from_url() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let mut jar_bytes: Vec<u8> = b"PK\x03\x04".to_vec();
+        jar_bytes.extend(std::iter::repeat(b'A').take(1100));
+        let known_md5 = "b3dc889f6447ad766faf659132180c80";
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let jar = jar_bytes.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                jar.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&jar);
+        });
+
+        let cache_root = std::env::temp_dir().join("qtw_spider_test_download");
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let spec = format!("http://{}/s.jar;md5;{}", addr, known_md5);
+
+        let result = rt.block_on(ensure_site_spider_jar("site", &spec, &cache_root));
+        assert!(result.is_ok(), "下载成功应返回 Ok,当前未实现下载");
+        if let Ok(handle) = result {
+            let cached = std::fs::read(&handle.path).unwrap();
+            assert_eq!(cached, jar_bytes);
+        }
+    }
+}
