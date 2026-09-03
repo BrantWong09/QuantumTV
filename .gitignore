@@ -59,6 +59,10 @@ public/manifest.json
 /src-tauri/gen/android/build
 /src-tauri/gen/android/local.properties
 /target
+# local tooling / skill artifacts
+.superpowers/
+opencode.json
+
 # Security: keys and secrets
 *.jks
 *.keystore

@@ -1,0 +1,4 @@
+# allow all classes in main dex (min-api 30 supports multidex natively)
+# but d8 main-dex rules say what stays in classes.dex
+-keep class com.quantumtv.bridge.** { *; }
+-keep class com.github.catvod.crawler.** { *; }
