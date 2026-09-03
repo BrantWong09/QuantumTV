@@ -1247,7 +1247,9 @@ dependencies = [
 name = "quantumtv-core"
 version = "0.7.6"
 dependencies = [
+ "base64",
  "image",
+ "md5",
  "moka",
  "regex",
  "reqwest",

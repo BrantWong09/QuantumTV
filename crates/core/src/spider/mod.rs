@@ -1,0 +1,1 @@
+const SPIDER_RUNNER_SOURCE: &str = include_str!("SpiderRunner.java");

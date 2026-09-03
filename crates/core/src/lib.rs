@@ -3,6 +3,7 @@ pub mod adult;
 pub mod playback;
 pub mod search_aggregation;
 pub mod source_selection;
+pub mod spider;
 pub mod types;
 
 pub use admin_config::default_admin_config_value;

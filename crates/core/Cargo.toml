@@ -7,6 +7,8 @@ description = "QuantumTV 核心业务逻辑库"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+md5 = "0.7"
+base64 = "0.22"
 reqwest = { workspace = true }
 tokio = { workspace = true }
 urlencoding = { workspace = true }
