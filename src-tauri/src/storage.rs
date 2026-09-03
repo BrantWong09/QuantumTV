@@ -67,6 +67,10 @@ impl StorageManager {
         Ok(data.clone())
     }
 
+    pub fn data_dir(&self) -> &PathBuf {
+        &self.data_path
+    }
+
     pub fn update_config(&self, new_config: serde_json::Value) -> Result<(), String> {
         let mut data = self.data.lock().map_err(|e| e.to_string())?;
         data.config = new_config;

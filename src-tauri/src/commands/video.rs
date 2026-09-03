@@ -1077,6 +1077,106 @@ fn parse_episodes(play_url: &str) -> (Vec<String>, Vec<String>) {
     (episodes, titles)
 }
 
+pub(crate) async fn search_site_results(
+    site: &ApiSite,
+    query: &str,
+    client: &reqwest::Client,
+    cache_root: &std::path::Path,
+) -> Result<Vec<SearchResult>, String> {
+    if site.site_type.unwrap_or(1) == 3 {
+        if site.searchable.unwrap_or(1) != 1 {
+            return Ok(vec![]);
+        }
+        let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
+        let spider = site.spider.clone().unwrap_or_default();
+        let items = quantumtv_core::spider::spider_search(
+            &site.key, query, class_name, &spider, cache_root,
+        )
+        .await?;
+
+        let results = items
+            .into_iter()
+            .map(|item| {
+                let (episodes, episodes_titles) =
+                    parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
+                SearchResult {
+                    id: match item.vod_id {
+                        Value::String(s) => s,
+                        Value::Number(n) => n.to_string(),
+                        _ => "".to_string(),
+                    },
+                    title: item.vod_name.trim().to_string(),
+                    poster: item.vod_pic,
+                    episodes,
+                    episodes_titles,
+                    source: site.key.clone(),
+                    source_name: site.name.clone(),
+                    class: item.vod_class,
+                    year: item.vod_year,
+                    desc: item.vod_content.map(|c| clean_html_tags(&c)),
+                    type_name: item.type_name,
+                    douban_id: item
+                        .vod_douban_id
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v as i32),
+                }
+            })
+            .collect();
+        Ok(results)
+    } else {
+        let search_url = format!(
+            "{}?ac=videolist&wd={}",
+            site.api,
+            urlencoding::encode(query)
+        );
+        let resp = timeout(Duration::from_secs(6), client.get(&search_url).send())
+            .await
+            .map_err(|_| "CMS timeout".to_string())?
+            .map_err(|e| format!("CMS request failed: {}", e))?;
+        if !resp.status().is_success() {
+            return Ok(vec![]);
+        }
+        let body = timeout(Duration::from_secs(5), resp.text())
+            .await
+            .map_err(|_| "CMS read timeout".to_string())?
+            .map_err(|e| format!("CMS read failed: {}", e))?;
+
+        let mut results = Vec::new();
+        if let Ok(search_res) = serde_json::from_str::<ApiSearchResponse>(&body) {
+            results = search_res
+                .list
+                .into_iter()
+                .map(|item| {
+                    let (episodes, episodes_titles) =
+                        parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
+                    SearchResult {
+                        id: match item.vod_id {
+                            Value::String(s) => s,
+                            Value::Number(n) => n.to_string(),
+                            _ => "".to_string(),
+                        },
+                        title: item.vod_name.trim().to_string(),
+                        poster: item.vod_pic,
+                        episodes,
+                        episodes_titles,
+                        source: site.key.clone(),
+                        source_name: site.name.clone(),
+                        class: item.vod_class,
+                        year: item.vod_year,
+                        desc: item.vod_content.map(|c| clean_html_tags(&c)),
+                        type_name: item.type_name,
+                        douban_id: item
+                            .vod_douban_id
+                            .and_then(|v| v.as_i64())
+                            .map(|v| v as i32),
+                        }
+                    })
+                    .collect();
+            }
+        Ok(results)
+    }
+}
+
 pub(crate) async fn search_with_cache_hit(
     query: String,
     app_handle: tauri::AppHandle,
@@ -1159,6 +1259,12 @@ pub(crate) async fn search_with_cache_hit(
 
     let total_sources = sites.len() as i32;
 
+    // 缓存根目录(用于 spider JAR 缓存)
+    let cache_root = app_handle
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+
     // 限制并发数：最多同时请求 20 个源，充分利用并发
     let semaphore = Arc::new(Semaphore::new(20));
     let client = get_video_client();
@@ -1166,6 +1272,7 @@ pub(crate) async fn search_with_cache_hit(
 
     let mut handles = Vec::new();
     for site in &sites {
+        let cache_root = cache_root.clone();
         let semaphore = semaphore.clone();
         let client = client.clone();
         let query = query.clone();
@@ -1182,164 +1289,69 @@ pub(crate) async fn search_with_cache_hit(
 
         let handle = tokio::spawn(async move {
             let _permit = semaphore.acquire().await.ok()?;
-            
-            // Route search based on site_type
-            let (search_url, request_timeout) = if site_clone.site_type.unwrap_or(1) == 3 {
-                // Spider site: route through API Server
-                if site_clone.searchable.unwrap_or(1) != 1 {
-                    return None; // Skip non-searchable sites
-                }
-                // 类名: api 去掉 csp_ 前缀; spider: 站点/全局 JAR URL(可能带 ;md5; 后缀)
-                let class_name = site_clone
-                    .api
-                    .strip_prefix("csp_")
-                    .unwrap_or(&site_clone.api);
-                let spider = site_clone.spider.clone().unwrap_or_default();
-                (
-                    format!(
-                        "http://127.0.0.1:3000/api/search?site_key={}&query={}&class_name={}&spider={}",
-                        urlencoding::encode(&site_clone.key),
-                        urlencoding::encode(&query),
-                        urlencoding::encode(class_name),
-                        urlencoding::encode(&spider)
-                    ),
-                    // JVM 启动 + JAR 加载较慢,给更长时间
-                    Duration::from_secs(20),
-                )
-            } else {
-                // CMS site: direct API call
-                (
-                    format!(
-                        "{}?ac=videolist&wd={}",
-                        site_clone.api,
-                        urlencoding::encode(&query)
-                    ),
-                    Duration::from_secs(6),
-                )
-            };
 
-            // 单个源请求超时(普通源 6 秒,spider 源 20 秒)
-            let resp = match timeout(request_timeout, client.get(&search_url).send()).await {
-                Ok(Ok(res)) if res.status().is_success() => res,
-                _ => {
-                    // 如果启用了流式搜索，即使失败也要发送事件
-                    if let Some(app_handle) = &app_handle_opt {
-                        // 尝试获取窗口 - 兼容桌面端和移动端
-                        let window = app_handle
-                            .get_webview_window("main")
-                            .or_else(|| app_handle.webview_windows().values().next().cloned());
-
-                        if let Some(window) = window {
-                            let mut count = completed.lock().await;
-                            *count += 1;
-                            let _ = window.emit(
-                                "search-stream-result",
-                                SearchStreamEvent {
-                                    results: vec![],
-                                    source: site_clone.key.clone(),
-                                    source_name: site_clone.name.clone(),
-                                    total_sources,
-                                    completed_sources: *count,
-                                },
-                            );
-                        }
-                    }
-                    return Some(vec![]);
-                }
-            };
-
-            let body = match timeout(Duration::from_secs(5), resp.text()).await {
-                Ok(Ok(text)) => text,
-                _ => {
-                    if let Some(app_handle) = &app_handle_opt {
-                        // 尝试获取窗口 - 兼容桌面端和移动端
-                        let window = app_handle
-                            .get_webview_window("main")
-                            .or_else(|| app_handle.webview_windows().values().next().cloned());
-
-                        if let Some(window) = window {
-                            let mut count = completed.lock().await;
-                            *count += 1;
-                            let _ = window.emit(
-                                "search-stream-result",
-                                SearchStreamEvent {
-                                    results: vec![],
-                                    source: site_clone.key.clone(),
-                                    source_name: site_clone.name.clone(),
-                                    total_sources,
-                                    completed_sources: *count,
-                                },
-                            );
-                        }
-                    }
-                    return Some(vec![]);
-                }
-            };
-
-            let mut source_results = Vec::new();
-            if let Ok(search_res) = serde_json::from_str::<ApiSearchResponse>(&body) {
-                source_results = search_res
-                    .list
-                    .into_iter()
-                    .map(|item| {
-                        let (episodes, episodes_titles) =
-                            parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
-                        SearchResult {
-                            id: match item.vod_id {
-                                Value::String(s) => s,
-                                Value::Number(n) => n.to_string(),
-                                _ => "".to_string(),
+            // 流式搜索失败/完成时发送事件(统一处理)
+            async fn emit_stream_event(
+                app_handle_opt: &Option<tauri::AppHandle>,
+                completed: &Arc<tokio::sync::Mutex<i32>>,
+                site_clone: &ApiSite,
+                total_sources: i32,
+                results: Vec<SearchResult>,
+            ) {
+                if let Some(app_handle) = app_handle_opt {
+                    let window = app_handle
+                        .get_webview_window("main")
+                        .or_else(|| app_handle.webview_windows().values().next().cloned());
+                    if let Some(window) = window {
+                        let mut count = completed.lock().await;
+                        *count += 1;
+                        let _ = window.emit(
+                            "search-stream-result",
+                            SearchStreamEvent {
+                                results,
+                                source: site_clone.key.clone(),
+                                source_name: site_clone.name.clone(),
+                                total_sources,
+                                completed_sources: *count,
                             },
-                            title: item.vod_name.trim().to_string(),
-                            poster: item.vod_pic,
-                            episodes,
-                            episodes_titles,
-                            source: site_clone.key.clone(),
-                            source_name: site_clone.name.clone(),
-                            class: item.vod_class,
-                            year: item.vod_year,
-                            desc: item.vod_content.map(|c| clean_html_tags(&c)),
-                            type_name: item.type_name,
-                            douban_id: item
-                                .vod_douban_id
-                                .and_then(|v| v.as_i64())
-                                .map(|v| v as i32),
-                        }
-                    })
-                    .collect::<Vec<SearchResult>>();
+                        );
+                    }
+                }
             }
 
-            // 在流式输出前进行内容关键词过滤（源已经在搜索前过滤了）
+            // 按 site_type 分流搜索,统一产出 Vec<SearchResult>
+            let mut source_results = match search_site_results(
+                &site_clone,
+                &query,
+                &client,
+                &cache_root,
+            )
+            .await
+            {
+                Ok(results) => results,
+                Err(_) => {
+                    emit_stream_event(&app_handle_opt, &completed, &site_clone, total_sources, vec![])
+                        .await;
+                    return None;
+                }
+            };
+
+            // 流式输出前进行内容关键词过滤(源已经在搜索前过滤了)
             if !disable_filter {
                 source_results.retain(|res| {
                     let type_name = res.type_name.as_deref().unwrap_or("");
-                    // 只需要检查关键词，因为18+源已经在搜索前被过滤掉了
                     !YELLOW_WORDS.iter().any(|w| type_name.contains(w))
                 });
             }
 
-            // 如果启用了流式搜索，立即发送该源的搜索结果给前端
-            if let Some(app_handle) = &app_handle_opt {
-                // 尝试获取窗口 - 兼容桌面端和移动端
-                let window = app_handle
-                    .get_webview_window("main")
-                    .or_else(|| app_handle.webview_windows().values().next().cloned());
-
-                if let Some(window) = window {
-                    let mut count = completed.lock().await;
-                    *count += 1;
-                    let _ = window.emit(
-                        "search-stream-result",
-                        SearchStreamEvent {
-                            results: source_results.clone(),
-                            source: site_clone.key.clone(),
-                            source_name: site_clone.name.clone(),
-                            total_sources,
-                            completed_sources: *count,
-                        },
-                    );
-                }
-            }
+            emit_stream_event(
+                &app_handle_opt,
+                &completed,
+                &site_clone,
+                total_sources,
+                source_results.clone(),
+            )
+            .await;
 
             Some(source_results)
         });
@@ -1422,6 +1434,56 @@ pub async fn search(
     Ok(results)
 }
 
+/// 按 site_type 分流获取详情: type=3 走 core spider_detail, type=1 走 CMS HTTP
+async fn fetch_detail_item(
+    site: &ApiSite,
+    id: &str,
+    cache_root: &std::path::Path,
+) -> Result<ApiSearchItem, String> {
+    if site.site_type.unwrap_or(1) == 3 {
+        let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
+        let spider = site.spider.clone().unwrap_or_default();
+        let item = quantumtv_core::spider::spider_detail(
+            &site.key, id, class_name, &spider, cache_root,
+        )
+        .await?;
+
+        Ok(ApiSearchItem {
+            vod_id: serde_json::Value::String(id.to_string()),
+            vod_name: item.vod_name,
+            vod_pic: item.vod_pic,
+            vod_remarks: item.vod_remarks,
+            vod_play_url: item.vod_play_url,
+            vod_class: item.vod_class,
+            vod_year: item.vod_year,
+            vod_content: item.vod_content,
+            vod_douban_id: item.vod_douban_id,
+            type_name: item.type_name,
+        })
+    } else {
+        let client = get_video_client();
+        let url = format!("{}?ac=videolist&ids={}", site.api, id);
+        let resp = timeout(Duration::from_secs(8), client.get(&url).send())
+            .await
+            .map_err(|_| "Failed to fetch detail: timeout".to_string())?
+            .map_err(|e| format!("Failed to fetch detail: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!("Failed to fetch detail: {}", resp.status()));
+        }
+        let body = timeout(Duration::from_secs(5), resp.text())
+            .await
+            .map_err(|_| "Failed to read response: timeout".to_string())?
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+        let search_res = serde_json::from_str::<ApiSearchResponse>(&body)
+            .map_err(|e| format!("Parse error: {}, body: {}", e, body))?;
+        search_res
+            .list
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Video not found".to_string())
+    }
+}
+
 #[tauri::command]
 pub async fn get_video_detail(
     source: String,
@@ -1432,33 +1494,12 @@ pub async fn get_video_detail(
     let config = get_config_with_db_sources(&storage, &db)?;
     let site = resolve_enabled_source(&config, &source)
         .ok_or_else(|| format!("Source not found or disabled: {}", source))?;
-    let client = get_video_client();
-
-    let url = format!("{}?ac=videolist&ids={}", site.api, id);
-
-    // 添加超时控制：8秒
-    let resp = match timeout(Duration::from_secs(8), client.get(&url).send()).await {
-        Ok(Ok(res)) => res,
-        _ => return Err("Failed to fetch detail: request timeout or network error".to_string()),
-    };
-
-    if !resp.status().is_success() {
-        return Err(format!("Failed to fetch detail: {}", resp.status()));
-    }
-
-    let body = match timeout(Duration::from_secs(5), resp.text()).await {
-        Ok(Ok(text)) => text,
-        _ => return Err("Failed to read response: timeout".to_string()),
-    };
-
-    let search_res = serde_json::from_str::<ApiSearchResponse>(&body)
-        .map_err(|e| format!("Parse error: {}, body: {}", e, body))?;
-
-    let item = search_res
-        .list
-        .into_iter()
-        .next()
-        .ok_or_else(|| "Video not found".to_string())?;
+    let cache_root = storage
+        .data_dir()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let item = fetch_detail_item(&site, &id, &cache_root).await?;
 
     let (episodes, episodes_titles) = parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
 
@@ -1497,30 +1538,12 @@ pub async fn get_video_detail_optimized(
     let config = get_config_with_db_sources(&storage, &db)?;
     let site = resolve_enabled_source(&config, &source)
         .ok_or_else(|| format!("Source not found or disabled: {}", source))?;
-    let client = get_video_client();
-    let url = format!("{}?ac=videolist&ids={}", site.api, id);
-
-    let resp = match timeout(Duration::from_secs(8), client.get(&url).send()).await {
-        Ok(Ok(res)) => res,
-        _ => return Err("Failed to fetch detail: timeout".to_string()),
-    };
-
-    if !resp.status().is_success() {
-        return Err(format!("Failed to fetch detail: {}", resp.status()));
-    }
-
-    let body = match timeout(Duration::from_secs(5), resp.text()).await {
-        Ok(Ok(text)) => text,
-        _ => return Err("Failed to read response: timeout".to_string()),
-    };
-
-    let search_res = serde_json::from_str::<ApiSearchResponse>(&body).map_err(|e| e.to_string())?;
-
-    let item = search_res
-        .list
-        .into_iter()
-        .next()
-        .ok_or_else(|| "Video not found".to_string())?;
+    let cache_root = storage
+        .data_dir()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let item = fetch_detail_item(&site, &id, &cache_root).await?;
 
     let (episodes, episodes_titles) = parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
 
