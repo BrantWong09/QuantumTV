@@ -192,6 +192,8 @@ pub async fn ensure_runner_compiled(cache_root: &Path) -> Result<PathBuf, String
     let output = tokio::process::Command::new("javac")
         .arg("-encoding")
         .arg("UTF-8")
+        .arg("--release")
+        .arg("17")
         .arg("-d")
         .arg(&runner_dir)
         .arg(&src_path)
