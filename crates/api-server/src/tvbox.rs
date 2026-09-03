@@ -1219,6 +1219,8 @@ async fn run_java_search(
         .arg("-cp")
         .arg(&classpath)
         .arg("SpiderRunner")
+        .arg(jar_path)
+        .arg("search")
         .arg(class_name)
         .arg(query)
         .output()

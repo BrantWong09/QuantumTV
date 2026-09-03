@@ -12,13 +12,14 @@ public class SpiderRunner {
 
     public static void main(String[] args) {
         String empty = "{\"list\":[]}";
-        if (args.length < 3) {
+        if (args.length < 4) {
             System.out.println(empty);
             return;
         }
         String jarPath = args[0];
-        String className = args[1];
-        String query = args[2];
+        String action = args[1];
+        String className = args[2];
+        String arg = args[3];
 
         try {
             URLClassLoader loader = new URLClassLoader(
@@ -29,8 +30,12 @@ public class SpiderRunner {
 
             tryInit(spider);
 
-            Object result = doSearch(spider, query);
-            String json = toJson(result, loader);
+            String json;
+            if ("detail".equals(action)) {
+                json = toDetailJson(doDetail(spider, arg), loader);
+            } else {
+                json = toJson(doSearch(spider, arg), loader);
+            }
             if (json == null) {
                 System.out.println(empty);
             } else {
@@ -72,6 +77,39 @@ public class SpiderRunner {
             }
         }
         return null;
+    }
+
+    private static Object doDetail(Object spider, String id) {
+        // Try detailContent(String[] ids) first, then detailContent(String id)
+        Method m = findMethod(spider, "detailContent", 1);
+        if (m != null) {
+            Class<?> paramType = m.getParameterTypes()[0];
+            if (paramType.isArray() || paramType == String[].class) {
+                try {
+                    return m.invoke(spider, new Object[]{new String[]{id}});
+                } catch (Exception ignored) {
+                }
+            }
+            try {
+                return m.invoke(spider, id);
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static String toDetailJson(Object result, ClassLoader loader) {
+        if (result == null) return null;
+        // If already a JSON string, output directly
+        if (result instanceof String) {
+            String s = (String) result;
+            s = s.trim();
+            if (s.startsWith("{") || s.startsWith("[")) {
+                return s;
+            }
+            return "{\"list\":[{\"vod_id\":0,\"vod_name\":\"\",\"vod_pic\":\"\",\"vod_play_url\":\"" + escape(s) + "\"}]}";
+        }
+        return toJson(result, loader);
     }
 
     private static Method findMethod(Object obj, String name, int paramCount) {
