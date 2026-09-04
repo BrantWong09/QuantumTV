@@ -159,6 +159,151 @@ pub fn has_emulator_device(devices_out: &str) -> bool {
     emulator_serial(devices_out).is_some()
 }
 
+pub fn parse_health_body(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("code").and_then(|c| c.as_i64()))
+        .map(|c| c == 200)
+        .unwrap_or(false)
+}
+
+pub(crate) async fn run_adb(adb: &Path, args: &[String]) -> Result<String, String> {
+    let output = tokio::process::Command::new(adb)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("执行 adb 失败: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "adb {:?} 失败: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+pub(crate) async fn probe_health(bridge_url: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .no_proxy()
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match client.get(format!("{}/health", bridge_url)).send().await {
+        Ok(resp) => match resp.text().await {
+            Ok(body) => parse_health_body(&body),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
+}
+
+pub(crate) async fn spawn_emulator(cfg: &BridgeConfig) -> Result<(), String> {
+    let emu = emulator_path(&cfg.sdk_root);
+    if !emu.exists() {
+        return Err(format!("emulator 不存在: {}", emu.display()));
+    }
+    let child = tokio::process::Command::new(&emu)
+        .args(&emulator_args(&cfg.avd))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("拉起模拟器失败: {}", e))?;
+    *EMU_CHILD.lock().unwrap() = Some(child);
+    set_we_started(true);
+    log::info!("[桥接] 模拟器 {} 拉起中", cfg.avd);
+    Ok(())
+}
+
+pub(crate) async fn wait_boot(adb: &Path, serial: &str) -> Result<(), String> {
+    let wait_args = vec!["-s".to_string(), serial.to_string(), "wait-for-device".to_string()];
+    run_adb(adb, &wait_args).await?;
+    let prop_args = vec![
+        "-s".to_string(),
+        serial.to_string(),
+        "shell".to_string(),
+        "getprop".to_string(),
+        "sys.boot_completed".to_string(),
+    ];
+    // 指数退避 1s→5s，总上限 120s
+    let mut delay = std::time::Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("等待模拟器启动超时 (120s)".to_string());
+        }
+        if let Ok(out) = run_adb(adb, &prop_args).await {
+            if out.trim() == "1" {
+                log::info!("[桥接] 模拟器 {} 启动完成", serial);
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(std::time::Duration::from_secs(5));
+    }
+}
+
+pub(crate) async fn ensure_apk_installed(
+    adb: &Path,
+    serial: &str,
+    apk_path: &Path,
+) -> Result<(), String> {
+    let pkg = "com.quantumtv.bridge";
+    let check_args = vec![
+        "-s".to_string(),
+        serial.to_string(),
+        "shell".to_string(),
+        "pm".to_string(),
+        "path".to_string(),
+        pkg.to_string(),
+    ];
+    if let Ok(out) = run_adb(adb, &check_args).await {
+        if out.trim_start().starts_with("package:") {
+            log::info!("[桥接] APK 已安装，跳过");
+            return Ok(());
+        }
+    }
+    if !apk_path.exists() {
+        return Err(format!(
+            "桥接 APK 未安装且本地不存在: {}（可先运行 android/spider-bridge/build.ps1，或设置 QUANTUMTV_BRIDGE_APK）",
+            apk_path.display()
+        ));
+    }
+    let install_args = vec![
+        "-s".to_string(),
+        serial.to_string(),
+        "install".to_string(),
+        "-r".to_string(),
+        apk_path.display().to_string(),
+    ];
+    run_adb(adb, &install_args).await?;
+    log::info!("[桥接] APK 安装完成");
+    Ok(())
+}
+
+pub(crate) async fn start_bridge_service(adb: &Path, serial: &str) -> Result<(), String> {
+    let args = vec![
+        "-s".to_string(),
+        serial.to_string(),
+        "shell".to_string(),
+        "am".to_string(),
+        "start-foreground-service".to_string(),
+        "-n".to_string(),
+        "com.quantumtv.bridge/.BridgeService".to_string(),
+    ];
+    run_adb(adb, &args).await?;
+    log::info!("[桥接] BridgeService 启动指令已发送");
+    Ok(())
+}
+
+pub(crate) async fn forward_port(adb: &Path, host_port: u16) -> Result<(), String> {
+    let args = vec!["forward".to_string()].into_iter().chain(forward_args(host_port, 8080)).collect::<Vec<_>>();
+    run_adb(adb, &args).await.map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +387,14 @@ mod tests {
         assert!(!has_emulator_device("List of devices attached\n"));
         assert!(!has_emulator_device("List of devices attached\nemulator-5554\toffline\n"));
         assert!(!has_emulator_device("List of devices attached\nABC123\tdevice\n"), "非 emulator- 前缀不算");
+    }
+
+    #[test]
+    fn health_body_parsing() {
+        assert!(parse_health_body(r#"{"code":200,"err":"ok","data":{"initialized":true}}"#));
+        assert!(parse_health_body(r#"{"code":200,"err":"ok"}"#));
+        assert!(!parse_health_body(r#"{"code":500,"err":"boom"}"#));
+        assert!(!parse_health_body("not json"));
+        assert!(!parse_health_body(""));
     }
 }
