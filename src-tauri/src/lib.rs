@@ -148,6 +148,13 @@ pub fn run() {
             // 启动所有后台任务
             scheduler::start_background_tasks(app.handle().clone());
 
+            // 桥接自动拉起（ADR 0002 Phase 4，失败静默降级）
+            tauri::async_runtime::spawn(async {
+                if let Err(e) = quantumtv_core::bridge::ensure_ready().await {
+                    log::warn!("[桥接] 后台拉起失败: {}", e);
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -289,6 +296,11 @@ pub fn run() {
             commands::analytics::generate_analytics_report,
             commands::analytics::clear_analytics_cache,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                tauri::async_runtime::block_on(quantumtv_core::bridge::shutdown());
+            }
+        });
 }
