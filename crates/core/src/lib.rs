@@ -1,5 +1,6 @@
 pub mod admin_config;
 pub mod adult;
+pub mod bridge;
 pub mod playback;
 pub mod search_aggregation;
 pub mod source_selection;
