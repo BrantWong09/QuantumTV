@@ -20,3 +20,7 @@ rusqlite = { workspace = true }
 image = { workspace = true }
 moka = { workspace = true }
 log = "0.4"
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tokio = { workspace = true }
