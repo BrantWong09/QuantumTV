@@ -220,7 +220,10 @@ pub(crate) async fn spawn_emulator(cfg: &BridgeConfig) -> Result<(), String> {
 
 pub(crate) async fn wait_boot(adb: &Path, serial: &str) -> Result<(), String> {
     let wait_args = vec!["-s".to_string(), serial.to_string(), "wait-for-device".to_string()];
-    run_adb(adb, &wait_args).await?;
+    // wait-for-device 在模拟器未出现时会无限阻塞，必须限时，保证 wait_boot 总时长不超过 120s
+    tokio::time::timeout(std::time::Duration::from_secs(120), run_adb(adb, &wait_args))
+        .await
+        .map_err(|_| format!("等待设备 {} 上线超时 (120s)", serial))??;
     let prop_args = vec![
         "-s".to_string(),
         serial.to_string(),
