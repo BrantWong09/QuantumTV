@@ -70,3 +70,6 @@ opencode.json
 key.properties
 **/*.jks
 /docs
+
+# bridge apk build output
+android/spider-bridge/out/

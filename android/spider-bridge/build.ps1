@@ -73,4 +73,8 @@ java -Xmx1024M -jar "$bt\lib\apksigner.jar" sign --ks $ks --ks-pass pass:android
 if ($LASTEXITCODE -ne 0) { throw "apksigner failed" }
 
 java -jar "$bt\lib\apksigner.jar" verify "$root\out\bridge.apk"
-Write-Host "BUILD OK: $root\out\bridge.apk"
+
+# 输出到仓库稳定路径，供 core bridge ensure_apk_installed 默认使用
+New-Item -ItemType Directory -Path "$PSScriptRoot\out" -Force | Out-Null
+Copy-Item "$root\out\bridge.apk" "$PSScriptRoot\out\bridge.apk" -Force
+Write-Host "BUILD OK: $PSScriptRoot\out\bridge.apk"
