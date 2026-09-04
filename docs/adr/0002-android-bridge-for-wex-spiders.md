@@ -94,6 +94,6 @@
 
 ## 后续工作
 
-- Phase 4: 桌面端自动拉起 AVD + adb forward + 桥接健康检查
+- ~~Phase 4: 桌面端自动拉起 AVD + adb forward + 桥接健康检查~~（已完成，2026-09-04，见 crates/core/src/bridge）
 - 内容 spider（Wexzhizhen 等）返回 null 的业务配置初始化（配置中心 ext 链路）
 - bridge_url 配置进管理界面而非环境变量
