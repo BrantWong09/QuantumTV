@@ -118,6 +118,47 @@ pub(crate) fn set_we_started(v: bool) {
     WE_STARTED.store(v, Ordering::SeqCst);
 }
 
+pub fn adb_path(sdk_root: &Path) -> PathBuf {
+    sdk_root.join("platform-tools").join("adb.exe")
+}
+
+pub fn emulator_path(sdk_root: &Path) -> PathBuf {
+    sdk_root.join("emulator").join("emulator.exe")
+}
+
+pub fn emulator_args(avd: &str) -> Vec<String> {
+    vec![
+        "-avd".to_string(),
+        avd.to_string(),
+        "-no-snapshot-save".to_string(),
+        "-no-boot-anim".to_string(),
+        "-gpu".to_string(),
+        "auto".to_string(),
+    ]
+}
+
+pub fn forward_args(host_port: u16, device_port: u16) -> Vec<String> {
+    vec![format!("tcp:{}", host_port), format!("tcp:{}", device_port)]
+}
+
+/// 从 `adb devices` 输出提取处于 device 状态的模拟器 serial
+pub fn emulator_serial(devices_out: &str) -> Option<String> {
+    devices_out
+        .lines()
+        .skip(1) // 跳过 "List of devices attached"
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let serial = it.next()?;
+            let state = it.next()?;
+            (serial.starts_with("emulator-") && state == "device").then(|| serial.to_string())
+        })
+        .next()
+}
+
+pub fn has_emulator_device(devices_out: &str) -> bool {
+    emulator_serial(devices_out).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +213,34 @@ mod tests {
         for s in [BridgeStatus::Idle, BridgeStatus::Starting, BridgeStatus::Ready, BridgeStatus::Failed] {
             assert_eq!(BridgeStatus::from_u8(s.as_u8()), s);
         }
+    }
+
+    #[test]
+    fn paths_and_args() {
+        let sdk = Path::new("D:/Android/Sdk");
+        assert_eq!(adb_path(sdk), PathBuf::from("D:/Android/Sdk/platform-tools/adb.exe"));
+        assert_eq!(emulator_path(sdk), PathBuf::from("D:/Android/Sdk/emulator/emulator.exe"));
+        assert_eq!(
+            emulator_args("wexbridge"),
+            vec![
+                "-avd".to_string(),
+                "wexbridge".to_string(),
+                "-no-snapshot-save".to_string(),
+                "-no-boot-anim".to_string(),
+                "-gpu".to_string(),
+                "auto".to_string(),
+            ]
+        );
+        assert_eq!(forward_args(18080, 8080), vec!["tcp:18080".to_string(), "tcp:8080".to_string()]);
+    }
+
+    #[test]
+    fn emulator_serial_parsing() {
+        let out = "List of devices attached\nemulator-5554\tdevice\n\n";
+        assert_eq!(emulator_serial(out).as_deref(), Some("emulator-5554"));
+        assert!(has_emulator_device(out));
+        assert!(!has_emulator_device("List of devices attached\n"));
+        assert!(!has_emulator_device("List of devices attached\nemulator-5554\toffline\n"));
+        assert!(!has_emulator_device("List of devices attached\nABC123\tdevice\n"), "非 emulator- 前缀不算");
     }
 }
