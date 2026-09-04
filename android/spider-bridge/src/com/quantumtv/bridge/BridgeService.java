@@ -28,9 +28,15 @@ import java.util.concurrent.ExecutorService;
 public class BridgeService extends Service {
     private static final String TAG = "Bridge";
     private static final int PORT = 8080;
+    /** wex 系 spider 的配置入口 (AES 加密返回配置服务器地址) */
+    private static final String WEX_CONFIG_URL = "https://9280.kstore.vip/api.txt";
     private ServerSocket server;
     private ExecutorService pool;
     private boolean initialized = false;
+    /** 站点级 ext 配置, /init 时由桌面端传入; TVBoxOSC 在 getSpider 后调用 spider.init(context, ext) */
+    private volatile String extConfig = "";
+    /** 已初始化的 spider 实例缓存: TVBoxOSC 同样按 jar+site 缓存, init 只跑一次 */
+    private final Map<String, Object> spiderCache = new HashMap<>();
 
     @Override
     public IBinder onBind(Intent intent) { return null; }
@@ -74,28 +80,45 @@ public class BridgeService extends Service {
         }
     }
 
+    /** 从原始流读一行(以 \n 结尾, 去掉尾部 \r); 全程按字节, 不经缓冲 Reader, 避免预读吃掉 body 字节 */
+    private String readLineRaw(java.io.InputStream in) throws Exception {
+        java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+        int b;
+        boolean any = false;
+        while ((b = in.read()) != -1) {
+            any = true;
+            if (b == '\n') break;
+            buf.write(b);
+        }
+        if (!any) return null;
+        String s = buf.toString("UTF-8");
+        return s.endsWith("\r") ? s.substring(0, s.length() - 1) : s;
+    }
+
     private void handle(Socket s) {
         try {
-            BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream(), java.nio.charset.StandardCharsets.UTF_8));
-            String line = r.readLine();
+            // 注意: Content-Length 是字节数, 必须按字节读完整 body 再按 UTF-8 解码;
+            // 用 Reader 按 char 读会在中文(多字节)请求上凑不满字符数而永久阻塞
+            java.io.InputStream in = s.getInputStream();
+            String line = readLineRaw(in);
             if (line == null) { s.close(); return; }
             String[] parts = line.split(" ");
             String method = parts[0];
             String path = parts[1];
             int contentLength = 0;
-            while ((line = r.readLine()) != null && !line.isEmpty()) {
+            while ((line = readLineRaw(in)) != null && !line.isEmpty()) {
                 if (line.toLowerCase().startsWith("content-length:")) {
                     contentLength = Integer.parseInt(line.split(":", 2)[1].trim());
                 }
             }
-            char[] body = new char[contentLength];
+            byte[] body = new byte[contentLength];
             int read = 0;
             while (read < contentLength) {
-                int n = r.read(body, read, contentLength - read);
+                int n = in.read(body, read, contentLength - read);
                 if (n < 0) break;
                 read += n;
             }
-            String bodyStr = new String(body, 0, read);
+            String bodyStr = new String(body, 0, read, java.nio.charset.StandardCharsets.UTF_8);
             Log.i(TAG, method + " " + path + " body=" + bodyStr);
 
             String resp;
@@ -144,6 +167,11 @@ public class BridgeService extends Service {
 
     private String doInit(String body) {
         try {
+            if (body != null && !body.isEmpty()) {
+                String ext = parseField(body, "ext");
+                if (ext != null) extConfig = ext;
+            }
+            ensureWexNativeLibs();
             Class<?> initCls = Class.forName("com.github.catvod.spider.Init");
             initCls.getMethod("init", Context.class).invoke(null, getApplication());
             initialized = true;
@@ -151,6 +179,104 @@ public class BridgeService extends Service {
         } catch (Throwable t) {
             Log.e(TAG, "init failed", t);
             return json(500, t.toString(), null);
+        }
+    }
+
+    /**
+     * wex 系 spider 依赖 files/TV/ 下的 native 库 (libLoadNiMa.so 等), 由原版宿主
+     * 启动时下载。这里复刻该逻辑: api.txt(AES) → 配置服务器 → go.php(AES) → 按 ABI 下载。
+     * 任一环节失败仅打日志, 不阻塞 spider 初始化 (非 wex 站点不需要这些库)。
+     */
+    private void ensureWexNativeLibs() {
+        try {
+            File tvDir = new File(getFilesDir(), "TV");
+            if (!tvDir.exists()) tvDir.mkdirs();
+            String conf = httpGetString(WEX_CONFIG_URL);
+            if (conf == null) { Log.w(TAG, "wex conf fetch failed"); return; }
+            String base = decryptWex(conf);
+            if (base == null || base.isEmpty()) { Log.w(TAG, "wex conf decrypt failed"); return; }
+            String goRaw = httpGetString(base + "/go.php");
+            if (goRaw == null) { Log.w(TAG, "go.php fetch failed"); return; }
+            String goJson = decryptWex(goRaw);
+            if (goJson == null) { Log.w(TAG, "go.php decrypt failed"); return; }
+            org.json.JSONObject go = new org.json.JSONObject(goJson);
+            // libLoadNiMa.so → wex_* 条目; libdecjni.so → hxq_* 条目 (awenc 库)
+            String key = abiKey();
+            downloadIfSizeMismatch(tvDir, go, "libLoadNiMa.so", "wex_" + key + "_size", "wex_" + key + "_url");
+            downloadIfSizeMismatch(tvDir, go, "libdecjni.so", "hxq_" + key + "_size", "hxq_" + key + "_url");
+        } catch (Throwable t) {
+            Log.w(TAG, "ensureWexNativeLibs: " + t);
+        }
+    }
+
+    /** go.php 配置中对应当前设备 ABI 的 key 段 (v7/v8/x86/x86_64) */
+    private String abiKey() {
+        String abi = Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "";
+        boolean isX86 = abi.startsWith("x86");
+        if (abi.contains("64")) return isX86 ? "x86_64" : "v8";
+        return isX86 ? "x86" : "v7";
+    }
+
+    /** 大小不符才下载 (go.php 提供 expected size) */
+    private void downloadIfSizeMismatch(File tvDir, org.json.JSONObject go, String fileName, String sizeKey, String urlKey) {
+        try {
+            if (!go.has(urlKey)) { Log.w(TAG, "no url for " + urlKey); return; }
+            long expected = go.getLong(sizeKey);
+            File target = new File(tvDir, fileName);
+            if (target.exists() && target.length() == expected) return;
+            Log.i(TAG, "downloading " + fileName + " from " + go.getString(urlKey));
+            byte[] data = httpGetBytes(go.getString(urlKey));
+            if (data == null || data.length != expected) { Log.w(TAG, "size mismatch after download: " + (data == null ? -1 : data.length)); return; }
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(target);
+            fos.write(data);
+            fos.close();
+            target.setReadable(true, false);
+            target.setExecutable(true, false);
+            Log.i(TAG, "saved " + fileName + " (" + data.length + " bytes)");
+        } catch (Throwable t) {
+            Log.w(TAG, "downloadIfSizeMismatch " + fileName + ": " + t);
+        }
+    }
+
+    /** AES/CBC/PKCS7 解密 wex 配置 (key/iv 为固定混淆串) */
+    private String decryptWex(String base64) {
+        try {
+            byte[] ct = android.util.Base64.decode(base64.trim(), android.util.Base64.DEFAULT);
+            javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("AES/CBC/PKCS5Padding");
+            cipher.init(javax.crypto.Cipher.DECRYPT_MODE,
+                new javax.crypto.spec.SecretKeySpec("nifanbianyikeyia".getBytes("UTF-8"), "AES"),
+                new javax.crypto.spec.IvParameterSpec("keyijiangjiudian".getBytes("UTF-8")));
+            return new String(cipher.doFinal(ct), "UTF-8").trim();
+        } catch (Throwable t) {
+            Log.w(TAG, "decryptWex: " + t);
+            return null;
+        }
+    }
+
+    private String httpGetString(String url) {
+        byte[] data = httpGetBytes(url);
+        return data == null ? null : new String(data, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private byte[] httpGetBytes(String url) {
+        java.net.HttpURLConnection conn = null;
+        try {
+            conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(20000);
+            conn.setRequestProperty("User-Agent", "okhttp/4.12.0");
+            java.io.InputStream in = conn.getResponseCode() >= 400 ? conn.getErrorStream() : conn.getInputStream();
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) bos.write(buf, 0, n);
+            in.close();
+            return bos.toByteArray();
+        } catch (Throwable t) {
+            Log.w(TAG, "httpGet " + url + ": " + t);
+            return null;
+        } finally {
+            if (conn != null) conn.disconnect();
         }
     }
 
@@ -209,8 +335,32 @@ public class BridgeService extends Service {
             Class<?> initCls = Class.forName("com.github.catvod.spider.Init");
             if (!initialized) initCls.getMethod("init", Context.class).invoke(null, getApplication());
             Method getSpider = initCls.getMethod("getSpider", String.class);
-            Object spider = getSpider.invoke(null, fqn);
-            if (spider == null) return json(404, "spider not found: " + fqn, null);
+            Object spider;
+            synchronized (spiderCache) {
+                spider = spiderCache.get(fqn);
+                if (spider == null) {
+                    spider = getSpider.invoke(null, fqn);
+                    if (spider == null) return json(404, "spider not found: " + fqn, null);
+                    // TVBoxOSC 流程: newInstance 后必须调用 init(context, ext), 否则部分
+                    // spider (如 wex 系) 的资源初始化(libLoadNiMa.so 提取)不会执行
+                    try {
+                        java.lang.reflect.Field keyField = findField(spider.getClass(), "siteKey");
+                        if (keyField != null) {
+                            keyField.setAccessible(true);
+                            keyField.set(spider, className);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    try {
+                        spider.getClass()
+                            .getMethod("init", Context.class, String.class)
+                            .invoke(spider, getApplication(), extConfig);
+                    } catch (NoSuchMethodException e) {
+                        spider.getClass().getMethod("init", Context.class).invoke(spider, getApplication());
+                    }
+                    spiderCache.put(fqn, spider);
+                }
+            }
             Method m = spider.getClass().getMethod(method, paramTypes);
             Object result = m.invoke(spider, args);
             String data = result == null ? "null" : result.toString();
@@ -219,6 +369,17 @@ public class BridgeService extends Service {
             Log.e(TAG, "invokeSpider failed", t);
             return json(500, t.toString(), null);
         }
+    }
+
+    /** 反射向上查找字段 (wex 系 Spider 基类有 public siteKey 字段) */
+    private static java.lang.reflect.Field findField(Class<?> clz, String name) {
+        for (Class<?> c = clz; c != null; c = c.getSuperclass()) {
+            try {
+                return c.getDeclaredField(name);
+            } catch (NoSuchFieldException ignored) {
+            }
+        }
+        return null;
     }
 
     private String parseField(String body, String key) {
