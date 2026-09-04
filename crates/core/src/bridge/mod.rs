@@ -382,14 +382,15 @@ async fn startup_steps(cfg: &BridgeConfig) -> Result<(), String> {
 }
 
 async fn wait_device_online(adb: &Path, cfg: &BridgeConfig) -> Result<String, String> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    // 模拟器注册到 adb 可能超过 15s（冷启动/AVD 锁释放），给足 60s
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let out = run_adb(adb, &["devices".to_string()]).await?;
         if let Some(s) = emulator_serial(&out) {
             return Ok(s);
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("模拟器 {} 未出现在设备列表 (15s)", cfg.avd));
+            return Err(format!("模拟器 {} 未出现在设备列表 (60s)", cfg.avd));
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
