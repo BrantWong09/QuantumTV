@@ -840,7 +840,10 @@ pub(crate) fn resolve_enabled_source(config: &Value, source_key: &str) -> Option
                         .map(|v| v.to_string()),
                     searchable: s.get("searchable").and_then(|v| v.as_i64()).map(|v| v as i32),
                 };
-                validate_remote_url_against_config(&site.api, config).ok()?;
+                // Spider 站点(type=3)的 api 是 csp_ 类名而非 URL，跳过 URL 校验
+                if site.site_type != Some(3) {
+                    validate_remote_url_against_config(&site.api, config).ok()?;
+                }
                 Some(site)
             })
         })
@@ -1218,7 +1221,11 @@ pub(crate) async fn search_with_cache_hit(
                         return None;
                     }
                     let api = s.get("api")?.as_str()?.to_string();
-                    validate_remote_url_against_config(&api, &config).ok()?;
+                    // Spider 站点(type=3)的 api 是 csp_ 类名而非 URL，跳过 URL 校验
+                    let site_type3 = s.get("site_type").and_then(|v| v.as_i64()).map(|v| v as i32) == Some(3);
+                    if !site_type3 {
+                        validate_remote_url_against_config(&api, &config).ok()?;
+                    }
                     Some(ApiSite {
                         key: s.get("key")?.as_str()?.to_string(),
                         api,
