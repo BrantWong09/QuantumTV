@@ -307,6 +307,120 @@ pub(crate) async fn forward_port(adb: &Path, host_port: u16) -> Result<(), Strin
     run_adb(adb, &args).await.map(|_| ())
 }
 
+/// 应用启动钩子调用：读取环境变量并执行完整拉起流程（幂等，可并发调用）
+pub async fn ensure_ready() -> Result<(), String> {
+    ensure_ready_with(BridgeConfig::from_env()).await
+}
+
+pub async fn ensure_ready_with(cfg: BridgeConfig) -> Result<(), String> {
+    if !cfg.enabled {
+        return Ok(());
+    }
+    if !try_begin_start() {
+        return Ok(()); // 已在 Starting/Ready，直接复用
+    }
+    let result = startup_steps(&cfg).await;
+    match result {
+        Ok(()) => {
+            set_status(BridgeStatus::Ready);
+            log::info!("[桥接] 就绪: {}", cfg.bridge_url);
+            Ok(())
+        }
+        Err(e) => {
+            set_status(BridgeStatus::Failed);
+            log::warn!("[桥接] 静默降级: {}", e);
+            Err(e)
+        }
+    }
+}
+
+async fn startup_steps(cfg: &BridgeConfig) -> Result<(), String> {
+    let adb = adb_path(&cfg.sdk_root);
+    if !adb.exists() {
+        return Err(format!("adb 不存在: {}", adb.display()));
+    }
+
+    // 快路径: 桥接已可用（上次会话遗留的模拟器/APK），只补 forward
+    if probe_health(&cfg.bridge_url).await {
+        forward_port(&adb, cfg.host_port).await?;
+        log::info!("[桥接] 复用已运行的桥接");
+        return Ok(());
+    }
+
+    // 1. 模拟器在跑吗？没有则拉起
+    let devices = run_adb(&adb, &["devices".to_string()]).await?;
+    let serial = match emulator_serial(&devices) {
+        Some(s) => s,
+        None => {
+            spawn_emulator(cfg).await?;
+            // 等设备出现在列表（offline→device 由 wait_boot 内的 wait-for-device 兜底）
+            wait_device_online(&adb, cfg).await?
+        }
+    };
+
+    // 2. 等系统启动完成
+    wait_boot(&adb, &serial).await?;
+
+    // 3. APK
+    ensure_apk_installed(&adb, &serial, &cfg.apk_path).await?;
+
+    // 4. forward + 启动服务
+    forward_port(&adb, cfg.host_port).await?;
+    start_bridge_service(&adb, &serial).await?;
+
+    // 5. 健康轮询（30s 上限，1s 间隔）
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if probe_health(&cfg.bridge_url).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("桥接健康检查超时 (30s)".to_string());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+async fn wait_device_online(adb: &Path, cfg: &BridgeConfig) -> Result<String, String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let out = run_adb(adb, &["devices".to_string()]).await?;
+        if let Some(s) = emulator_serial(&out) {
+            return Ok(s);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("模拟器 {} 未出现在设备列表 (15s)", cfg.avd));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// 应用退出钩子调用：只关闭自己拉起的模拟器
+pub async fn shutdown() {
+    if !we_started() {
+        return;
+    }
+    let cfg = BridgeConfig::from_env();
+    let adb = adb_path(&cfg.sdk_root);
+    // 1. 优雅关闭
+    let _ = run_adb(&adb, &["emu".to_string(), "kill".to_string()]).await;
+    // 2. 最多等 3s
+    let child = EMU_CHILD.lock().unwrap().take();
+    if let Some(mut child) = child {
+        for _ in 0..6 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                log::info!("[桥接] 模拟器已退出");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let _ = child.kill().await;
+    }
+    set_we_started(false);
+    set_status(BridgeStatus::Idle);
+    log::info!("[桥接] 已关闭");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +513,16 @@ mod tests {
         assert!(!parse_health_body(r#"{"code":500,"err":"boom"}"#));
         assert!(!parse_health_body("not json"));
         assert!(!parse_health_body(""));
+    }
+
+    #[test]
+    fn ensure_ready_with_disabled_config_is_noop() {
+        set_status(BridgeStatus::Idle);
+        let cfg = BridgeConfig::from_map(&map(&[("QUANTUMTV_BRIDGE_ENABLED", "0")]));
+        // 用同步 runtime 包一层，仅验证短路行为，不触发任何进程
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let r = rt.block_on(ensure_ready_with(cfg));
+        assert!(r.is_ok());
+        assert_eq!(status(), BridgeStatus::Idle, "禁用时不改变状态");
     }
 }
