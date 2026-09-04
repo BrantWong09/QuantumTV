@@ -91,6 +91,8 @@ static STATUS: AtomicU8 = AtomicU8::new(0);
 static WE_STARTED: AtomicBool = AtomicBool::new(false);
 /// 本进程拉起的模拟器句柄；shutdown 时使用
 pub(crate) static EMU_CHILD: Mutex<Option<tokio::process::Child>> = Mutex::new(None);
+/// 本进程拉起的模拟器 serial；shutdown 时用它精准关闭对应设备
+pub(crate) static STARTED_SERIAL: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn status() -> BridgeStatus {
     BridgeStatus::from_u8(STATUS.load(Ordering::SeqCst))
@@ -143,6 +145,11 @@ pub fn forward_args(host_port: u16, device_port: u16) -> Vec<String> {
 
 /// 从 `adb devices` 输出提取处于 device 状态的模拟器 serial
 pub fn emulator_serial(devices_out: &str) -> Option<String> {
+    emulator_serials(devices_out).into_iter().next()
+}
+
+/// `adb devices` 输出中所有处于 device 状态的模拟器 serial
+fn emulator_serials(devices_out: &str) -> Vec<String> {
     devices_out
         .lines()
         .skip(1) // 跳过 "List of devices attached"
@@ -152,11 +159,34 @@ pub fn emulator_serial(devices_out: &str) -> Option<String> {
             let state = it.next()?;
             (serial.starts_with("emulator-") && state == "device").then(|| serial.to_string())
         })
-        .next()
+        .collect()
 }
 
 pub fn has_emulator_device(devices_out: &str) -> bool {
-    emulator_serial(devices_out).is_some()
+    !emulator_serials(devices_out).is_empty()
+}
+
+/// 从 `adb -s <serial> emu avd name` 输出解析 AVD 名。
+/// 兼容两种格式：`OK: <name>`（旧版 platform-tools 单行）与 `<name>\nOK`（新版两行）。
+pub fn parse_avd_name(out: &str) -> Option<String> {
+    let lines: Vec<&str> = out.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    // 旧版: "OK: wexbridge"
+    for l in &lines {
+        if let Some(name) = l.strip_prefix("OK:") {
+            let name = name.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    // 新版: 首个非噪音行为 AVD 名，且必须伴随独立一行 "OK"
+    let name = lines.iter().copied().find(|l| {
+        !l.starts_with("OK:")
+            && *l != "OK"
+            && !l.starts_with("error:")
+            && !l.starts_with("Android Console")
+    })?;
+    lines.iter().any(|l| *l == "OK").then(|| name.to_string())
 }
 
 pub fn parse_health_body(body: &str) -> bool {
@@ -170,6 +200,7 @@ pub fn parse_health_body(body: &str) -> bool {
 pub(crate) async fn run_adb(adb: &Path, args: &[String]) -> Result<String, String> {
     let output = tokio::process::Command::new(adb)
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("执行 adb 失败: {}", e))?;
@@ -220,7 +251,7 @@ pub(crate) async fn spawn_emulator(cfg: &BridgeConfig) -> Result<(), String> {
 
 pub(crate) async fn wait_boot(adb: &Path, serial: &str) -> Result<(), String> {
     let wait_args = vec!["-s".to_string(), serial.to_string(), "wait-for-device".to_string()];
-    // wait-for-device 在模拟器未出现时会无限阻塞，必须限时，保证 wait_boot 总时长不超过 120s
+    // wait-for-device 在模拟器未出现时会无限阻塞，必须限时（wait_boot 两段各限时 120s，最坏约 240s）
     tokio::time::timeout(std::time::Duration::from_secs(120), run_adb(adb, &wait_args))
         .await
         .map_err(|_| format!("等待设备 {} 上线超时 (120s)", serial))??;
@@ -347,16 +378,27 @@ async fn startup_steps(cfg: &BridgeConfig) -> Result<(), String> {
         return Ok(());
     }
 
-    // 1. 模拟器在跑吗？没有则拉起
+    // 1. 模拟器在跑吗？只认配置 AVD 的 serial，绝不劫持外部其他模拟器
     let devices = run_adb(&adb, &["devices".to_string()]).await?;
-    let serial = match emulator_serial(&devices) {
+    let mut serial: Option<String> = None;
+    for s in emulator_serials(&devices) {
+        if serial_matches_avd(&adb, &s, &cfg.avd).await {
+            log::info!("[桥接] 复用运行中的 AVD {} ({})", cfg.avd, s);
+            serial = Some(s);
+            break;
+        }
+    }
+    let serial = match serial {
         Some(s) => s,
         None => {
             spawn_emulator(cfg).await?;
-            // 等设备出现在列表（offline→device 由 wait_boot 内的 wait-for-device 兜底）
-            wait_device_online(&adb, cfg).await?
+            // 等配置 AVD 的 serial 出现（offline→device 由 wait_boot 内的 wait-for-device 兜底）
+            wait_for_avd_serial(&adb, cfg).await?
         }
     };
+    if we_started() {
+        *STARTED_SERIAL.lock().unwrap() = Some(serial.clone());
+    }
 
     // 2. 等系统启动完成
     wait_boot(&adb, &serial).await?;
@@ -381,13 +423,31 @@ async fn startup_steps(cfg: &BridgeConfig) -> Result<(), String> {
     }
 }
 
-async fn wait_device_online(adb: &Path, cfg: &BridgeConfig) -> Result<String, String> {
+/// serial 是否为配置的 AVD
+async fn serial_matches_avd(adb: &Path, serial: &str, avd: &str) -> bool {
+    let args = vec![
+        "-s".to_string(),
+        serial.to_string(),
+        "emu".to_string(),
+        "avd".to_string(),
+        "name".to_string(),
+    ];
+    match run_adb(adb, &args).await {
+        Ok(out) => parse_avd_name(&out).as_deref() == Some(avd),
+        Err(_) => false,
+    }
+}
+
+/// 轮询等待配置 AVD 的模拟器 serial 出现并处于 device 状态
+async fn wait_for_avd_serial(adb: &Path, cfg: &BridgeConfig) -> Result<String, String> {
     // 模拟器注册到 adb 可能超过 15s（冷启动/AVD 锁释放），给足 60s
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let out = run_adb(adb, &["devices".to_string()]).await?;
-        if let Some(s) = emulator_serial(&out) {
-            return Ok(s);
+        for s in emulator_serials(&out) {
+            if serial_matches_avd(adb, &s, &cfg.avd).await {
+                return Ok(s);
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("模拟器 {} 未出现在设备列表 (60s)", cfg.avd));
@@ -403,8 +463,14 @@ pub async fn shutdown() {
     }
     let cfg = BridgeConfig::from_env();
     let adb = adb_path(&cfg.sdk_root);
-    // 1. 优雅关闭
-    let _ = run_adb(&adb, &["emu".to_string(), "kill".to_string()]).await;
+    // 1. 优雅关闭：优先用记住的 serial 精准关闭，拿不到时退回无 serial 广播
+    let serial = STARTED_SERIAL.lock().unwrap().take();
+    let _ = match serial {
+        Some(s) => {
+            run_adb(&adb, &["-s".to_string(), s, "emu".to_string(), "kill".to_string()]).await
+        }
+        None => run_adb(&adb, &["emu".to_string(), "kill".to_string()]).await,
+    };
     // 2. 最多等 3s
     let child = EMU_CHILD.lock().unwrap().take();
     if let Some(mut child) = child {
@@ -505,6 +571,32 @@ mod tests {
         assert!(!has_emulator_device("List of devices attached\n"));
         assert!(!has_emulator_device("List of devices attached\nemulator-5554\toffline\n"));
         assert!(!has_emulator_device("List of devices attached\nABC123\tdevice\n"), "非 emulator- 前缀不算");
+    }
+
+    #[test]
+    fn emulator_serials_collects_all() {
+        let out = "List of devices attached\nemulator-5554\tdevice\nemulator-5556\tdevice\nemulator-5558\toffline\nABC123\tdevice\n";
+        assert_eq!(
+            emulator_serials(out),
+            vec!["emulator-5554".to_string(), "emulator-5556".to_string()]
+        );
+        assert_eq!(emulator_serial(out).as_deref(), Some("emulator-5554"));
+    }
+
+    #[test]
+    fn parse_avd_name_parsing() {
+        assert_eq!(parse_avd_name("OK: wexbridge\r\n").as_deref(), Some("wexbridge"));
+        assert_eq!(parse_avd_name("error: unknown host service").as_deref(), None);
+        assert_eq!(parse_avd_name("").as_deref(), None);
+    }
+
+    #[test]
+    fn parse_avd_name_two_line_ok_format() {
+        // 新版 platform-tools: 第一行为 AVD 名，随后独立一行 OK（实测输出）
+        assert_eq!(parse_avd_name("wexbridge\r\r\nOK\r\r\n").as_deref(), Some("wexbridge"));
+        assert_eq!(parse_avd_name("wexbridge\nOK\n").as_deref(), Some("wexbridge"));
+        assert_eq!(parse_avd_name("OK\n").as_deref(), None);
+        assert_eq!(parse_avd_name("error: device offline\nOK\n").as_deref(), None);
     }
 
     #[test]
