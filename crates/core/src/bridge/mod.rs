@@ -11,16 +11,35 @@ pub struct BridgeConfig {
     pub host_port: u16,
     pub bridge_url: String,
     pub apk_path: PathBuf,
+    /// env QUANTUMTV_BRIDGE_URL，Phase A 首候选
+    pub url_override: Option<String>,
+    /// env QUANTUMTV_BRIDGE_REMOTE_URL，远程桥接地址
+    pub remote_url: Option<String>,
+    /// env QUANTUMTV_BRIDGE_ADB_ADDRESSES，逗号/换行分隔
+    pub adb_addresses: Vec<String>,
+    /// env QUANTUMTV_BRIDGE_AUTO_SCAN，"0"=false，默认 true
+    pub auto_scan: bool,
 }
 
-const ENV_KEYS: [&str; 6] = [
+const ENV_KEYS: [&str; 9] = [
     "QUANTUMTV_BRIDGE_ENABLED",
     "QUANTUMTV_BRIDGE_AVD",
     "QUANTUMTV_BRIDGE_SDK",
     "QUANTUMTV_ADB_HOST_PORT",
     "QUANTUMTV_BRIDGE_URL",
     "QUANTUMTV_BRIDGE_APK",
+    "QUANTUMTV_BRIDGE_REMOTE_URL",
+    "QUANTUMTV_BRIDGE_ADB_ADDRESSES",
+    "QUANTUMTV_BRIDGE_AUTO_SCAN",
 ];
+
+/// 逗号/换行分隔的地址串 → 去空白、去空的地址数组
+fn normalize_addr_list(s: &str) -> Vec<String> {
+    s.split([',', '\n'])
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect()
+}
 
 impl BridgeConfig {
     /// 纯函数入口，便于测试；from_env 只收集已知键后委托到这里
@@ -33,15 +52,26 @@ impl BridgeConfig {
             .or_else(default_sdk_root)
             .unwrap_or_else(|| PathBuf::from("Android/Sdk"));
         let host_port = m.get("QUANTUMTV_ADB_HOST_PORT").and_then(|v| v.parse().ok()).unwrap_or(18080);
-        let bridge_url = m
+        let url_override = m
             .get("QUANTUMTV_BRIDGE_URL")
-            .cloned()
-            .unwrap_or_else(|| format!("http://127.0.0.1:{}", host_port));
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // bridge_url 恒为本地 forward 地址，不再被 env 覆盖
+        let bridge_url = format!("http://127.0.0.1:{}", host_port);
+        let remote_url = m
+            .get("QUANTUMTV_BRIDGE_REMOTE_URL")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let adb_addresses = m
+            .get("QUANTUMTV_BRIDGE_ADB_ADDRESSES")
+            .map(|s| normalize_addr_list(s))
+            .unwrap_or_default();
+        let auto_scan = m.get("QUANTUMTV_BRIDGE_AUTO_SCAN").map(|v| v != "0").unwrap_or(true);
         let apk_path = m
             .get("QUANTUMTV_BRIDGE_APK")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("android/spider-bridge/out/bridge.apk"));
-        BridgeConfig { enabled, avd, sdk_root, host_port, bridge_url, apk_path }
+        BridgeConfig { enabled, avd, sdk_root, host_port, bridge_url, apk_path, url_override, remote_url, adb_addresses, auto_scan }
     }
 
     pub fn from_env() -> BridgeConfig {
@@ -521,8 +551,33 @@ mod tests {
         assert_eq!(cfg.avd, "myavd");
         assert_eq!(cfg.sdk_root, PathBuf::from("D:/Android/Sdk"));
         assert_eq!(cfg.host_port, 19090);
-        assert_eq!(cfg.bridge_url, "http://127.0.0.1:1234"); // 显式 URL 不被端口拼接覆盖
+        // QUANTUMTV_BRIDGE_URL 现在是 Phase A 首候选（url_override），bridge_url 恒为本地地址
+        assert_eq!(cfg.url_override.as_deref(), Some("http://127.0.0.1:1234"));
+        assert_eq!(cfg.bridge_url, "http://127.0.0.1:19090");
         assert_eq!(cfg.apk_path, PathBuf::from("C:/bridge.apk"));
+    }
+
+    #[test]
+    fn config_remote_keys() {
+        let cfg = BridgeConfig::from_map(&map(&[
+            ("QUANTUMTV_BRIDGE_REMOTE_URL", " http://192.168.1.20:8080 "),
+            ("QUANTUMTV_BRIDGE_ADB_ADDRESSES", " 127.0.0.1:5555 ,\n127.0.0.1:16384 , ,"),
+            ("QUANTUMTV_BRIDGE_AUTO_SCAN", "0"),
+        ]));
+        assert_eq!(cfg.remote_url.as_deref(), Some("http://192.168.1.20:8080"));
+        assert_eq!(cfg.adb_addresses, vec!["127.0.0.1:5555", "127.0.0.1:16384"]);
+        assert!(!cfg.auto_scan);
+    }
+
+    #[test]
+    fn config_remote_keys_default_and_empty() {
+        let cfg = BridgeConfig::from_map(&map(&[
+            ("QUANTUMTV_BRIDGE_REMOTE_URL", "   "),
+            ("QUANTUMTV_BRIDGE_ADB_ADDRESSES", " , ,"),
+        ]));
+        assert_eq!(cfg.remote_url, None);
+        assert!(cfg.adb_addresses.is_empty());
+        assert!(cfg.auto_scan, "未配置默认开启扫描");
     }
 
     #[test]
