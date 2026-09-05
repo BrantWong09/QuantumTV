@@ -68,10 +68,13 @@ const CAS_HEADERS: &[(&str, &str)] = &[
 ];
 
 /// 夸克扫码: 第一步, 取 token + 二维码内容
+/// 注意: 必须 GET + v=1.2 + request_id 参数, POST/缺参会生成旧版会话, App 扫码确认时报"登录请求已过期"
 pub async fn quark_scan_start() -> Result<ScanSession, String> {
-    let (status, json, _) = http_json(
-        "https://uop.quark.cn/cas/ajax/getTokenForQrcodeLogin?client_id=532",
-        reqwest::Method::POST, CAS_HEADERS, None).await?;
+    let request_id = uuid_v4();
+    let url = format!(
+        "https://uop.quark.cn/cas/ajax/getTokenForQrcodeLogin?client_id=532&v=1.2&request_id={request_id}"
+    );
+    let (status, json, _) = http_json(&url, reqwest::Method::GET, CAS_HEADERS, None).await?;
     if status != 200 {
         return Err(format!("scan start HTTP {status}"));
     }
@@ -93,14 +96,19 @@ pub async fn quark_scan_start() -> Result<ScanSession, String> {
 /// 夸克扫码: 第二步, 轮询确认状态; 确认后立即换 cookie
 /// 返回 (state, Option<account>): state ∈ waiting | confirmed
 pub async fn quark_scan_poll(token: &str) -> Result<(String, Option<CloudAccount>), String> {
+    let request_id = uuid_v4();
     let url = format!(
-        "https://uop.quark.cn/cas/ajax/getServiceTicketByQrcodeToken?client_id=532&token={token}"
+        "https://uop.quark.cn/cas/ajax/getServiceTicketByQrcodeToken?client_id=532&v=1.2&token={token}&request_id={request_id}"
     );
     let (status, json, _) = http_json(&url, reqwest::Method::GET, CAS_HEADERS, None).await?;
     if status != 200 {
         return Err(format!("scan poll HTTP {status}"));
     }
-    // 50004001 = 等待扫码
+    // 50004001 = 等待扫码; 50004002 = 二维码无效或已过期
+    let code = json["status"].as_i64().unwrap_or(0);
+    if code == 50004002 {
+        return Err("登录请求已过期, 请重新发起扫码".into());
+    }
     let st = json["data"]["st"].as_str().map(|s| s.to_string());
     match st {
         None => Ok(("waiting".into(), None)),
@@ -109,6 +117,42 @@ pub async fn quark_scan_poll(token: &str) -> Result<(String, Option<CloudAccount
             Ok(("confirmed".into(), Some(account)))
         }
     }
+}
+
+/// 轻量 uuid v4 (无需依赖: 随机 16 字节格式化)
+fn uuid_v4() -> String {
+    let mut buf = [0u8; 16];
+    let _ = getrandom_fill(&mut buf);
+    buf[6] = (buf[6] & 0x0f) | 0x40; // version 4
+    buf[8] = (buf[8] & 0x3f) | 0x80; // variant
+    let h = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        h(&buf[0..4]),
+        h(&buf[4..6]),
+        h(&buf[6..8]),
+        h(&buf[8..10]),
+        h(&buf[10..16])
+    )
+}
+
+fn getrandom_fill(buf: &mut [u8]) -> Result<(), String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // std 无 CSPRNG; 混合时间+指针熵, 仅用于 request_id 去重 (非安全场景)
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seed = t.as_nanos();
+    let addr = buf.as_ptr() as u64;
+    for (i, b) in buf.iter_mut().enumerate() {
+        let mut x = (seed as u64)
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add((i as u64 + 1) * 1442695040888963407)
+            ^ addr;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51afd7ed558ccd);
+        x ^= x >> 33;
+        *b = (x >> 24) as u8;
+    }
+    Ok(())
 }
 
 /// 夸克扫码: 第三步, st → account/info → Set-Cookie 全套
