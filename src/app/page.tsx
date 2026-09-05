@@ -3,17 +3,10 @@
 'use client';
 
 import { invoke } from '@tauri-apps/api/core';
-import { ChevronRight, Sparkles, X } from 'lucide-react';
-import Link from 'next/link';
+import { Sparkles, X } from 'lucide-react';
 import { Suspense, useEffect, useState } from 'react';
 
-import {
-  BangumiItem,
-  DoubanItem,
-  FavoriteCard,
-  HomeBootstrapResponse,
-  HomePageData,
-} from '@/lib/types';
+import { FavoriteCard, HomeBootstrapResponse } from '@/lib/types';
 
 interface RecommendationItem {
   title: string;
@@ -28,16 +21,12 @@ import {
   getRailItemClass,
 } from '@/lib/ui-layout';
 import { subscribeToDataUpdates } from '@/lib/utils';
-import {
-  extractFromBangumiItem,
-  extractFromDoubanItem,
-  useContentPoolSync,
-} from '@/hooks/useContentPoolSync';
 import { useImagePreload } from '@/hooks/useImagePreload';
 import { useScrollRestoration } from '@/hooks/useScrollRestoration';
 
 import CapsuleSwitch from '@/components/CapsuleSwitch';
 import ContinueWatching from '@/components/ContinueWatching';
+import HomeCatalogSection from '@/components/HomeCatalogSection';
 import PageLayout from '@/components/PageLayout';
 import ScrollableRow from '@/components/ScrollableRow';
 import { useSite } from '@/components/SiteProvider';
@@ -45,10 +34,6 @@ import VideoCard from '@/components/VideoCard';
 
 function HomeClient() {
   const [activeTab, setActiveTab] = useState<'home' | 'favorites'>('home');
-  const [hotMovies, setHotMovies] = useState<DoubanItem[]>([]);
-  const [hotTvShows, setHotTvShows] = useState<DoubanItem[]>([]);
-  const [hotVarietyShows, setHotVarietyShows] = useState<DoubanItem[]>([]);
-  const [todayBangumi, setTodayBangumi] = useState<BangumiItem[]>([]);
   const [recommendations, setRecommendations] = useState<RecommendationItem[]>(
     [],
   );
@@ -60,15 +45,8 @@ function HomeClient() {
   // 收藏夹数据
   const [favoriteItems, setFavoriteItems] = useState<FavoriteCard[]>([]);
 
-  // 内容池同步
-  const { batchSyncToContentPool } = useContentPoolSync();
-
   // 图片预加载：提取所有图片 URL
   const allImageUrls = [
-    ...hotMovies.map((m) => m.poster),
-    ...hotTvShows.map((m) => m.poster),
-    ...hotVarietyShows.map((m) => m.poster),
-    ...todayBangumi.map((item) => item.images?.large || item.images?.common),
     ...favoriteItems.map((f) => f.poster),
   ].filter((url): url is string => Boolean(url)); // 过滤空值并确保类型
 
@@ -86,23 +64,7 @@ function HomeClient() {
           weekday: null,
           announcement: announcement || null,
         });
-        const homeData: HomePageData = data.homeData;
-        setHotMovies(homeData.hotMovies);
-        setHotTvShows(homeData.hotTvShows);
-        setHotVarietyShows(homeData.hotVarietyShows);
-        setTodayBangumi(homeData.todayBangumi);
         setShowAnnouncement(data.shouldShowAnnouncement);
-
-        // 自动同步内容到内容池（后台异步执行）
-        setTimeout(() => {
-          const allItems = [
-            ...homeData.hotMovies.map(extractFromDoubanItem),
-            ...homeData.hotTvShows.map(extractFromDoubanItem),
-            ...homeData.hotVarietyShows.map(extractFromDoubanItem),
-            ...homeData.todayBangumi.map(extractFromBangumiItem),
-          ];
-          batchSyncToContentPool(allItems);
-        }, 1000);
 
         // 加载推荐内容
         try {
@@ -126,7 +88,6 @@ function HomeClient() {
     };
 
     loadHomeBootstrap();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [announcement]);
 
   // 处理收藏数据更新的函数
@@ -166,16 +127,6 @@ function HomeClient() {
       console.error('保存公告状态失败:', error);
     }
   };
-
-  // 骨架屏组件
-  const SkeletonCard = () => (
-    <div className={getRailItemClass('default')}>
-      <div className='relative aspect-2/3 w-full overflow-hidden rounded-xl bg-gradient-to-br from-gray-200 to-gray-300 dark:from-gray-800 dark:to-gray-700 animate-pulse'>
-        <div className='absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent animate-shimmer' />
-      </div>
-      <div className='mt-2.5 h-4 bg-gray-200 dark:bg-gray-700 rounded-lg animate-pulse w-3/4 mx-auto' />
-    </div>
-  );
 
   return (
     <PageLayout>
@@ -269,162 +220,8 @@ function HomeClient() {
                 </section>
               )}
 
-              {/* 热门电影 */}
-              <section className={appLayoutClasses.sectionGap}>
-                <div className='mb-5 flex items-center justify-between'>
-                  <h2 className='text-lg font-bold text-gray-800 max-[375px]:text-base min-[834px]:text-[1.35rem] min-[1440px]:text-[1.5rem] dark:text-gray-100'>
-                    热门电影
-                  </h2>
-                  <Link
-                    href='/douban?type=movie'
-                    className='tap-target flex items-center px-2 text-sm text-purple-600 transition-colors group hover:text-purple-700 dark:text-purple-400 dark:hover:text-purple-300'
-                  >
-                    查看更多
-                    <ChevronRight className='w-4 h-4 ml-0.5 group-hover:translate-x-0.5 transition-transform' />
-                  </Link>
-                </div>
-                <ScrollableRow>
-                  {loading
-                    ? Array.from({ length: 8 }).map((_, index) => (
-                        <SkeletonCard key={index} />
-                      ))
-                    : hotMovies.map((movie, index) => (
-                        <div
-                          key={index}
-                          className={getRailItemClass('default')}
-                        >
-                          <VideoCard
-                            from='douban'
-                            title={movie.title}
-                            poster={movie.poster}
-                            douban_id={Number(movie.id)}
-                            rate={movie.rate}
-                            year={movie.year}
-                            type='movie'
-                          />
-                        </div>
-                      ))}
-                </ScrollableRow>
-              </section>
-
-              {/* 热门剧集 */}
-              <section className={appLayoutClasses.sectionGap}>
-                <div className='mb-5 flex items-center justify-between'>
-                  <h2 className='text-lg font-bold text-gray-800 max-[375px]:text-base min-[834px]:text-[1.35rem] min-[1440px]:text-[1.5rem] dark:text-gray-100'>
-                    热门剧集
-                  </h2>
-                  <Link
-                    href='/douban?type=tv'
-                    className='tap-target flex items-center px-2 text-sm text-purple-600 transition-colors group hover:text-purple-700 dark:text-purple-400 dark:hover:text-purple-300'
-                  >
-                    查看更多
-                    <ChevronRight className='w-4 h-4 ml-0.5 group-hover:translate-x-0.5 transition-transform' />
-                  </Link>
-                </div>
-                <ScrollableRow>
-                  {loading
-                    ? Array.from({ length: 8 }).map((_, index) => (
-                        <SkeletonCard key={index} />
-                      ))
-                    : hotTvShows.map((show, index) => (
-                        <div
-                          key={index}
-                          className={getRailItemClass('default')}
-                        >
-                          <VideoCard
-                            from='douban'
-                            title={show.title}
-                            poster={show.poster}
-                            douban_id={Number(show.id)}
-                            rate={show.rate}
-                            year={show.year}
-                          />
-                        </div>
-                      ))}
-                </ScrollableRow>
-              </section>
-
-              {/* 每日新番放送 */}
-              <section className={appLayoutClasses.sectionGap}>
-                <div className='mb-5 flex items-center justify-between'>
-                  <h2 className='text-lg font-bold text-gray-800 max-[375px]:text-base min-[834px]:text-[1.35rem] min-[1440px]:text-[1.5rem] dark:text-gray-100'>
-                    新番放送
-                  </h2>
-                  <Link
-                    href='/douban?type=anime'
-                    className='tap-target flex items-center px-2 text-sm text-purple-600 transition-colors group hover:text-purple-700 dark:text-purple-400 dark:hover:text-purple-300'
-                  >
-                    查看更多
-                    <ChevronRight className='w-4 h-4 ml-0.5 group-hover:translate-x-0.5 transition-transform' />
-                  </Link>
-                </div>
-                <ScrollableRow>
-                  {loading
-                    ? Array.from({ length: 8 }).map((_, index) => (
-                        <SkeletonCard key={index} />
-                      ))
-                    : todayBangumi.map((anime, index) => (
-                        <div
-                          key={`${anime.id}-${index}`}
-                          className={getRailItemClass('default')}
-                        >
-                          <VideoCard
-                            from='douban'
-                            title={anime.name_cn || anime.name}
-                            poster={
-                              anime.images?.large ||
-                              anime.images?.common ||
-                              anime.images?.medium ||
-                              anime.images?.small ||
-                              anime.images?.grid ||
-                              '/logo.png'
-                            }
-                            douban_id={anime.id}
-                            rate={anime.rating?.score?.toFixed(1) || ''}
-                            year={anime.air_date?.split('-')?.[0] || ''}
-                            isBangumi={true}
-                          />
-                        </div>
-                      ))}
-                </ScrollableRow>
-              </section>
-
-              {/* 热门综艺 */}
-              <section className={appLayoutClasses.sectionGap}>
-                <div className='mb-5 flex items-center justify-between'>
-                  <h2 className='text-lg font-bold text-gray-800 max-[375px]:text-base min-[834px]:text-[1.35rem] min-[1440px]:text-[1.5rem] dark:text-gray-100'>
-                    热门综艺
-                  </h2>
-                  <Link
-                    href='/douban?type=show'
-                    className='tap-target flex items-center px-2 text-sm text-purple-600 transition-colors group hover:text-purple-700 dark:text-purple-400 dark:hover:text-purple-300'
-                  >
-                    查看更多
-                    <ChevronRight className='w-4 h-4 ml-0.5 group-hover:translate-x-0.5 transition-transform' />
-                  </Link>
-                </div>
-                <ScrollableRow>
-                  {loading
-                    ? Array.from({ length: 8 }).map((_, index) => (
-                        <SkeletonCard key={index} />
-                      ))
-                    : hotVarietyShows.map((show, index) => (
-                        <div
-                          key={index}
-                          className={getRailItemClass('default')}
-                        >
-                          <VideoCard
-                            from='douban'
-                            title={show.title}
-                            poster={show.poster}
-                            douban_id={Number(show.id)}
-                            rate={show.rate}
-                            year={show.year}
-                          />
-                        </div>
-                      ))}
-                </ScrollableRow>
-              </section>
+              {/* 配置源目录 */}
+              <HomeCatalogSection />
             </>
           )}
         </div>
