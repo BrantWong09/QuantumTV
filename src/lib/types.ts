@@ -378,3 +378,28 @@ export interface PreferBestSourceResponse {
   best_source: SearchResult;
   test_results: Array<[string, SourceTestResult]>;
 }
+
+/** 首页目录：一个订阅源的分类 + 每分类下的视频 */
+export interface HomeCatalogResponse {
+  source_key: string;
+  source_name: string;
+  site_type: number;
+  categories: HomeCategoryRow[];
+}
+
+export interface HomeCategoryRow {
+  type_id: string;
+  type_name: string;
+  list: HomeVideoCard[];
+}
+
+export interface HomeVideoCard {
+  id: string;
+  title: string;
+  poster: string;
+  year?: string | null;
+  episodes: string[];
+  class?: string | null;
+  source: string;
+  source_name: string;
+}
