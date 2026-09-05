@@ -34,6 +34,7 @@ import {
   FolderOpen,
   GripVertical,
   Plus,
+  Radio,
   RefreshCw,
   Settings,
   Trash2,
@@ -47,6 +48,7 @@ import { AdminConfig } from '@/lib/admin.types';
 import { appLayoutClasses } from '@/lib/ui-layout';
 
 import AnalyticsDashboard from '@/components/AnalyticsDashboard';
+import BridgeSettings from '@/components/BridgeSettings';
 import DatabaseImportExport, {
   ConfirmModal,
 } from '@/components/DatabaseImportExport';
@@ -1437,6 +1439,7 @@ function AdminPageContent() {
     version: true,
     configSubscription: false,
     videoSource: false,
+    bridge: false,
     categoryConfig: false,
     liveSource: false,
     databaseImportExport: false,
@@ -1546,6 +1549,16 @@ function AdminPageContent() {
             onUpdate={replaceConfig}
             showAlert={showAlert}
           />
+        </CollapsibleTab>
+
+        {/* 桥接设置 */}
+        <CollapsibleTab
+          title='桥接设置'
+          icon={<Radio className='w-5 h-5 text-orange-500' />}
+          isExpanded={expandedTabs.bridge}
+          onToggle={() => toggleTab('bridge')}
+        >
+          <BridgeSettings showAlert={showAlert} />
         </CollapsibleTab>
 
         {/* 自定义分类 */}
