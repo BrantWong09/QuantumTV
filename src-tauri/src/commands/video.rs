@@ -3828,3 +3828,255 @@ mod tests {
         assert_eq!(derive_search_type_filter(None), None);
     }
 }
+
+// ---------- 首页目录（Home Catalog） ----------
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HomeCatalogResponse {
+    pub source_key: String,
+    pub source_name: String,
+    pub site_type: i32,
+    pub categories: Vec<HomeCategoryRow>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HomeCategoryRow {
+    pub type_id: String,
+    pub type_name: String,
+    pub list: Vec<HomeVideoCard>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HomeVideoCard {
+    pub id: String,
+    pub title: String,
+    pub poster: String,
+    pub year: Option<String>,
+    pub episodes: Vec<String>,
+    pub class: Option<String>,
+    pub source: String,
+    pub source_name: String,
+}
+
+const HOME_CATALOG_MAX_VIDEOS_PER_CATEGORY: usize = 8;
+const HOME_CATALOG_TTL_SECS: u64 = 300;
+
+struct CachedHomeCatalog {
+    response: HomeCatalogResponse,
+    fetched_at: std::time::Instant,
+}
+
+static HOME_CATALOG_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, CachedHomeCatalog>>,
+> = std::sync::OnceLock::new();
+
+fn home_catalog_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, CachedHomeCatalog>> {
+    HOME_CATALOG_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn stringify_category_type_id(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn api_search_item_to_home_card(item: ApiSearchItem, source: &ApiSite) -> HomeVideoCard {
+    let (episodes, _) = parse_episodes_for(item.vod_play_url.as_deref().unwrap_or(""), false);
+    HomeVideoCard {
+        id: match item.vod_id {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => String::new(),
+        },
+        title: item.vod_name.trim().to_string(),
+        poster: item.vod_pic,
+        year: item.vod_year,
+        episodes,
+        class: item.vod_class,
+        source: source.key.clone(),
+        source_name: source.name.clone(),
+    }
+}
+
+#[tauri::command]
+pub async fn get_home_catalog(
+    source_key: String,
+    storage: State<'_, StorageManager>,
+    db: State<'_, crate::db::db_client::Db>,
+) -> Result<HomeCatalogResponse, String> {
+    let config = get_config_with_db_sources(&storage, &db)?;
+    let source = resolve_enabled_source(&config, &source_key)
+        .ok_or_else(|| format!("Source not found or disabled: {}", source_key))?;
+
+    let site_type = source.site_type.unwrap_or(1);
+
+    // Spider 站点无目录能力，直接返回空
+    if site_type == 3 {
+        return Ok(HomeCatalogResponse {
+            source_key: source.key,
+            source_name: source.name,
+            site_type: 3,
+            categories: Vec::new(),
+        });
+    }
+
+    // TTL 缓存命中
+    {
+        let map = home_catalog_cache().lock().unwrap();
+        if let Some(cached) = map.get(&source_key) {
+            if cached.fetched_at.elapsed().as_secs() < HOME_CATALOG_TTL_SECS {
+                return Ok(cached.response.clone());
+            }
+        }
+    }
+
+    // 1) 拉取分类列表
+    let class_url = source_url(&source.api, "?ac=class");
+    let class_body = get_video_client()
+        .get(&class_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let categories = parse_source_categories(&class_body).unwrap_or_default();
+
+    // 2) 并行拉每个分类的视频（pg=1，截前 N 条）
+    let client = get_video_client();
+    let mut handles = Vec::with_capacity(categories.len());
+    for (idx, cat) in categories.iter().enumerate() {
+        let type_id = stringify_category_type_id(&cat.type_id);
+        if type_id.is_empty() {
+            continue;
+        }
+        let api = source.api.clone();
+        let client = client.clone();
+        let source_clone = source.clone();
+        handles.push((idx, tokio::spawn(async move {
+            let url = source_url(
+                &api,
+                &format!("?ac=videolist&t={}&pg=1", urlencoding::encode(&type_id)),
+            );
+            let resp = match client.get(&url).send().await {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
+            let resp = match resp.error_for_status() {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
+            let body = match resp.text().await {
+                Ok(t) => t,
+                Err(_) => return Vec::new(),
+            };
+            let items = parse_source_videos(&body).unwrap_or_default();
+            let mut cards: Vec<HomeVideoCard> = items
+                .into_iter()
+                .take(HOME_CATALOG_MAX_VIDEOS_PER_CATEGORY)
+                .map(|item| api_search_item_to_home_card(item, &source_clone))
+                .collect();
+            cards.retain(|c| !c.id.is_empty());
+            cards
+        })));
+    }
+
+    let mut indexed: Vec<(usize, Vec<HomeVideoCard>)> = Vec::new();
+    for (idx, handle) in handles {
+        match handle.await {
+            Ok(cards) => indexed.push((idx, cards)),
+            Err(_) => indexed.push((idx, Vec::new())),
+        }
+    }
+    indexed.sort_by_key(|(i, _)| *i);
+
+    let mut category_rows = Vec::with_capacity(categories.len());
+    for (idx, cat) in categories.iter().enumerate() {
+        let list = indexed
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default();
+        category_rows.push(HomeCategoryRow {
+            type_id: stringify_category_type_id(&cat.type_id),
+            type_name: cat.type_name.clone(),
+            list,
+        });
+    }
+
+    let response = HomeCatalogResponse {
+        source_key: source.key,
+        source_name: source.name,
+        site_type,
+        categories: category_rows,
+    };
+
+    // 写缓存
+    {
+        let mut map = home_catalog_cache().lock().unwrap();
+        map.insert(
+            source_key,
+            CachedHomeCatalog {
+                response: response.clone(),
+                fetched_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    Ok(response)
+}
+
+#[cfg(test)]
+mod home_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn stringify_category_type_id_handles_number_and_string() {
+        assert_eq!(stringify_category_type_id(&serde_json::json!(1)), "1");
+        assert_eq!(
+            stringify_category_type_id(&serde_json::json!("2")),
+            "2"
+        );
+        assert_eq!(stringify_category_type_id(&serde_json::json!(null)), "");
+    }
+
+    #[test]
+    fn api_search_item_to_home_card_maps_fields() {
+        let source = ApiSite {
+            key: "src1".to_string(),
+            api: "http://x".to_string(),
+            name: "SourceOne".to_string(),
+            detail: None,
+            is_adult: None,
+            site_type: Some(1),
+            spider: None,
+            searchable: Some(1),
+        };
+        let item = ApiSearchItem {
+            vod_id: serde_json::json!(42),
+            vod_name: "  Test Movie  ".to_string(),
+            vod_pic: "http://pic".to_string(),
+            vod_remarks: None,
+            vod_play_url: Some("http://a.m3u8$$$http://b.m3u8".to_string()),
+            vod_class: Some("电影".to_string()),
+            vod_year: Some("2020".to_string()),
+            vod_content: None,
+            vod_douban_id: None,
+            type_name: None,
+        };
+        let card = api_search_item_to_home_card(item, &source);
+        assert_eq!(card.id, "42");
+        assert_eq!(card.title, "Test Movie");
+        assert_eq!(card.source, "src1");
+        assert_eq!(card.source_name, "SourceOne");
+        assert_eq!(card.year.as_deref(), Some("2020"));
+        assert_eq!(card.class.as_deref(), Some("电影"));
+        assert_eq!(card.episodes.len(), 2);
+    }
+}
