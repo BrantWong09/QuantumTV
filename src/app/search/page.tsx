@@ -106,6 +106,9 @@ function SearchPageClient() {
     [],
   );
 
+  // 流式搜索的渐进式结果: 每个站点完成即上屏(客户端聚合), 搜索完成后被权威结果替换
+  const streamingRef = useRef<SearchResult[]>([]);
+
   useEffect(() => {
     const query = currentQueryRef.current;
     if (!query) return;
@@ -268,6 +271,8 @@ function SearchPageClient() {
     // 清空之前的进度
     setTotalSources(0);
     setCompletedSources(0);
+    // 重置流式累积
+    streamingRef.current = [];
 
     // 调用搜索命令
     invoke<SearchPageOpenResponse>('search_page_open', { query: qParam })
@@ -330,13 +335,59 @@ function SearchPageClient() {
 
     const setupListeners = async () => {
       try {
-        // 监听流式结果事件
+        // 监听流式结果事件: 增量累积已到达的站点结果, 立即分组上屏
         unlistenStream = await listen<any>('search-stream-result', (event) => {
-          const { total_sources, completed_sources } = event.payload;
+          const { total_sources, completed_sources, results } = event.payload;
           setTotalSources(total_sources);
           setCompletedSources(completed_sources);
 
-          // 流式搜索时，实时调用 apply_search_filter 更新结果
+          // 把本站结果并入累积列表(按 source+id 去重)
+          if (Array.isArray(results) && results.length > 0) {
+            const seen = new Set(
+              streamingRef.current.map((r) => `${r.source}|${r.id}`),
+            );
+            const fresh = results.filter(
+              (r: SearchResult) => !seen.has(`${r.source}|${r.id}`),
+            );
+            if (fresh.length === 0) return;
+            streamingRef.current = [...streamingRef.current, ...fresh];
+
+            // 客户端同步聚合: 标题+年份+单/剧集数 分组 (与后端 aggregate 逻辑一致)
+            const map = new Map<string, AggregatedGroup>();
+            for (const item of streamingRef.current) {
+              const key = `${item.title.replace(/ /g, '')}-${
+                item.year || 'unknown'
+              }-${item.episodes.length === 1 ? 'movie' : 'tv'}`;
+              const group = map.get(key);
+              if (group) {
+                if (!group.source_names.includes(item.source_name)) {
+                  group.source_names.push(item.source_name);
+                }
+                group.episodes = Math.max(group.episodes, item.episodes.length);
+              } else {
+                map.set(key, {
+                  representative: item,
+                  episodes: item.episodes.length,
+                  source_names: [item.source_name],
+                  douban_id: item.douban_id ?? undefined,
+                });
+              }
+            }
+            setAggregatedGroups(map);
+            // 全部视图: 新结果按标题包含关键词优先排序后上屏
+            const q = qParam.trim().toLowerCase();
+            const sorted = [...streamingRef.current].sort((a, b) => {
+              const aMatch = a.title.toLowerCase().includes(q) ? 0 : 1;
+              const bMatch = b.title.toLowerCase().includes(q) ? 0 : 1;
+              return aMatch - bMatch || a.title.length - b.title.length;
+            });
+            setFilteredAllResults(sorted);
+          }
+        });
+
+        // 监听搜索完成事件: 后端权威聚合(含过滤/排序)替换渐进式结果
+        unlistenCompleted = await listen<any>('search-stream-completed', () => {
+          streamingRef.current = [];
           invoke<{
             aggregatedEntries: Array<[string, AggregatedGroup]>;
             filteredResults: SearchResult[];
@@ -359,11 +410,9 @@ function SearchPageClient() {
               setAggregatedGroups(new Map(filterResponse.aggregatedEntries));
               setFilteredAllResults(filterResponse.filteredResults);
             })
-            .catch(console.error);
-        });
-
-        // 监听搜索完成事件
-        unlistenCompleted = await listen<any>('search-stream-completed', () => {
+            .catch(() => {
+              /* 保留渐进式结果 */
+            });
           setIsLoading(false);
         });
       } catch (err) {
