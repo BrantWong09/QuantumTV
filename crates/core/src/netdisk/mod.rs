@@ -81,7 +81,11 @@ pub async fn quark_scan_start() -> Result<ScanSession, String> {
         .to_string();
     Ok(ScanSession {
         drive: "quark".into(),
-        qr_content: format!("https://su.quark.cn/4_EWfmyUj?token={token}"),
+        // 固定短码 4_eMHBJ = 夸克官方登录入口(xiaoya 等项目统一硬编码), token 走 query 参数
+        qr_content: format!(
+            "https://su.quark.cn/4_eMHBJ?token={}&client_id=532&ssb=weblogin",
+            urlencoding::encode(&token)
+        ),
         token,
     })
 }
