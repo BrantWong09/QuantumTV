@@ -506,12 +506,18 @@ async fn startup_steps(cfg: &BridgeConfig) -> Result<(), String> {
             log::warn!("[桥接] Phase B 总超时，转入官方 AVD");
             break;
         }
-        // connect 幂等；失败不中断（该地址可能不是 adb 端口）
-        let _ = run_adb(&adb, &["connect".to_string(), addr.clone()]).await;
+        // connect 幂等；失败不中断（该地址可能不是 adb 端口）；单地址 5s 上限防个别地址卡死
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_adb(&adb, &["connect".to_string(), addr.clone()]),
+        )
+        .await;
         if !wait_serial_device(&adb, &addr, 5).await {
             continue;
         }
-        if try_adb_device(&adb, &addr, cfg, b_deadline).await.is_ok() {
+        // 手动地址 = 用户显式指定即授权安装；扫描发现的地址只探活复用，绝不装 APK（防误连无关 Android 实例）
+        let manual = cfg.adb_addresses.contains(&addr);
+        if try_adb_device(&adb, &addr, cfg, b_deadline, manual).await.is_ok() {
             set_effective(&cfg.bridge_url, EFFECTIVE_EMULATOR);
             log::info!("[桥接] 第三方模拟器桥接就绪: {}", addr);
             return Ok(());
@@ -555,7 +561,10 @@ async fn wait_serial_device(adb: &Path, serial: &str, secs: u64) -> bool {
     }
 }
 
-/// 单个第三方设备完整链路: 等就绪 → 装 APK → forward → 启动服务 → 健康轮询（受总 deadline 约束）
+/// 单个第三方设备处理链路，按地址来源分支:
+/// - allow_install=true（手动配置/官方 AVD 授权）: 等就绪 → 装 APK → forward → 启动服务 → 健康轮询
+/// - allow_install=false（扫描发现）: 等就绪 → forward → 单次探活；健康说明设备已有桥接在跑，直接复用；
+///   不健康视为非桥接设备（如无关 Android 实例），跳过且绝不装 APK/启服务
 /// 注意: wait_boot 内部各自有 120s 上限，可能超过 Phase B 总 deadline，
 /// 故整段用 tokio::time::timeout 包裹，到点强制转入 Phase C。
 async fn try_adb_device(
@@ -563,12 +572,21 @@ async fn try_adb_device(
     serial: &str,
     cfg: &BridgeConfig,
     deadline: tokio::time::Instant,
+    allow_install: bool,
 ) -> Result<(), String> {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     tokio::time::timeout(
         remaining,
         async {
             wait_boot(adb, serial).await?;
+            if !allow_install {
+                // 扫描路径: 探活必须发生在装 APK 之前
+                forward_port(adb, serial, cfg.host_port).await?;
+                if probe_health(&cfg.bridge_url).await {
+                    return Ok(());
+                }
+                return Err(format!("非桥接设备，跳过: {} 未运行桥接服务", serial));
+            }
             ensure_apk_installed(adb, serial, &cfg.apk_path).await?;
             forward_port(adb, serial, cfg.host_port).await?;
             start_bridge_service(adb, serial).await?;
@@ -916,5 +934,25 @@ mod tests {
         assert_eq!(addrs.iter().filter(|a| **a == "127.0.0.1:5555").count(), 1, "与扫描端口去重");
         assert!(phase_b_addresses(&manual, false).len() == 1, "关闭扫描只剩手动");
         assert!(phase_b_addresses(&[], true).len() == SCAN_PORTS.len());
+    }
+
+    // allow_install=false（扫描发现路径）行为验证：
+    // apk_path 指向不存在的文件——若实现把 ensure_apk_installed 挪到探活/等待之前，
+    // 错误会变成特征文案"桥接 APK 未安装且本地不存在"，本测试即失败
+    #[tokio::test]
+    async fn try_adb_device_scan_path_fails_without_install() {
+        let cfg = BridgeConfig::from_map(&map(&[
+            ("QUANTUMTV_BRIDGE_APK", "Z:/no-such-dir/bridge.apk"),
+        ]));
+        let adb = Path::new("Z:/definitely-not-adb/platform-tools/adb.exe");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let r = try_adb_device(adb, "127.0.0.1:5555", &cfg, deadline, false).await;
+        let msg = r.expect_err("无 adb/设备时扫描路径必须返回 Err");
+        assert!(
+            !msg.contains("桥接 APK 未安装") && !msg.contains("install"),
+            "扫描路径不应触及安装阶段: {}",
+            msg
+        );
+        assert!(msg.contains("执行 adb 失败"), "应失败于 wait_boot 的 adb 调用: {}", msg);
     }
 }
