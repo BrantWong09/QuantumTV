@@ -1093,10 +1093,10 @@ pub(crate) async fn search_site_results(
         let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
         let items = if quantumtv_core::spider::is_bridge_class(class_name) {
             // wex Guard 类: 走 Android 桥接 (含 OLLVM/DexNative 保护, JVM 无法加载)
-            let bridge_url = std::env::var("QUANTUMTV_BRIDGE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:18080".to_string());
-            quantumtv_core::spider::spider_bridge_search(class_name, query, &bridge_url)
-                .await?
+            let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
+                return Err("桥接未就绪".to_string());
+            };
+            quantumtv_core::spider::spider_bridge_search(class_name, query, &bridge_url).await?
         } else {
             let spider = site.spider.clone().unwrap_or_default();
             quantumtv_core::spider::spider_search(
@@ -1459,10 +1459,10 @@ async fn fetch_detail_item(
         let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
         let item = if quantumtv_core::spider::is_bridge_class(class_name) {
             // wex Guard 类: 走 Android 桥接
-            let bridge_url = std::env::var("QUANTUMTV_BRIDGE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:18080".to_string());
-            quantumtv_core::spider::spider_bridge_detail(class_name, id, &bridge_url)
-                .await?
+            let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
+                return Err("桥接未就绪".to_string());
+            };
+            quantumtv_core::spider::spider_bridge_detail(class_name, id, &bridge_url).await?
         } else {
             let spider = site.spider.clone().unwrap_or_default();
             quantumtv_core::spider::spider_detail(
