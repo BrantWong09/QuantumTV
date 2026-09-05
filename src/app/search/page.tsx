@@ -4,7 +4,14 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { ChevronUp, Search, X } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import React, { Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import React, {
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 
 import { AggregatedGroup, SearchFilter, SearchResult } from '@/lib/types';
 import { appLayoutClasses, getGridColumnsClass } from '@/lib/ui-layout';
@@ -108,6 +115,50 @@ function SearchPageClient() {
 
   // 流式搜索的渐进式结果: 每个站点完成即上屏(客户端聚合), 搜索完成后被权威结果替换
   const streamingRef = useRef<SearchResult[]>([]);
+  // 渲染节流: 滑动/滚动期间站点事件密集, 用 rAF 合并渲染避免列表卡顿
+  const streamRafRef = useRef<number | null>(null);
+  const streamDirtyRef = useRef(false);
+  const flushStream = useCallback(() => {
+    streamRafRef.current = null;
+    if (!streamDirtyRef.current) return;
+    streamDirtyRef.current = false;
+
+    const map = new Map<string, AggregatedGroup>();
+    for (const item of streamingRef.current) {
+      const key = `${item.title.replace(/ /g, '')}-${item.year || 'unknown'}-${
+        item.episodes.length === 1 ? 'movie' : 'tv'
+      }`;
+      const group = map.get(key);
+      if (group) {
+        if (!group.source_names.includes(item.source_name)) {
+          group.source_names.push(item.source_name);
+        }
+        group.episodes = Math.max(group.episodes, item.episodes.length);
+      } else {
+        map.set(key, {
+          representative: item,
+          episodes: item.episodes.length,
+          source_names: [item.source_name],
+          douban_id: item.douban_id ?? undefined,
+        });
+      }
+    }
+    setAggregatedGroups(map);
+    const q = (currentQueryRef.current || '').trim().toLowerCase();
+    const sorted = [...streamingRef.current].sort((a, b) => {
+      const aMatch = a.title.toLowerCase().includes(q) ? 0 : 1;
+      const bMatch = b.title.toLowerCase().includes(q) ? 0 : 1;
+      return aMatch - bMatch || a.title.length - b.title.length;
+    });
+    setFilteredAllResults(sorted);
+  }, []);
+
+  const scheduleStreamFlush = useCallback(() => {
+    streamDirtyRef.current = true;
+    if (streamRafRef.current == null) {
+      streamRafRef.current = requestAnimationFrame(flushStream);
+    }
+  }, [flushStream]);
 
   useEffect(() => {
     const query = currentQueryRef.current;
@@ -341,7 +392,7 @@ function SearchPageClient() {
           setTotalSources(total_sources);
           setCompletedSources(completed_sources);
 
-          // 把本站结果并入累积列表(按 source+id 去重)
+          // 把本站结果并入累积列表(按 source+id 去重), 节流合并渲染
           if (Array.isArray(results) && results.length > 0) {
             const seen = new Set(
               streamingRef.current.map((r) => `${r.source}|${r.id}`),
@@ -351,43 +402,18 @@ function SearchPageClient() {
             );
             if (fresh.length === 0) return;
             streamingRef.current = [...streamingRef.current, ...fresh];
-
-            // 客户端同步聚合: 标题+年份+单/剧集数 分组 (与后端 aggregate 逻辑一致)
-            const map = new Map<string, AggregatedGroup>();
-            for (const item of streamingRef.current) {
-              const key = `${item.title.replace(/ /g, '')}-${
-                item.year || 'unknown'
-              }-${item.episodes.length === 1 ? 'movie' : 'tv'}`;
-              const group = map.get(key);
-              if (group) {
-                if (!group.source_names.includes(item.source_name)) {
-                  group.source_names.push(item.source_name);
-                }
-                group.episodes = Math.max(group.episodes, item.episodes.length);
-              } else {
-                map.set(key, {
-                  representative: item,
-                  episodes: item.episodes.length,
-                  source_names: [item.source_name],
-                  douban_id: item.douban_id ?? undefined,
-                });
-              }
-            }
-            setAggregatedGroups(map);
-            // 全部视图: 新结果按标题包含关键词优先排序后上屏
-            const q = qParam.trim().toLowerCase();
-            const sorted = [...streamingRef.current].sort((a, b) => {
-              const aMatch = a.title.toLowerCase().includes(q) ? 0 : 1;
-              const bMatch = b.title.toLowerCase().includes(q) ? 0 : 1;
-              return aMatch - bMatch || a.title.length - b.title.length;
-            });
-            setFilteredAllResults(sorted);
+            scheduleStreamFlush();
           }
         });
 
         // 监听搜索完成事件: 后端权威聚合(含过滤/排序)替换渐进式结果
         unlistenCompleted = await listen<any>('search-stream-completed', () => {
           streamingRef.current = [];
+          if (streamRafRef.current != null) {
+            cancelAnimationFrame(streamRafRef.current);
+            streamRafRef.current = null;
+          }
+          streamDirtyRef.current = false;
           invoke<{
             aggregatedEntries: Array<[string, AggregatedGroup]>;
             filteredResults: SearchResult[];
@@ -688,23 +714,26 @@ function SearchPageClient() {
                                   Spider
                                 </span>
                               )}
-                              <VideoCard
-                                ref={getGroupRef(mapKey)}
-                                from='search'
-                                isAggregate={true}
-                                title={title}
-                                poster={poster}
-                                year={year}
-                                episodes={episodes}
-                                source_names={source_names}
-                                douban_id={douban_id}
-                                query={
-                                  searchQuery.trim() !== title
-                                    ? searchQuery.trim()
-                                    : ''
-                                }
-                                type={type}
-                              />
+            <VideoCard
+              ref={getGroupRef(mapKey)}
+              from='search'
+              isAggregate={true}
+              title={title}
+              poster={poster}
+              year={year}
+              episodes={episodes}
+              source_names={source_names}
+              // 聚合代表源携带 source/id: 点击直达该源的详情(桥接), 而非标题兜底搜索
+              source={rep.source}
+              id={rep.id}
+              douban_id={douban_id}
+              query={
+                searchQuery.trim() !== title
+                  ? searchQuery.trim()
+                  : ''
+              }
+              type={type}
+            />
                             </div>
                           );
                         },

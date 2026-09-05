@@ -1130,6 +1130,7 @@ pub(crate) async fn search_site_results(
                         .vod_douban_id
                         .and_then(|v| v.as_i64())
                         .map(|v| v as i32),
+                    source_site_type: site.site_type,
                 }
             })
             .collect();
@@ -1180,6 +1181,7 @@ pub(crate) async fn search_site_results(
                             .vod_douban_id
                             .and_then(|v| v.as_i64())
                             .map(|v| v as i32),
+                        source_site_type: site.site_type,
                         }
                     })
                     .collect();
@@ -1557,6 +1559,7 @@ pub async fn get_video_detail(
             .vod_douban_id
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
+        source_site_type: site.site_type,
     })
 }
 
@@ -1601,6 +1604,7 @@ pub async fn get_video_detail_optimized(
             .vod_douban_id
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
+        source_site_type: site.site_type,
     };
 
     // 如果需要搜索相似源，尝试从缓存快速获取
@@ -2574,6 +2578,7 @@ pub async fn initialize_player_by_query(
                             filtered[0] = SearchResult {
                                 episodes,
                                 episodes_titles,
+                                source_site_type: first.source_site_type,
                                 ..first.clone()
                             };
                         }
@@ -2626,6 +2631,7 @@ async fn fetch_detail_for_source_key(
             .vod_douban_id
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
+        source_site_type: site.site_type,
     })
 }
 

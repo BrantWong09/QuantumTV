@@ -21,4 +21,7 @@ pub struct SearchResult {
     pub desc: Option<String>,
     pub type_name: Option<String>,
     pub douban_id: Option<i32>,
+    /// 站点类型 (1=CMS, 3=Spider); 供前端区分 spider 结果
+    #[serde(default)]
+    pub source_site_type: Option<i32>,
 }
