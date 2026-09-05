@@ -322,7 +322,7 @@ pub async fn spider_bridge_detail(
         "class": class_name,
         "ids": video_id,
     });
-    let data = bridge_post(bridge_url, "/detail", &body).await?;
+    let data = bridge_post_with(bridge_url, "/detail", &body, false, 120).await?;
     let mut items = parse_catvod_list(&data)?;
     items.pop().ok_or_else(|| "详情返回空".to_string())
 }
@@ -352,15 +352,29 @@ pub async fn spider_bridge_category(
 }
 
 /// 桥接通用 POST: 首次触发 /init,然后调用指定端点
-/// 设备端 spider 调用是串行的(native 非线程安全), 桌面端并发必须限流, 否则排队超时
+/// gated=true 时受 BRIDGE_GATE 限流(搜索/浏览类); detail 传 false 走设备端优先通道
 static BRIDGE_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 /// /init 每进程只成功调一次(设备端 doInit 与 spider 调用共享锁, 重复 /init 会触发 native 竞态)
 static BRIDGE_INITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 async fn bridge_post(bridge_url: &str, path: &str, body: &serde_json::Value) -> Result<String, String> {
-    let _gate = BRIDGE_GATE.acquire().await.map_err(|e| format!("bridge gate: {}", e))?;
+    bridge_post_with(bridge_url, path, body, true, 60).await
+}
+
+async fn bridge_post_with(
+    bridge_url: &str,
+    path: &str,
+    body: &serde_json::Value,
+    gated: bool,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let _gate = if gated {
+        Some(BRIDGE_GATE.acquire().await.map_err(|e| format!("bridge gate: {}", e))?)
+    } else {
+        None
+    };
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(timeout_secs))
         .no_proxy()
         .build()
         .map_err(|e| format!("bridge client: {}", e))?;

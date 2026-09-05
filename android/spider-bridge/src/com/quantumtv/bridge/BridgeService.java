@@ -32,6 +32,8 @@ public class BridgeService extends Service {
     private static final String WEX_CONFIG_URL = "https://9280.kstore.vip/api.txt";
     private ServerSocket server;
     private ExecutorService pool;
+    /** /detail 专用单线程池: 与搜索队列隔离, 保证点击播放低延迟 */
+    private ExecutorService detailExecutor;
     private boolean initialized = false;
     /** 站点级 ext 配置, /init 时由桌面端传入; TVBoxOSC 在 getSpider 后调用 spider.init(context, ext) */
     private volatile String extConfig = "";
@@ -39,6 +41,9 @@ public class BridgeService extends Service {
     private final Map<String, Object> spiderCache = new HashMap<>();
     /** wex 系 spider 的 native 链 (DexNative/libLoadNiMa) 非线程安全, 并发调用会 SIGABRT, 必须串行 */
     private final Object spiderLock = new Object();
+    /** detail 优先标记: >0 时搜索线程在调用间隙主动让出 spiderLock */
+    private final java.util.concurrent.atomic.AtomicInteger detailPending =
+        new java.util.concurrent.atomic.AtomicInteger(0);
 
     @Override
     public IBinder onBind(Intent intent) { return null; }
@@ -51,6 +56,7 @@ public class BridgeService extends Service {
             server = new ServerSocket(PORT);
             Log.i(TAG, "HTTP server listening on " + PORT);
             pool = Executors.newFixedThreadPool(4);
+            detailExecutor = Executors.newSingleThreadExecutor();
             new Thread(this::acceptLoop, "BridgeAccept").start();
         } catch (Exception e) {
             Log.e(TAG, "server start failed: " + e);
@@ -121,6 +127,18 @@ public class BridgeService extends Service {
                 read += n;
             }
             String bodyStr = new String(body, 0, read, java.nio.charset.StandardCharsets.UTF_8);
+
+            // /detail 走优先通道: 用户点击播放不能排在全站搜索队列后面
+            if ("/detail".equals(path) && "POST".equalsIgnoreCase(method)) {
+                Log.i(TAG, method + " " + path + " body=" + bodyStr);
+                java.net.Socket sock = s;
+                detailExecutor.submit(() -> {
+                    String r = doDetail(bodyStr);
+                    try { writeHttp(sock, r); sock.close(); } catch (Exception e) { Log.e(TAG, "detail write: " + e); }
+                });
+                return;
+            }
+
             Log.i(TAG, method + " " + path + " body=" + bodyStr);
 
             String resp;
@@ -302,7 +320,7 @@ public class BridgeService extends Service {
             String className = parseField(body, "class");
             String ids = parseField(body, "ids");
             if (className == null || ids == null) return json(400, "missing class/ids", null);
-            return invokeSpider(className, "detailContent", new Class[]{List.class}, new Object[]{java.util.Arrays.asList(ids.split(","))});
+            return invokeSpider(className, "detailContent", new Class[]{List.class}, new Object[]{java.util.Arrays.asList(ids.split(","))}, true);
         } catch (Throwable t) {
             return json(500, t.toString(), null);
         }
@@ -335,9 +353,18 @@ public class BridgeService extends Service {
     }
 
     private String invokeSpider(String className, String method, Class<?>[] paramTypes, Object[] args) {
+        return invokeSpider(className, method, paramTypes, args, false);
+    }
+
+    /**
+     * spider 调用统一入口, native 链不支持并发故全互斥。
+     * @param priority detail 用: 进入锁前置位, 让正在搜索的线程在片段边界主动让出锁
+     */
+    private String invokeSpider(String className, String method, Class<?>[] paramTypes, Object[] args, boolean priority) {
+        if (priority) detailPending.incrementAndGet();
         try {
-            // 串行化所有 spider 调用: native 库全局状态不支持并发, 并发会直接 SIGABRT 崩溃进程
             synchronized (spiderLock) {
+                if (priority) detailPending.decrementAndGet();
                 // 短名自动补全包名 (桌面端传 csp_ 剥离后的短名)
                 String fqn = className.indexOf('.') >= 0 ? className : "com.github.catvod.spider." + className;
                 Class<?> initCls = Class.forName("com.github.catvod.spider.Init");
@@ -375,7 +402,20 @@ public class BridgeService extends Service {
                     }
                 }
                 Method m = spider.getClass().getMethod(method, paramTypes);
-                Object result = m.invoke(spider, args);
+                Object result;
+                if (priority) {
+                    // detail 的真正网络请求不占 spiderLock: 初始化/取类已在此锁内完成,
+                    // 多数 spider 的 detailContent 只是单次 HTTP + 解析, 原子性风险远低于搜索
+                    result = m.invoke(spider, args);
+                } else {
+                    // 搜索: 调用前后检查 detail 优先标记, 让在途 detail 尽快插进下个空档
+                    result = m.invoke(spider, args);
+                    while (detailPending.get() > 0) {
+                        synchronized (spiderLock) {
+                            spiderLock.wait(50);
+                        }
+                    }
+                }
                 String data = result == null ? "null" : result.toString();
                 return json(200, null, "\"" + esc(data) + "\"");
             }
