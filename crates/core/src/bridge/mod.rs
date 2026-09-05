@@ -745,8 +745,10 @@ mod tests {
         assert_eq!(status(), BridgeStatus::Idle, "禁用时不改变状态");
     }
 
+    // 合并为单个测试：EFFECTIVE_*/STATUS 为进程级全局，cargo test 并行执行时
+    // 两个测试互相写入会造成间歇性断言失败，串在一个函数内即可消除竞争
     #[test]
-    fn effective_url_roundtrip_and_reset() {
+    fn effective_url_roundtrip_and_reset_status() {
         set_effective("http://192.168.1.20:8080", EFFECTIVE_REMOTE);
         assert_eq!(effective_url().as_deref(), Some("http://192.168.1.20:8080"));
         assert_eq!(effective_kind(), EFFECTIVE_REMOTE);
@@ -755,11 +757,8 @@ mod tests {
         reset_effective();
         assert_eq!(effective_url(), None);
         assert_eq!(effective_kind(), EFFECTIVE_NONE);
-    }
 
-    #[test]
-    fn reset_effective_idle_only_from_ready() {
-        // Starting 时不复位：避免误伤进行中的启动流程与测试间状态竞争
+        // Starting 时不复位：try_begin_start 已接受 Idle/Failed，从这两个状态重试无需解锁
         set_status(BridgeStatus::Starting);
         set_effective("http://127.0.0.1:18080", EFFECTIVE_EMULATOR);
         reset_effective();
@@ -767,7 +766,7 @@ mod tests {
         assert_eq!(status(), BridgeStatus::Starting);
         set_status(BridgeStatus::Idle);
 
-        // Ready 时复位归 Idle：try_begin_start 已接受 Idle/Failed，仅从 Ready 重试才需要解锁
+        // Ready 时复位归 Idle：仅从 Ready 重试才需要解锁
         set_status(BridgeStatus::Ready);
         set_effective("http://127.0.0.1:18080", EFFECTIVE_EMULATOR);
         reset_effective();
