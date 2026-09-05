@@ -148,11 +148,10 @@ pub fn run() {
             // 启动所有后台任务
             scheduler::start_background_tasks(app.handle().clone());
 
-            // 桥接自动拉起（ADR 0002 Phase 4，失败静默降级）
-            tauri::async_runtime::spawn(async {
-                if let Err(e) = quantumtv_core::bridge::ensure_ready().await {
-                    log::warn!("[桥接] 后台拉起失败: {}", e);
-                }
+            // 桥接自动拉起（远程优先，失败降级模拟器；失败静默降级）
+            let bridge_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                commands::bridge::startup_ensure(bridge_handle).await;
             });
 
             Ok(())
@@ -190,6 +189,10 @@ pub fn run() {
             commands::search::search_page_open,
             commands::search::apply_search_filter,
             commands::search::get_search_cache_stats,
+            commands::bridge::get_bridge_config,
+            commands::bridge::save_bridge_config,
+            commands::bridge::get_bridge_status,
+            commands::bridge::retry_bridge,
             commands::settings::get_settings_bootstrap,
             commands::config::is_adult_source,
             // 跳过片头片尾
