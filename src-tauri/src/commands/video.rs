@@ -3211,6 +3211,9 @@ mod tests {
             desc: None,
             type_name: None,
             douban_id: None,
+            source_site_type: Some(1),
+            login_hint: None,
+            episodes_raw: Vec::new(),
         }
     }
 
@@ -4063,7 +4066,7 @@ mod home_catalog_tests {
             vod_name: "  Test Movie  ".to_string(),
             vod_pic: "http://pic".to_string(),
             vod_remarks: None,
-            vod_play_url: Some("http://a.m3u8$$$http://b.m3u8".to_string()),
+            vod_play_url: Some("http://a.m3u8#http://b.m3u8".to_string()),
             vod_class: Some("电影".to_string()),
             vod_year: Some("2020".to_string()),
             vod_content: None,
