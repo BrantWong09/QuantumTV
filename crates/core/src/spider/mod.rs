@@ -3,6 +3,10 @@ use std::time::Duration;
 
 const SPIDER_RUNNER_SOURCE: &str = include_str!("SpiderRunner.java");
 
+pub mod player;
+
+pub use player::{netdisk_login_hint, resolve_spider_episode};
+
 pub fn calculate_md5(data: &[u8]) -> String {
     format!("{:x}", md5::compute(data))
 }
@@ -356,6 +360,8 @@ pub async fn spider_bridge_category(
 static BRIDGE_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 /// /init 每进程只成功调一次(设备端 doInit 与 spider 调用共享锁, 重复 /init 会触发 native 竞态)
 static BRIDGE_INITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 最近一次 /init 携带的 ext (网盘 cookie 载荷)
+static INIT_EXT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 async fn bridge_post(bridge_url: &str, path: &str, body: &serde_json::Value) -> Result<String, String> {
     bridge_post_with(bridge_url, path, body, true, 60).await
@@ -379,11 +385,19 @@ async fn bridge_post_with(
         .build()
         .map_err(|e| format!("bridge client: {}", e))?;
 
-    if !BRIDGE_INITED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        // 首次调用确保 Init.init() 已在设备端完成; 失败则回退标志, 下次重试
+    if !BRIDGE_INITED.swap(true, std::sync::atomic::Ordering::SeqCst)
+        || crate::bridge::take_ext_if_dirty().is_some_and(|ext| {
+            // ext 变更(网盘 cookie 更新): 重新 init 携带新 ext, 设备端会重建 spider
+            INIT_EXT.lock().ok().map(|mut g| { *g = Some(ext.clone()); true }).unwrap_or(false)
+        })
+    {
+        let ext_body = INIT_EXT.lock().ok().and_then(|g| g.clone())
+            .map(|ext| serde_json::json!({"ext": ext}))
+            .unwrap_or_else(|| serde_json::json!({}));
+        // 首次调用或 ext 变更: 确保设备端 Init.init 完成; 失败回退标志下次重试
         match client
             .post(format!("{}/init", bridge_url))
-            .json(&serde_json::json!({}))
+            .json(&ext_body)
             .send()
             .await
         {

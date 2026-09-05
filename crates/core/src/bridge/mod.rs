@@ -126,11 +126,36 @@ pub(crate) static STARTED_SERIAL: Mutex<Option<String>> = Mutex::new(None);
 /// 解析成功的生效桥接地址与其来源（Phase A/B/C）
 static EFFECTIVE_URL: Mutex<Option<String>> = Mutex::new(None);
 static EFFECTIVE_KIND: AtomicU8 = AtomicU8::new(EFFECTIVE_NONE);
+/// 网盘 cookie 等 ext 载荷的脏标记: 置位后下次 /init 前桥接会重建 spider 实例
+static EXT_DIRTY: AtomicBool = AtomicBool::new(false);
+/// 当前注入的 ext 内容 (由 Tauri 层写入, bridge_post 读取)
+static EXT_PAYLOAD: Mutex<Option<String>> = Mutex::new(None);
 
 pub const EFFECTIVE_NONE: u8 = 0;
 pub const EFFECTIVE_REMOTE: u8 = 1;
 pub const EFFECTIVE_EMULATOR: u8 = 2;
 pub const EFFECTIVE_AVD: u8 = 3;
+
+/// 网盘 cookie 变更时由 Tauri 层调用: 置脏标记 + 更新载荷
+pub fn set_ext_payload(ext: Option<String>) {
+    if let Ok(mut g) = EXT_PAYLOAD.lock() {
+        *g = ext;
+    }
+    EXT_DIRTY.store(true, Ordering::SeqCst);
+}
+
+pub fn mark_ext_dirty() {
+    EXT_DIRTY.store(true, Ordering::SeqCst);
+}
+
+/// 取走当前 ext 载荷 (消费脏标记)
+pub(crate) fn take_ext_if_dirty() -> Option<String> {
+    if EXT_DIRTY.swap(false, Ordering::SeqCst) {
+        EXT_PAYLOAD.lock().ok().and_then(|g| g.clone())
+    } else {
+        None
+    }
+}
 
 /// 桥接就绪后的实际可用地址；None = 未就绪（调用方应快速失败）
 pub fn effective_url() -> Option<String> {

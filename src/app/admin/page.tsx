@@ -49,6 +49,7 @@ import { appLayoutClasses } from '@/lib/ui-layout';
 
 import AnalyticsDashboard from '@/components/AnalyticsDashboard';
 import BridgeSettings from '@/components/BridgeSettings';
+import CloudAccountSettings from '@/components/CloudAccountSettings';
 import DatabaseImportExport, {
   ConfirmModal,
 } from '@/components/DatabaseImportExport';
@@ -1437,10 +1438,11 @@ function AdminPageContent() {
   const [isLoading, setIsLoading] = useState(true);
   const [expandedTabs, setExpandedTabs] = useState({
     version: true,
-    configSubscription: false,
-    videoSource: false,
-    bridge: false,
-    categoryConfig: false,
+configSubscription: false,
+videoSource: false,
+bridge: false,
+cloudAccounts: false,
+categoryConfig: false,
     liveSource: false,
     databaseImportExport: false,
     analytics: false,
@@ -1559,6 +1561,16 @@ function AdminPageContent() {
           onToggle={() => toggleTab('bridge')}
         >
           <BridgeSettings showAlert={showAlert} />
+        </CollapsibleTab>
+
+        {/* 网盘账号 */}
+        <CollapsibleTab
+          title='网盘账号'
+          icon={<Cloud className='w-5 h-5 text-emerald-500' />}
+          isExpanded={expandedTabs.cloudAccounts}
+          onToggle={() => toggleTab('cloudAccounts')}
+        >
+          <CloudAccountSettings showAlert={showAlert} />
         </CollapsibleTab>
 
         {/* 自定义分类 */}

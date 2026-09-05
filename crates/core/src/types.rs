@@ -24,4 +24,10 @@ pub struct SearchResult {
     /// 站点类型 (1=CMS, 3=Spider); 供前端区分 spider 结果
     #[serde(default)]
     pub source_site_type: Option<i32>,
+    /// 播放受阻的用户提示 (如"该源为网盘资源, 需要登录网盘账号")
+    #[serde(default)]
+    pub login_hint: Option<String>,
+    /// Spider 网盘集原始 id (直链化前的待解析列表, 与 episodes 对齐; 已解析集为空)
+    #[serde(default)]
+    pub episodes_raw: Vec<String>,
 }

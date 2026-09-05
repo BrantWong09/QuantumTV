@@ -148,6 +148,15 @@ pub fn run() {
             // 启动所有后台任务
             scheduler::start_background_tasks(app.handle().clone());
 
+            // 网盘账号 cookie 注入桥接 + 常驻续期调度
+            {
+                let storage = app.state::<StorageManager>();
+                if let Some(ext) = commands::netdisk::build_ext_from_storage(&storage) {
+                    quantumtv_core::bridge::set_ext_payload(Some(ext));
+                }
+            }
+            tauri::async_runtime::spawn(commands::netdisk::start_refresh_scheduler(app.handle().clone()));
+
             // 桥接自动拉起（远程优先，失败降级模拟器；失败静默降级）
             let bridge_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -193,6 +202,13 @@ pub fn run() {
             commands::bridge::save_bridge_config,
             commands::bridge::get_bridge_status,
             commands::bridge::retry_bridge,
+            // 网盘账号
+            commands::netdisk::netdisk_scan_start,
+            commands::netdisk::netdisk_scan_poll,
+            commands::netdisk::netdisk_get_accounts,
+            commands::netdisk::netdisk_save_cookie,
+            commands::netdisk::netdisk_delete_account,
+            commands::netdisk::netdisk_refresh_now,
             commands::settings::get_settings_bootstrap,
             commands::config::is_adult_source,
             // 跳过片头片尾

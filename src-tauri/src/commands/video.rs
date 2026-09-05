@@ -1054,6 +1054,11 @@ const YELLOW_WORDS: &[&str] = &[
 ];
 
 fn parse_episodes(play_url: &str) -> (Vec<String>, Vec<String>) {
+    parse_episodes_for(play_url, false)
+}
+
+/// spider_mode=true 时收录非 http 的网盘集 id (播放前经 playerContent 二次解析)
+fn parse_episodes_for(play_url: &str, spider_mode: bool) -> (Vec<String>, Vec<String>) {
     let mut episodes = Vec::new();
     let mut titles = Vec::new();
 
@@ -1064,7 +1069,7 @@ fn parse_episodes(play_url: &str) -> (Vec<String>, Vec<String>) {
         let items = group.split('#');
         for item in items {
             let parts: Vec<&str> = item.split('$').collect();
-            if parts.len() == 2 && is_playable_m3u8(parts[1]) {
+            if parts.len() == 2 && (is_playable_m3u8(parts[1]) || (spider_mode && !parts[1].is_empty())) {
                 group_titles.push(parts[0].to_string());
                 group_episodes.push(parts[1].to_string());
             } else if parts.len() == 1 && is_playable_m3u8(parts[0]) {
@@ -1079,6 +1084,7 @@ fn parse_episodes(play_url: &str) -> (Vec<String>, Vec<String>) {
     }
     (episodes, titles)
 }
+
 
 pub(crate) async fn search_site_results(
     site: &ApiSite,
@@ -1109,7 +1115,7 @@ pub(crate) async fn search_site_results(
             .into_iter()
             .map(|item| {
                 let (episodes, episodes_titles) =
-                    parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
+                    parse_episodes_for(item.vod_play_url.as_deref().unwrap_or(""), true);
                 SearchResult {
                     id: match item.vod_id {
                         Value::String(s) => s,
@@ -1131,6 +1137,8 @@ pub(crate) async fn search_site_results(
                         .and_then(|v| v.as_i64())
                         .map(|v| v as i32),
                     source_site_type: site.site_type,
+                    login_hint: None,
+                    episodes_raw: Vec::new(),
                 }
             })
             .collect();
@@ -1160,7 +1168,7 @@ pub(crate) async fn search_site_results(
                 .into_iter()
                 .map(|item| {
                     let (episodes, episodes_titles) =
-                        parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
+                        parse_episodes_for(item.vod_play_url.as_deref().unwrap_or(""), false);
                     SearchResult {
                         id: match item.vod_id {
                             Value::String(s) => s,
@@ -1182,6 +1190,8 @@ pub(crate) async fn search_site_results(
                             .and_then(|v| v.as_i64())
                             .map(|v| v as i32),
                         source_site_type: site.site_type,
+                        login_hint: None,
+                        episodes_raw: Vec::new(),
                         }
                     })
                     .collect();
@@ -1537,7 +1547,8 @@ pub async fn get_video_detail(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let item = fetch_detail_item(&site, &id, &cache_root).await?;
 
-    let (episodes, episodes_titles) = parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
+    let (episodes, episodes_titles) = parse_episodes_for(item.vod_play_url.as_deref().unwrap_or(""), site.site_type.unwrap_or(1) == 3);
+    let episodes_raw = episodes.clone();
 
     Ok(SearchResult {
         id: match item.vod_id {
@@ -1547,8 +1558,10 @@ pub async fn get_video_detail(
         },
         title: item.vod_name.trim().to_string(),
         poster: item.vod_pic,
-        episodes,
+        episodes: episodes.clone(),
         episodes_titles,
+        episodes_raw,
+        login_hint: None,
         source: site.key,
         source_name: site.name,
         class: item.vod_class,
@@ -1582,7 +1595,8 @@ pub async fn get_video_detail_optimized(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let item = fetch_detail_item(&site, &id, &cache_root).await?;
 
-    let (episodes, episodes_titles) = parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
+    let (episodes, episodes_titles) = parse_episodes_for(item.vod_play_url.as_deref().unwrap_or(""), site.site_type.unwrap_or(1) == 3);
+    let episodes_raw = episodes.clone();
 
     let detail = SearchResult {
         id: match item.vod_id {
@@ -1592,8 +1606,10 @@ pub async fn get_video_detail_optimized(
         },
         title: item.vod_name.trim().to_string(),
         poster: item.vod_pic.clone(),
-        episodes,
+        episodes: episodes.clone(),
         episodes_titles,
+        episodes_raw,
+        login_hint: None,
         source: site.key,
         source_name: site.name,
         class: item.vod_class.clone(),
@@ -2573,14 +2589,20 @@ pub async fn initialize_player_by_query(
                 if site.site_type.unwrap_or(1) == 3 {
                     match fetch_detail_item(&site, &first.id, &cache_root).await {
                         Ok(item) => {
-                            let (episodes, episodes_titles) =
-                                parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
+                            let (episodes, episodes_titles) = parse_episodes_for(
+                                item.vod_play_url.as_deref().unwrap_or(""),
+                                true,
+                            );
                             filtered[0] = SearchResult {
-                                episodes,
+                                episodes: episodes.clone(),
                                 episodes_titles,
-                                source_site_type: first.source_site_type,
+                                source_site_type: Some(3),
+                                login_hint: None,
+                                episodes_raw: episodes,
                                 ..first.clone()
                             };
+                            // 首集直链化: 网盘 id → playerContent → 直链; 未登录时置 login_hint
+                            enrich_first_episode_direct(&mut filtered[0], &site).await;
                         }
                         Err(e) => {
                             log::warn!("[播放] 补全 spider 首选源集数失败 ({}): {}", first.source, e);
@@ -2595,6 +2617,71 @@ pub async fn initialize_player_by_query(
         results: filtered,
         test_results,
     })
+}
+
+/// 解析 spider 网盘集: playerContent(flag,id) → 真实直链
+/// 供前端播放/切集时调用; 未登录网盘时 Err 文案含登录指引
+#[tauri::command]
+pub async fn resolve_spider_episode(
+    source: String,
+    flag: String,
+    episode_id: String,
+    storage: State<'_, StorageManager>,
+    db: State<'_, crate::db::db_client::Db>,
+) -> Result<ResolveEpisodeResponse, String> {
+    let config = get_config_with_db_sources(&storage, &db)?;
+    let site = resolve_enabled_source(&config, &source)
+        .ok_or_else(|| format!("Source not found or disabled: {}", source))?;
+    if site.site_type.unwrap_or(1) != 3 {
+        return Err("非 Spider 站点无需解析".into());
+    }
+    let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
+    let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
+        return Err("桥接未就绪".into());
+    };
+    let (url, header) =
+        quantumtv_core::spider::resolve_spider_episode(class_name, &flag, &episode_id, &bridge_url)
+            .await?;
+    Ok(ResolveEpisodeResponse {
+        url,
+        header,
+        source_site_type: 3,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResolveEpisodeResponse {
+    pub url: String,
+    pub header: serde_json::Value,
+    pub source_site_type: i32,
+}
+
+/// Spider 网盘源首集直链化: playerContent 解析第 1 集, 剩余集留给前端 resolve_spider_episode 按需解析
+/// 解析为空直链(未登录网盘)时置 login_hint, 前端展示引导
+async fn enrich_first_episode_direct(result: &mut SearchResult, site: &ApiSite) {
+    let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
+    let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
+        result.login_hint = Some("桥接未就绪, 无法解析网盘资源".into());
+        return;
+    };
+    let Some(first_raw) = result.episodes_raw.first().cloned() else {
+        return;
+    };
+    let flag = String::new(); // wex 系 playerContent 的 flag 对网盘组不敏感(组序已在 id 内编码)
+    match quantumtv_core::spider::resolve_spider_episode(class_name, &flag, &first_raw, &bridge_url)
+        .await
+    {
+        Ok((url, _)) => {
+            if !result.episodes.is_empty() {
+                result.episodes[0] = url; // 第 1 集已是真实直链
+            }
+            // 其余集保持 raw id, 前端切集时逐集解析
+        }
+        Err(hint) => {
+            // 解析失败: 保留 raw id(前端会再试), 并置提示
+            result.login_hint = Some(hint);
+        }
+    }
 }
 
 /// 按站点 key+视频 id 调详情接口, 返回补全集数后的 SearchResult (Spider 站点播放前必需)
@@ -2632,6 +2719,8 @@ async fn fetch_detail_for_source_key(
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
         source_site_type: site.site_type,
+        login_hint: None,
+        episodes_raw: Vec::new(),
     })
 }
 

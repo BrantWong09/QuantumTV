@@ -44,6 +44,8 @@ public class BridgeService extends Service {
     /** detail 优先标记: >0 时搜索线程在调用间隙主动让出 spiderLock */
     private final java.util.concurrent.atomic.AtomicInteger detailPending =
         new java.util.concurrent.atomic.AtomicInteger(0);
+    /** 上次成功 init 携带的 ext (用于检测网盘 cookie 变更并重建 spider) */
+    private String lastInitExt;
 
     @Override
     public IBinder onBind(Intent intent) { return null; }
@@ -148,6 +150,15 @@ public class BridgeService extends Service {
                 resp = doInit(bodyStr);
             } else if ("/search".equals(path) && "POST".equalsIgnoreCase(method)) {
                 resp = doSearch(bodyStr);
+            } else if ("/playerContent".equals(path) && "POST".equalsIgnoreCase(method)) {
+                // 播放二次解析: detailContent 的网盘资源 id → 真实直链 (走 detail 优先通道)
+                Log.i(TAG, method + " " + path + " body=" + bodyStr);
+                java.net.Socket sock = s;
+                detailExecutor.submit(() -> {
+                    String r = doPlayerContent(bodyStr);
+                    try { writeHttp(sock, r); sock.close(); } catch (Exception e) { Log.e(TAG, "playerContent write: " + e); }
+                });
+                return;
             } else if ("/detail".equals(path) && "POST".equalsIgnoreCase(method)) {
                 resp = doDetail(bodyStr);
             } else if ("/home".equals(path) && "POST".equalsIgnoreCase(method)) {
@@ -190,14 +201,20 @@ public class BridgeService extends Service {
             synchronized (spiderLock) {
                 String ext = (body != null && !body.isEmpty()) ? parseField(body, "ext") : null;
                 if (ext != null) extConfig = ext;
-                if (initialized) {
-                    // 已初始化: 不重复跑 native 库检查与 Init.init, 与 spider 调用并发会破坏 DexClassLoader
+                if (initialized && (ext == null || ext.equals(lastInitExt))) {
+                    // 已初始化且 ext 未变: 不重复跑 native 库检查与 Init.init
                     return json(200, null, "{\"ok\":true}");
+                }
+                // 首次初始化或 ext 变更(网盘 cookie 更新): 重建全部 spider 实例
+                synchronized (spiderCache) {
+                    spiderCache.clear();
                 }
                 ensureWexNativeLibs();
                 Class<?> initCls = Class.forName("com.github.catvod.spider.Init");
                 initCls.getMethod("init", Context.class).invoke(null, getApplication());
                 initialized = true;
+                lastInitExt = ext;
+                Log.i(TAG, "init(重)完成, ext=" + (ext != null ? ext.length() + "字节" : "null"));
                 return json(200, null, "{\"ok\":true}");
             }
         } catch (Throwable t) {
@@ -321,6 +338,31 @@ public class BridgeService extends Service {
             String ids = parseField(body, "ids");
             if (className == null || ids == null) return json(400, "missing class/ids", null);
             return invokeSpider(className, "detailContent", new Class[]{List.class}, new Object[]{java.util.Arrays.asList(ids.split(","))}, true);
+        } catch (Throwable t) {
+            return json(500, t.toString(), null);
+        }
+    }
+
+    private String doPlayerContent(String body) {
+        try {
+            String className = parseField(body, "class");
+            String flag = parseField(body, "flag");
+            String id = parseField(body, "id");
+            if (className == null || id == null) return json(400, "missing class/id", null);
+            if (flag == null) flag = "";
+            // TVBox 标准: playerContent(flag, id, vipFlags) — 三参签名优先, 两参变体兜底
+            String r3 = null;
+            try {
+                r3 = invokeSpider(className, "playerContent",
+                    new Class[]{String.class, String.class, java.util.List.class},
+                    new Object[]{flag, id, java.util.Collections.emptyList()}, true);
+            } catch (Throwable t3) {
+                Log.w(TAG, "3-arg playerContent failed: " + t3);
+            }
+            if (r3 != null && !r3.contains("NoSuchMethodException")) return r3;
+            return invokeSpider(className, "playerContent",
+                new Class[]{String.class, String.class},
+                new Object[]{flag, id}, true);
         } catch (Throwable t) {
             return json(500, t.toString(), null);
         }
