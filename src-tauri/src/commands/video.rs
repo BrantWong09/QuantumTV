@@ -3936,18 +3936,22 @@ pub async fn get_home_catalog(
         }
     }
 
-    // 1) 拉取分类列表
+    // 1) 拉取分类列表（单请求超时 6s，失败降级为空）
     let class_url = source_url(&source.api, "?ac=class");
-    let class_body = get_video_client()
-        .get(&class_url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .text()
-        .await
-        .map_err(|e| e.to_string())?;
+    let class_body = match timeout(Duration::from_secs(6), async {
+        let resp = get_video_client()
+            .get(&class_url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let resp = resp.error_for_status().map_err(|e| e.to_string())?;
+        resp.text().await.map_err(|e| e.to_string())
+    })
+    .await
+    {
+        Ok(Ok(text)) => text,
+        _ => String::new(),
+    };
 
     let categories = parse_source_categories(&class_body).unwrap_or_default();
 
@@ -3967,17 +3971,17 @@ pub async fn get_home_catalog(
                 &api,
                 &format!("?ac=videolist&t={}&pg=1", urlencoding::encode(&type_id)),
             );
-            let resp = match client.get(&url).send().await {
-                Ok(r) => r,
-                Err(_) => return Vec::new(),
+            let resp = match timeout(Duration::from_secs(6), client.get(&url).send()).await {
+                Ok(Ok(r)) => r,
+                _ => return Vec::new(),
             };
             let resp = match resp.error_for_status() {
                 Ok(r) => r,
                 Err(_) => return Vec::new(),
             };
-            let body = match resp.text().await {
-                Ok(t) => t,
-                Err(_) => return Vec::new(),
+            let body = match timeout(Duration::from_secs(6), resp.text()).await {
+                Ok(Ok(t)) => t,
+                _ => return Vec::new(),
             };
             let items = parse_source_videos(&body).unwrap_or_default();
             let mut cards: Vec<HomeVideoCard> = items

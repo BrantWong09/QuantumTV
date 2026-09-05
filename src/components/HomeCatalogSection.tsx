@@ -65,7 +65,6 @@ export default function HomeCatalogSection() {
 
   // 组件内缓存：Map<source_key, response>
   const cacheRef = useRef(new Map<string, HomeCatalogResponse>());
-  const cancelledRef = useRef(false);
 
   // 初始化选中源（默认第一个）
   useEffect(() => {
@@ -86,7 +85,6 @@ export default function HomeCatalogSection() {
   useEffect(() => {
     if (!selectedSource) return;
     let cancelled = false;
-    cancelledRef.current = false;
 
     const cached = cacheRef.current.get(selectedSource);
     if (cached) {
@@ -115,6 +113,7 @@ export default function HomeCatalogSection() {
         console.error('获取首页目录失败:', err);
         if (cancelled) return;
         setCatalog(EMPTY_CATALOG);
+        router.push('/search');
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -122,7 +121,6 @@ export default function HomeCatalogSection() {
 
     return () => {
       cancelled = true;
-      cancelledRef.current = true;
     };
   }, [selectedSource, router]);
 
