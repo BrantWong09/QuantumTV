@@ -230,6 +230,7 @@ pub fn run() {
             commands::video::get_douban_data,
             commands::video::get_source_categories,
             commands::video::get_source_videos_by_type,
+            commands::video::get_home_catalog,
             commands::video::prefer_best_source_command,
             commands::video::test_video_source_command,
             commands::video::player_tick,
