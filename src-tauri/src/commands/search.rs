@@ -499,9 +499,16 @@ pub async fn apply_search_filter(
     }
 
     // 从结果缓存获取原始搜索结果
-    let results = result_cache
-        .get(&query)
-        .ok_or_else(|| "搜索结果未找到，请先执行搜索".to_string())?;
+    // 流式搜索期间结果尚未落缓存, 返回空集让前端流式事件驱动 UI, 而非报错刷屏
+    let results = match result_cache.get(&query) {
+        Some(r) => r,
+        None => {
+            return Ok(ApplySearchFilterResponse {
+                aggregated_entries: Vec::new(),
+                filtered_results: Vec::new(),
+            });
+        }
+    };
 
     // 聚合模式：应用 filter_agg
     let aggregated_list =
