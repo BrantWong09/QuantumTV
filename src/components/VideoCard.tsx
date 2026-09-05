@@ -33,7 +33,13 @@ export interface VideoCardProps {
   source_names?: string[];
   progress?: number;
   year?: string;
-  from: 'playrecord' | 'favorite' | 'search' | 'douban' | 'recommendation';
+  from:
+    | 'playrecord'
+    | 'favorite'
+    | 'search'
+    | 'douban'
+    | 'recommendation'
+    | 'home';
   currentEpisode?: number;
   douban_id?: number;
   onDelete?: () => void;
@@ -267,33 +273,32 @@ const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
     );
 
     const handleClick = useCallback(() => {
-      if (
-        from === 'douban' ||
-        from === 'recommendation' ||
-        (isAggregate && !actualSource && !actualId)
-      ) {
-        const url = `/play?title=${encodeURIComponent(actualTitle.trim())}${
-          actualYear ? `&year=${actualYear}` : ''
-        }${actualSearchType ? `&stype=${actualSearchType}` : ''}${isAggregate ? '&prefer=true' : ''}${actualQuery ? `&stitle=${encodeURIComponent(actualQuery.trim())}` : ''}`;
-        router.push(url);
-      } else if (actualSource && actualId) {
-        // 已有具体源: 直达该源详情, 不带 prefer(否则播放页会退回全站搜索+优选, 白白等待)
+      // 首页目录卡片：一律跳搜索页
+      if (from === 'home') {
+        const q = encodeURIComponent(actualTitle.trim());
+        router.push(`/search${q ? `?q=${q}` : ''}`);
+        return;
+      }
+      // 有具体源 + id：直接播放
+      if (actualSource && actualId) {
         const url = `/play?source=${actualSource}&id=${actualId}&title=${encodeURIComponent(
           actualTitle,
         )}${actualYear ? `&year=${actualYear}` : ''}${
           actualQuery ? `&stitle=${encodeURIComponent(actualQuery.trim())}` : ''
         }${actualSearchType ? `&stype=${actualSearchType}` : ''}`;
         router.push(url);
+        return;
       }
+      // 其它（豆瓣 / 推荐 / 聚合无源）：跳搜索页
+      const q = encodeURIComponent(actualTitle.trim());
+      router.push(`/search${q ? `?q=${q}` : ''}`);
     }, [
-      origin,
       from,
       actualSource,
       actualId,
       router,
       actualTitle,
       actualYear,
-      isAggregate,
       actualQuery,
       actualSearchType,
     ]);
@@ -387,6 +392,16 @@ const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
           showHeart: true, // 移动端菜单中需要显示收藏选项
           showCheckCircle: false,
           showDoubanLink: true, // 移动端菜单中显示豆瓣链接
+          showRating: false,
+          showYear: true,
+        },
+        home: {
+          showSourceName: true,
+          showProgress: false,
+          showPlayButton: true,
+          showHeart: true,
+          showCheckCircle: false,
+          showDoubanLink: false,
           showRating: false,
           showYear: true,
         },
