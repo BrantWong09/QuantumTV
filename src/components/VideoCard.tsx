@@ -277,11 +277,10 @@ const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
         }${actualSearchType ? `&stype=${actualSearchType}` : ''}${isAggregate ? '&prefer=true' : ''}${actualQuery ? `&stitle=${encodeURIComponent(actualQuery.trim())}` : ''}`;
         router.push(url);
       } else if (actualSource && actualId) {
+        // 已有具体源: 直达该源详情, 不带 prefer(否则播放页会退回全站搜索+优选, 白白等待)
         const url = `/play?source=${actualSource}&id=${actualId}&title=${encodeURIComponent(
           actualTitle,
         )}${actualYear ? `&year=${actualYear}` : ''}${
-          isAggregate ? '&prefer=true' : ''
-        }${
           actualQuery ? `&stitle=${encodeURIComponent(actualQuery.trim())}` : ''
         }${actualSearchType ? `&stype=${actualSearchType}` : ''}`;
         router.push(url);
