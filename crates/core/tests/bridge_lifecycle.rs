@@ -16,10 +16,11 @@ async fn ensure_ready_then_shutdown_lifecycle() {
     bridge::ensure_ready_with(cfg.clone()).await.expect("ensure_ready 应成功");
     assert_eq!(bridge::status(), BridgeStatus::Ready);
 
-    // 健康端点真实可达
+    // 健康端点真实可达（生效 URL 可能是远程直连，不一定是本地 forward 地址）
+    let url = bridge::effective_url().expect("桥接就绪后应有生效 URL");
     let client = reqwest::Client::new();
     let body = client
-        .get(format!("{}/health", cfg.bridge_url))
+        .get(format!("{}/health", url))
         .send()
         .await
         .expect("health 请求应成功")

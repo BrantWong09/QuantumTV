@@ -444,9 +444,16 @@ pub(crate) async fn start_bridge_service(adb: &Path, serial: &str) -> Result<(),
     Ok(())
 }
 
-pub(crate) async fn forward_port(adb: &Path, host_port: u16) -> Result<(), String> {
-    let args = vec!["forward".to_string()].into_iter().chain(forward_args(host_port, 8080)).collect::<Vec<_>>();
-    run_adb(adb, &args).await.map(|_| ())
+/// adb forward 完整参数（纯函数，含 -s serial 定向）
+pub(crate) fn forward_cmd_args(serial: &str, host_port: u16) -> Vec<String> {
+    vec!["-s".to_string(), serial.to_string(), "forward".to_string()]
+        .into_iter()
+        .chain(forward_args(host_port, 8080))
+        .collect()
+}
+
+pub(crate) async fn forward_port(adb: &Path, serial: &str, host_port: u16) -> Result<(), String> {
+    run_adb(adb, &forward_cmd_args(serial, host_port)).await.map(|_| ())
 }
 
 /// 应用启动钩子调用：读取环境变量并执行完整拉起流程（幂等，可并发调用）
@@ -477,61 +484,44 @@ pub async fn ensure_ready_with(cfg: BridgeConfig) -> Result<(), String> {
 }
 
 async fn startup_steps(cfg: &BridgeConfig) -> Result<(), String> {
-    let adb = adb_path(&cfg.sdk_root);
-    if !adb.exists() {
-        return Err(format!("adb 不存在: {}", adb.display()));
-    }
-
-    // 快路径: 桥接已可用（上次会话遗留的模拟器/APK），只补 forward
-    if probe_health(&cfg.bridge_url).await {
-        forward_port(&adb, cfg.host_port).await?;
-        log::info!("[桥接] 复用已运行的桥接");
-        return Ok(());
-    }
-
-    // 1. 模拟器在跑吗？只认配置 AVD 的 serial，绝不劫持外部其他模拟器
-    let devices = run_adb(&adb, &["devices".to_string()]).await?;
-    let mut serial: Option<String> = None;
-    for s in emulator_serials(&devices) {
-        if serial_matches_avd(&adb, &s, &cfg.avd).await {
-            log::info!("[桥接] 复用运行中的 AVD {} ({})", cfg.avd, s);
-            serial = Some(s);
-            break;
-        }
-    }
-    let serial = match serial {
-        Some(s) => s,
-        None => {
-            spawn_emulator(cfg).await?;
-            // 等配置 AVD 的 serial 出现（offline→device 由 wait_boot 内的 wait-for-device 兜底）
-            wait_for_avd_serial(&adb, cfg).await?
-        }
-    };
-    if we_started() {
-        *STARTED_SERIAL.lock().unwrap() = Some(serial.clone());
-    }
-
-    // 2. 等系统启动完成
-    wait_boot(&adb, &serial).await?;
-
-    // 3. APK
-    ensure_apk_installed(&adb, &serial, &cfg.apk_path).await?;
-
-    // 4. forward + 启动服务
-    forward_port(&adb, cfg.host_port).await?;
-    start_bridge_service(&adb, &serial).await?;
-
-    // 5. 健康轮询（30s 上限，1s 间隔）
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        if probe_health(&cfg.bridge_url).await {
+    // Phase A: 远程真机直连（env 覆盖值优先，探活失败继续瀑布）
+    for cand in remote_candidates(cfg.url_override.as_deref(), cfg.remote_url.as_deref()) {
+        if probe_health(&cand).await {
+            set_effective(&cand, EFFECTIVE_REMOTE);
+            log::info!("[桥接] 远程桥接就绪: {}", cand);
             return Ok(());
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("桥接健康检查超时 (30s)".to_string());
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+
+    // B/C 需要 adb
+    let adb = adb_path(&cfg.sdk_root);
+    if !adb.exists() {
+        return Err(format!("adb 不存在: {}，且远程候选均未就绪", adb.display()));
+    }
+
+    // Phase B: 第三方模拟器（手动地址优先，auto_scan 追加扫描端口；总上限 120s）
+    let b_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    for addr in phase_b_addresses(&cfg.adb_addresses, cfg.auto_scan) {
+        if tokio::time::Instant::now() >= b_deadline {
+            log::warn!("[桥接] Phase B 总超时，转入官方 AVD");
+            break;
+        }
+        // connect 幂等；失败不中断（该地址可能不是 adb 端口）
+        let _ = run_adb(&adb, &["connect".to_string(), addr.clone()]).await;
+        if !wait_serial_device(&adb, &addr, 5).await {
+            continue;
+        }
+        if try_adb_device(&adb, &addr, cfg, b_deadline).await.is_ok() {
+            set_effective(&cfg.bridge_url, EFFECTIVE_EMULATOR);
+            log::info!("[桥接] 第三方模拟器桥接就绪: {}", addr);
+            return Ok(());
+        }
+    }
+
+    // Phase C: 官方 AVD（复用运行中的或拉起新的）
+    ensure_avd_bridge(cfg, &adb).await?;
+    set_effective(&cfg.bridge_url, EFFECTIVE_AVD);
+    Ok(())
 }
 
 /// serial 是否为配置的 AVD
@@ -546,6 +536,99 @@ async fn serial_matches_avd(adb: &Path, serial: &str, avd: &str) -> bool {
     match run_adb(adb, &args).await {
         Ok(out) => parse_avd_name(&out).as_deref() == Some(avd),
         Err(_) => false,
+    }
+}
+
+/// 轮询 `adb devices` 直到指定 TCP serial 出现且为 device 状态
+async fn wait_serial_device(adb: &Path, serial: &str, secs: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Ok(out) = run_adb(adb, &["devices".to_string()]).await {
+            if connectable_serials(&out).iter().any(|s| s == serial) {
+                return true;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// 单个第三方设备完整链路: 等就绪 → 装 APK → forward → 启动服务 → 健康轮询（受总 deadline 约束）
+/// 注意: wait_boot 内部各自有 120s 上限，可能超过 Phase B 总 deadline，
+/// 故整段用 tokio::time::timeout 包裹，到点强制转入 Phase C。
+async fn try_adb_device(
+    adb: &Path,
+    serial: &str,
+    cfg: &BridgeConfig,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    tokio::time::timeout(
+        remaining,
+        async {
+            wait_boot(adb, serial).await?;
+            ensure_apk_installed(adb, serial, &cfg.apk_path).await?;
+            forward_port(adb, serial, cfg.host_port).await?;
+            start_bridge_service(adb, serial).await?;
+            loop {
+                if probe_health(&cfg.bridge_url).await {
+                    return Ok(());
+                }
+                // 健康轮询单次 1s；外层 timeout 负责总时长约束
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        },
+    )
+    .await
+    .map_err(|_| "Phase B 设备处理超时".to_string())?
+}
+
+/// Phase C: 官方 AVD 桥接（原 startup_steps 主体逻辑，仅 forward_port 增加 serial）
+async fn ensure_avd_bridge(cfg: &BridgeConfig, adb: &Path) -> Result<(), String> {
+    // 模拟器在跑吗？只认配置 AVD 的 serial，绝不劫持外部其他模拟器
+    let devices = run_adb(adb, &["devices".to_string()]).await?;
+    let mut serial: Option<String> = None;
+    for s in emulator_serials(&devices) {
+        if serial_matches_avd(adb, &s, &cfg.avd).await {
+            log::info!("[桥接] 复用运行中的 AVD {} ({})", cfg.avd, s);
+            serial = Some(s);
+            break;
+        }
+    }
+    let serial = match serial {
+        Some(s) => s,
+        None => {
+            spawn_emulator(cfg).await?;
+            // 等配置 AVD 的 serial 出现（offline→device 由 wait_boot 内的 wait-for-device 兜底）
+            wait_for_avd_serial(adb, cfg).await?
+        }
+    };
+    if we_started() {
+        *STARTED_SERIAL.lock().unwrap() = Some(serial.clone());
+    }
+
+    // 等系统启动完成
+    wait_boot(adb, &serial).await?;
+
+    // APK
+    ensure_apk_installed(adb, &serial, &cfg.apk_path).await?;
+
+    // forward + 启动服务
+    forward_port(adb, &serial, cfg.host_port).await?;
+    start_bridge_service(adb, &serial).await?;
+
+    // 健康轮询（30s 上限，1s 间隔）
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if probe_health(&cfg.bridge_url).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("桥接健康检查超时 (30s)".to_string());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 
@@ -697,6 +780,15 @@ mod tests {
             ]
         );
         assert_eq!(forward_args(18080, 8080), vec!["tcp:18080".to_string(), "tcp:8080".to_string()]);
+    }
+
+    #[test]
+    fn forward_cmd_args_includes_serial() {
+        let args = forward_cmd_args("127.0.0.1:5555", 18080);
+        assert_eq!(
+            args,
+            vec!["-s", "127.0.0.1:5555", "forward", "tcp:18080", "tcp:8080"]
+        );
     }
 
     #[test]
