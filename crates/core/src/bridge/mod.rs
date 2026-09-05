@@ -317,6 +317,32 @@ pub(crate) async fn probe_health(bridge_url: &str) -> bool {
     }
 }
 
+/// Phase A 候选（优先级序）: env QUANTUMTV_BRIDGE_URL 覆盖值在前，remote_url 在后；去空白去重
+pub(crate) fn remote_candidates(url_override: Option<&str>, remote_url: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for cand in [url_override, remote_url].into_iter().flatten() {
+        let cand = cand.trim();
+        if !cand.is_empty() && !out.iter().any(|x| x == cand) {
+            out.push(cand.to_string());
+        }
+    }
+    out
+}
+
+/// Phase B 连接序列: 手动地址在前，auto_scan 时追加扫描端口（127.0.0.1:p）；按字符串去重
+pub(crate) fn phase_b_addresses(manual: &[String], auto_scan: bool) -> Vec<String> {
+    let mut out: Vec<String> = manual.to_vec();
+    if auto_scan {
+        for p in SCAN_PORTS {
+            let addr = format!("127.0.0.1:{}", p);
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) async fn spawn_emulator(cfg: &BridgeConfig) -> Result<(), String> {
     let emu = emulator_path(&cfg.sdk_root);
     if !emu.exists() {
@@ -772,5 +798,31 @@ mod tests {
         reset_effective();
         assert_eq!(effective_url(), None);
         assert_eq!(status(), BridgeStatus::Idle);
+    }
+
+    #[test]
+    fn remote_candidates_order_and_dedup() {
+        assert_eq!(remote_candidates(None, None), Vec::<String>::new());
+        assert_eq!(
+            remote_candidates(Some(" http://a:1 "), Some("http://b:2")),
+            vec!["http://a:1".to_string(), "http://b:2".to_string()]
+        );
+        assert_eq!(
+            remote_candidates(Some("http://a:1"), Some("http://a:1")),
+            vec!["http://a:1".to_string()],
+            "重复候选去重"
+        );
+        assert_eq!(remote_candidates(Some("  "), Some("http://b:2")), vec!["http://b:2".to_string()]);
+    }
+
+    #[test]
+    fn phase_b_addresses_manual_first_scan_dedup() {
+        let manual = vec!["127.0.0.1:5555".to_string()];
+        let addrs = phase_b_addresses(&manual, true);
+        assert_eq!(&addrs[0], "127.0.0.1:5555", "手动地址在前");
+        assert!(addrs.iter().any(|a| a == "127.0.0.1:16384"));
+        assert_eq!(addrs.iter().filter(|a| **a == "127.0.0.1:5555").count(), 1, "与扫描端口去重");
+        assert!(phase_b_addresses(&manual, false).len() == 1, "关闭扫描只剩手动");
+        assert!(phase_b_addresses(&[], true).len() == SCAN_PORTS.len());
     }
 }
