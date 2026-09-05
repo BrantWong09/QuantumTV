@@ -104,11 +104,13 @@ export default function BridgeSettings({
       showAlert('success', '保存成功', '桥接正在重新连接');
       startPolling();
     } catch (error) {
-      showAlert(
-        'error',
-        '保存失败',
-        error instanceof Error ? error.message : String(error),
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('桥接正在启动中')) {
+        // 落盘已成功，仅重试被 Starting 防重入拒绝，不算保存失败
+        showAlert('warning', '已保存', '桥接正在启动中，稍后可手动重试');
+      } else {
+        showAlert('error', '保存失败', message);
+      }
     } finally {
       setSaving(false);
     }
