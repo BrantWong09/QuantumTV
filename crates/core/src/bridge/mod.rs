@@ -123,6 +123,43 @@ static WE_STARTED: AtomicBool = AtomicBool::new(false);
 pub(crate) static EMU_CHILD: Mutex<Option<tokio::process::Child>> = Mutex::new(None);
 /// 本进程拉起的模拟器 serial；shutdown 时用它精准关闭对应设备
 pub(crate) static STARTED_SERIAL: Mutex<Option<String>> = Mutex::new(None);
+/// 解析成功的生效桥接地址与其来源（Phase A/B/C）
+static EFFECTIVE_URL: Mutex<Option<String>> = Mutex::new(None);
+static EFFECTIVE_KIND: AtomicU8 = AtomicU8::new(EFFECTIVE_NONE);
+
+pub const EFFECTIVE_NONE: u8 = 0;
+pub const EFFECTIVE_REMOTE: u8 = 1;
+pub const EFFECTIVE_EMULATOR: u8 = 2;
+pub const EFFECTIVE_AVD: u8 = 3;
+
+/// 桥接就绪后的实际可用地址；None = 未就绪（调用方应快速失败）
+pub fn effective_url() -> Option<String> {
+    EFFECTIVE_URL.lock().ok().and_then(|g| g.clone())
+}
+
+pub fn effective_kind() -> u8 {
+    EFFECTIVE_KIND.load(Ordering::SeqCst)
+}
+
+pub(crate) fn set_effective(url: &str, kind: u8) {
+    if let Ok(mut g) = EFFECTIVE_URL.lock() {
+        *g = Some(url.to_string());
+    }
+    EFFECTIVE_KIND.store(kind, Ordering::SeqCst);
+}
+
+/// 清空生效 URL/kind；仅当处于 Ready 时状态归 Idle（供手动重试前复位）
+pub fn reset_effective() {
+    if let Ok(mut g) = EFFECTIVE_URL.lock() {
+        *g = None;
+    }
+    EFFECTIVE_KIND.store(EFFECTIVE_NONE, Ordering::SeqCst);
+    // 仅 Ready→Idle：try_begin_start 已接受 Idle/Failed，从这两个状态重试无需解锁；
+    // Starting 时复位会误伤进行中的启动流程并造成测试间状态竞争，故不处理
+    if status() == BridgeStatus::Ready {
+        set_status(BridgeStatus::Idle);
+    }
+}
 
 pub fn status() -> BridgeStatus {
     BridgeStatus::from_u8(STATUS.load(Ordering::SeqCst))
@@ -706,5 +743,35 @@ mod tests {
         let r = rt.block_on(ensure_ready_with(cfg));
         assert!(r.is_ok());
         assert_eq!(status(), BridgeStatus::Idle, "禁用时不改变状态");
+    }
+
+    #[test]
+    fn effective_url_roundtrip_and_reset() {
+        set_effective("http://192.168.1.20:8080", EFFECTIVE_REMOTE);
+        assert_eq!(effective_url().as_deref(), Some("http://192.168.1.20:8080"));
+        assert_eq!(effective_kind(), EFFECTIVE_REMOTE);
+        set_effective("http://127.0.0.1:18080", EFFECTIVE_EMULATOR);
+        assert_eq!(effective_kind(), EFFECTIVE_EMULATOR);
+        reset_effective();
+        assert_eq!(effective_url(), None);
+        assert_eq!(effective_kind(), EFFECTIVE_NONE);
+    }
+
+    #[test]
+    fn reset_effective_idle_only_from_ready() {
+        // Starting 时不复位：避免误伤进行中的启动流程与测试间状态竞争
+        set_status(BridgeStatus::Starting);
+        set_effective("http://127.0.0.1:18080", EFFECTIVE_EMULATOR);
+        reset_effective();
+        assert_eq!(effective_url(), None);
+        assert_eq!(status(), BridgeStatus::Starting);
+        set_status(BridgeStatus::Idle);
+
+        // Ready 时复位归 Idle：try_begin_start 已接受 Idle/Failed，仅从 Ready 重试才需要解锁
+        set_status(BridgeStatus::Ready);
+        set_effective("http://127.0.0.1:18080", EFFECTIVE_EMULATOR);
+        reset_effective();
+        assert_eq!(effective_url(), None);
+        assert_eq!(status(), BridgeStatus::Idle);
     }
 }
