@@ -1383,6 +1383,12 @@ pub(crate) async fn search_with_cache_hit(
     // Filter duplicates
     let mut unique_results = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    // 记录 Spider 站点 key(其结果免"必须有集数"过滤)
+    let spider_site_keys: std::collections::HashSet<String> = sites
+        .iter()
+        .filter(|s| s.site_type.unwrap_or(1) == 3)
+        .map(|s| s.key.clone())
+        .collect();
     for res in all_results {
         let key = format!("{}|{}", res.source, res.id);
         if seen.insert(key) {
@@ -1393,7 +1399,10 @@ pub(crate) async fn search_with_cache_hit(
                     continue;
                 }
             }
-            if !res.episodes.is_empty() {
+            // Spider 站点(type=3)搜索结果通常不含播放地址(详情阶段才返回集数),
+            // 不能按"必须有集数"过滤,否则结果被团灭; CMS 站点保持原有过滤
+            let is_spider_site = spider_site_keys.contains(&res.source);
+            if is_spider_site || !res.episodes.is_empty() {
                 unique_results.push(res);
             }
         }
@@ -1430,8 +1439,10 @@ pub(crate) async fn search_with_cache_hit(
         }
     }
 
-    // 缓存搜索结果
-    cache.set(query, unique_results.clone()).await;
+    // 缓存搜索结果(空结果不缓存: spider 站点可用性波动大, 避免空结果污染缓存 1 小时)
+    if !unique_results.is_empty() {
+        cache.set(query, unique_results.clone()).await;
+    }
 
     Ok((unique_results, false))
 }
@@ -2515,7 +2526,8 @@ pub async fn initialize_player_by_query(
     }
 
     let (results, _) =
-        search_with_cache_hit(query.to_string(), app_handle, storage, cache, &db).await?;
+        search_with_cache_hit(query.to_string(), app_handle.clone(), storage.clone(), cache, &db)
+            .await?;
     let filter_title = request.filter_title.trim();
     let filter_year = request
         .year
@@ -2545,15 +2557,82 @@ pub async fn initialize_player_by_query(
         filtered = reorder_results_with_best(&best, filtered);
     }
 
+    // Spider 站点(type=3)的搜索结果不带集数, 播放前须调详情接口补全首选源
+    if let Some(first) = filtered.first() {
+        if first.episodes.is_empty() {
+            let config = get_config_with_db_sources(&storage, &db)?;
+            let cache_root = app_handle
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+            if let Some(site) = resolve_enabled_source(&config, &first.source) {
+                if site.site_type.unwrap_or(1) == 3 {
+                    match fetch_detail_item(&site, &first.id, &cache_root).await {
+                        Ok(item) => {
+                            let (episodes, episodes_titles) =
+                                parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
+                            filtered[0] = SearchResult {
+                                episodes,
+                                episodes_titles,
+                                ..first.clone()
+                            };
+                        }
+                        Err(e) => {
+                            log::warn!("[播放] 补全 spider 首选源集数失败 ({}): {}", first.source, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(InitializePlayerByQueryResponse {
         results: filtered,
         test_results,
     })
 }
 
+/// 按站点 key+视频 id 调详情接口, 返回补全集数后的 SearchResult (Spider 站点播放前必需)
+async fn fetch_detail_for_source_key(
+    source_key: &str,
+    id: &str,
+    storage: &StorageManager,
+    db: &crate::db::db_client::Db,
+) -> Result<SearchResult, String> {
+    let config = get_config_with_db_sources(storage, db)?;
+    let site = resolve_enabled_source(&config, source_key)
+        .ok_or_else(|| format!("Source not found or disabled: {}", source_key))?;
+    let cache_root = std::env::temp_dir();
+    let item = fetch_detail_item(&site, id, &cache_root).await?;
+
+    let (episodes, episodes_titles) = parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
+    Ok(SearchResult {
+        id: match item.vod_id {
+            Value::String(s) => s,
+            Value::Number(n) => n.to_string(),
+            _ => id.to_string(),
+        },
+        title: item.vod_name.trim().to_string(),
+        poster: item.vod_pic,
+        episodes,
+        episodes_titles,
+        source: site.key,
+        source_name: site.name,
+        class: item.vod_class,
+        year: item.vod_year,
+        desc: item.vod_content.map(|c| clean_html_tags(&c)),
+        type_name: item.type_name,
+        douban_id: item
+            .vod_douban_id
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
+    })
+}
+
 #[tauri::command]
 pub async fn change_play_source(
     request: ChangePlaySourceRequest,
+    storage: State<'_, StorageManager>,
     db: State<'_, crate::db::db_client::Db>,
     source_manager: State<'_, SourceIntelligenceManager>,
 ) -> Result<ChangePlaySourceResponse, String> {
@@ -2580,6 +2659,19 @@ pub async fn change_play_source(
             .cloned()
     }
     .ok_or_else(|| "未找到匹配结果".to_string())?;
+
+    // 切到 Spider 站点(type=3)时, 搜索结果不带集数, 须调详情接口补全
+    let detail = if detail.episodes.is_empty() {
+        match fetch_detail_for_source_key(&detail.source, &detail.id, &storage, &db).await {
+            Ok(filled) => filled,
+            Err(e) => {
+                log::warn!("[播放] 切源补全 spider 集数失败 ({}): {}", detail.source, e);
+                detail
+            }
+        }
+    } else {
+        detail
+    };
 
     let old_key = match (
         request.current_source.as_deref(),

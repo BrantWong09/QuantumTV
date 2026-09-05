@@ -37,6 +37,8 @@ public class BridgeService extends Service {
     private volatile String extConfig = "";
     /** 已初始化的 spider 实例缓存: TVBoxOSC 同样按 jar+site 缓存, init 只跑一次 */
     private final Map<String, Object> spiderCache = new HashMap<>();
+    /** wex 系 spider 的 native 链 (DexNative/libLoadNiMa) 非线程安全, 并发调用会 SIGABRT, 必须串行 */
+    private final Object spiderLock = new Object();
 
     @Override
     public IBinder onBind(Intent intent) { return null; }
@@ -167,15 +169,19 @@ public class BridgeService extends Service {
 
     private String doInit(String body) {
         try {
-            if (body != null && !body.isEmpty()) {
-                String ext = parseField(body, "ext");
+            synchronized (spiderLock) {
+                String ext = (body != null && !body.isEmpty()) ? parseField(body, "ext") : null;
                 if (ext != null) extConfig = ext;
+                if (initialized) {
+                    // 已初始化: 不重复跑 native 库检查与 Init.init, 与 spider 调用并发会破坏 DexClassLoader
+                    return json(200, null, "{\"ok\":true}");
+                }
+                ensureWexNativeLibs();
+                Class<?> initCls = Class.forName("com.github.catvod.spider.Init");
+                initCls.getMethod("init", Context.class).invoke(null, getApplication());
+                initialized = true;
+                return json(200, null, "{\"ok\":true}");
             }
-            ensureWexNativeLibs();
-            Class<?> initCls = Class.forName("com.github.catvod.spider.Init");
-            initCls.getMethod("init", Context.class).invoke(null, getApplication());
-            initialized = true;
-            return json(200, null, "{\"ok\":true}");
         } catch (Throwable t) {
             Log.e(TAG, "init failed", t);
             return json(500, t.toString(), null);
@@ -330,41 +336,49 @@ public class BridgeService extends Service {
 
     private String invokeSpider(String className, String method, Class<?>[] paramTypes, Object[] args) {
         try {
-            // 短名自动补全包名 (桌面端传 csp_ 剥离后的短名)
-            String fqn = className.indexOf('.') >= 0 ? className : "com.github.catvod.spider." + className;
-            Class<?> initCls = Class.forName("com.github.catvod.spider.Init");
-            if (!initialized) initCls.getMethod("init", Context.class).invoke(null, getApplication());
-            Method getSpider = initCls.getMethod("getSpider", String.class);
-            Object spider;
-            synchronized (spiderCache) {
-                spider = spiderCache.get(fqn);
-                if (spider == null) {
-                    spider = getSpider.invoke(null, fqn);
-                    if (spider == null) return json(404, "spider not found: " + fqn, null);
-                    // TVBoxOSC 流程: newInstance 后必须调用 init(context, ext), 否则部分
-                    // spider (如 wex 系) 的资源初始化(libLoadNiMa.so 提取)不会执行
-                    try {
-                        java.lang.reflect.Field keyField = findField(spider.getClass(), "siteKey");
-                        if (keyField != null) {
-                            keyField.setAccessible(true);
-                            keyField.set(spider, className);
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                    try {
-                        spider.getClass()
-                            .getMethod("init", Context.class, String.class)
-                            .invoke(spider, getApplication(), extConfig);
-                    } catch (NoSuchMethodException e) {
-                        spider.getClass().getMethod("init", Context.class).invoke(spider, getApplication());
-                    }
-                    spiderCache.put(fqn, spider);
+            // 串行化所有 spider 调用: native 库全局状态不支持并发, 并发会直接 SIGABRT 崩溃进程
+            synchronized (spiderLock) {
+                // 短名自动补全包名 (桌面端传 csp_ 剥离后的短名)
+                String fqn = className.indexOf('.') >= 0 ? className : "com.github.catvod.spider." + className;
+                Class<?> initCls = Class.forName("com.github.catvod.spider.Init");
+                if (!initialized) {
+                    // 自愈: /search 直接到达(未经 /init)时也要确保 wex native 库就位
+                    ensureWexNativeLibs();
+                    initCls.getMethod("init", Context.class).invoke(null, getApplication());
+                    initialized = true;
                 }
+                Method getSpider = initCls.getMethod("getSpider", String.class);
+                Object spider;
+                synchronized (spiderCache) {
+                    spider = spiderCache.get(fqn);
+                    if (spider == null) {
+                        spider = getSpider.invoke(null, fqn);
+                        if (spider == null) return json(404, "spider not found: " + fqn, null);
+                        // TVBoxOSC 流程: newInstance 后必须调用 init(context, ext), 否则部分
+                        // spider (如 wex 系) 的资源初始化(libLoadNiMa.so 提取)不会执行
+                        try {
+                            java.lang.reflect.Field keyField = findField(spider.getClass(), "siteKey");
+                            if (keyField != null) {
+                                keyField.setAccessible(true);
+                                keyField.set(spider, className);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        try {
+                            spider.getClass()
+                                .getMethod("init", Context.class, String.class)
+                                .invoke(spider, getApplication(), extConfig);
+                        } catch (NoSuchMethodException e) {
+                            spider.getClass().getMethod("init", Context.class).invoke(spider, getApplication());
+                        }
+                        spiderCache.put(fqn, spider);
+                    }
+                }
+                Method m = spider.getClass().getMethod(method, paramTypes);
+                Object result = m.invoke(spider, args);
+                String data = result == null ? "null" : result.toString();
+                return json(200, null, "\"" + esc(data) + "\"");
             }
-            Method m = spider.getClass().getMethod(method, paramTypes);
-            Object result = m.invoke(spider, args);
-            String data = result == null ? "null" : result.toString();
-            return json(200, null, "\"" + esc(data) + "\"");
         } catch (Throwable t) {
             Log.e(TAG, "invokeSpider failed", t);
             return json(500, t.toString(), null);

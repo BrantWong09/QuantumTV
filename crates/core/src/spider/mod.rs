@@ -351,21 +351,35 @@ pub async fn spider_bridge_category(
     bridge_post(bridge_url, "/category", &body).await
 }
 
-/// 桥接通用 POST: 触发 /init (首次),然后调用指定端点
+/// 桥接通用 POST: 首次触发 /init,然后调用指定端点
+/// 设备端 spider 调用是串行的(native 非线程安全), 桌面端并发必须限流, 否则排队超时
+static BRIDGE_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+/// /init 每进程只成功调一次(设备端 doInit 与 spider 调用共享锁, 重复 /init 会触发 native 竞态)
+static BRIDGE_INITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn bridge_post(bridge_url: &str, path: &str, body: &serde_json::Value) -> Result<String, String> {
+    let _gate = BRIDGE_GATE.acquire().await.map_err(|e| format!("bridge gate: {}", e))?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(60))
         .no_proxy()
         .build()
         .map_err(|e| format!("bridge client: {}", e))?;
 
-    // First call ensures Init.init() is done on the device
-    let _ = client
-        .post(format!("{}/init", bridge_url))
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .map_err(|e| format!("bridge /init: {}", e))?;
+    if !BRIDGE_INITED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        // 首次调用确保 Init.init() 已在设备端完成; 失败则回退标志, 下次重试
+        match client
+            .post(format!("{}/init", bridge_url))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {}
+            _ => {
+                BRIDGE_INITED.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Err("bridge /init 失败".to_string());
+            }
+        }
+    }
 
     let resp = client
         .post(format!("{}{}", bridge_url, path))
