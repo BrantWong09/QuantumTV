@@ -257,6 +257,20 @@ fn emulator_serials(devices_out: &str) -> Vec<String> {
 /// 第三方模拟器/WSA 常见 TCP adb 端口（LDPlayer/Nox/MuMu/WSA）
 pub const SCAN_PORTS: &[u16] = &[5555, 5557, 62001, 62025, 62026, 62027, 16384, 16416, 16448, 58526];
 
+/// `adb devices` 输出中所有处于 device 状态的 serial (含 emulator- 与 host:port)
+pub fn all_device_serials(devices_out: &str) -> Vec<String> {
+    devices_out
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let serial = it.next()?;
+            let state = it.next()?;
+            (state == "device").then(|| serial.to_string())
+        })
+        .collect()
+}
+
 /// 从 `adb devices` 输出解析 TCP 型 serial（`host:port`，端口可解析为 u16），仅 device 状态
 pub fn connectable_serials(devices_out: &str) -> Vec<String> {
     devices_out
@@ -725,6 +739,39 @@ pub async fn shutdown() {
     log::info!("[桥接] 已关闭");
 }
 
+/// 在桥接 APK 所在设备上启动一个 activity (如网盘登录页)。
+/// 通过 adb 找到第一个处于 device 状态的设备执行 am start。
+pub async fn launch_bridge_activity(
+    cfg: &BridgeConfig,
+    extra_key: &str,
+    extra_value: &str,
+) -> Result<(), String> {
+    let adb = adb_path(&cfg.sdk_root);
+    if !adb.exists() {
+        return Err(format!("adb 不存在: {}", adb.display()));
+    }
+    let devices_out = run_adb(&adb, &["devices".to_string()]).await?;
+    let serial = all_device_serials(&devices_out)
+        .into_iter()
+        .next()
+        .ok_or_else(|| "未发现已连接的设备 (adb devices 为空)".to_string())?;
+    let args = vec![
+        "-s".to_string(),
+        serial.clone(),
+        "shell".to_string(),
+        "am".to_string(),
+        "start".to_string(),
+        "-n".to_string(),
+        "com.quantumtv.bridge/.CloudLoginActivity".to_string(),
+        "--es".to_string(),
+        extra_key.to_string(),
+        extra_value.to_string(),
+    ];
+    run_adb(&adb, &args).await?;
+    log::info!("[桥接] 已在 {} 拉起 CloudLoginActivity ({}={})", serial, extra_key, extra_value);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,6 +940,16 @@ mod tests {
         let out = "List of devices attached\n127.0.0.1:5555\tdevice\nemulator-5554\tdevice\n192.168.1.20:5555\toffline\nnot-a-port\tdevice\n";
         assert_eq!(connectable_serials(out), vec!["127.0.0.1:5555".to_string()]);
         assert!(connectable_serials("List of devices attached\n").is_empty());
+    }
+
+    #[test]
+    fn all_device_serials_parsing() {
+        let out = "List of devices attached\n127.0.0.1:5555\tdevice\nemulator-5554\tdevice\n192.168.1.20:5555\toffline\n";
+        assert_eq!(
+            all_device_serials(out),
+            vec!["127.0.0.1:5555".to_string(), "emulator-5554".to_string()]
+        );
+        assert!(all_device_serials("List of devices attached\n").is_empty());
     }
 
     #[test]

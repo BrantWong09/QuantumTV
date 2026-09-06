@@ -13,6 +13,7 @@ import { GlobalErrorIndicator } from '../components/GlobalErrorIndicator';
 import NavbarGate from '../components/NavbarGate';
 import ParticleBackground from '../components/ParticleBackground';
 import { SiteProvider } from '../components/SiteProvider';
+import { SourceProvider } from '../components/SourceProvider';
 import { ThemeProvider } from '../components/ThemeProvider';
 import TopNavbar from '../components/TopNavbar';
 
@@ -125,13 +126,15 @@ export default async function RootLayout({
           disableTransitionOnChange
         >
           <SiteProvider siteName={siteName} announcement={announcement}>
-            <ParticleBackground />
-            <NavbarGate>
-              <TopNavbar />
-            </NavbarGate>
-            {children}
-            <GlobalErrorIndicator />
-            <AppLifecycleWatcher />
+            <SourceProvider>
+              <ParticleBackground />
+              <NavbarGate>
+                <TopNavbar />
+              </NavbarGate>
+              {children}
+              <GlobalErrorIndicator />
+              <AppLifecycleWatcher />
+            </SourceProvider>
           </SiteProvider>
         </ThemeProvider>
       </body>

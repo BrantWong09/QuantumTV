@@ -21,7 +21,12 @@ New-Item -ItemType Directory -Path "$root\src" -Force | Out-Null
 Copy-Item "$PSScriptRoot\src\*" "$root\src\" -Recurse -Force
 Copy-Item "$PSScriptRoot\AndroidManifest.xml" "$root\AndroidManifest.xml" -Force
 $srcs = Get-ChildItem "$root\src" -Recurse -Filter *.java | ForEach-Object { $_.FullName }
-& javac --release 8 -encoding UTF-8 -classpath $plat -d "$root\out\classes" $srcs
+# javac 的 deprecation note 会写 stderr; 在 ErrorActionPreference=Stop 下会被 PS 当作终止错误
+# 因此这里临时切回 Continue 并依赖 $LASTEXITCODE 判定成败
+$oldEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+& javac --release 8 -encoding UTF-8 -nowarn -classpath $plat -d "$root\out\classes" $srcs 2>&1 | Out-Null
+$ErrorActionPreference = $oldEAP
 if ($LASTEXITCODE -ne 0) { throw "javac failed" }
 
 Write-Host "=== 2/6 d8 (merge) ==="

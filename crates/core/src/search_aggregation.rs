@@ -57,41 +57,15 @@ pub fn aggregate_search_results(
     let query_lower = query.trim().to_lowercase();
     let query_no_space = query_lower.replace(" ", "");
 
-    let norm_query = normalized_query.unwrap_or(&query_lower);
-    let norm_query_lower = norm_query.trim().to_lowercase();
-    let norm_query_no_space = norm_query_lower.replace(" ", "");
-
-    // 过滤相关结果
-    let relevant_results: Vec<SearchResult> = results
-        .into_iter()
-        .filter(|item| {
-            let title_lower = item.title.to_lowercase();
-            let title_no_space = title_lower.replace(" ", "");
-
-            // 包含完整关键词
-            if title_lower.contains(&query_lower)
-                || title_no_space.contains(&query_no_space)
-                || title_lower.contains(&norm_query_lower)
-                || title_no_space.contains(&norm_query_no_space)
-            {
-                return true;
-            }
-
-            // 顺序包含关键词的所有字符 (原词)
-            if subsequence_match(&title_no_space, &query_no_space) {
-                return true;
-            }
-
-            // 顺序包含关键词的所有字符 (转换后的词)
-            if norm_query != &query_lower
-                && subsequence_match(&title_no_space, &norm_query_no_space)
-            {
-                return true;
-            }
-
-            false
-        })
-        .collect();
+    // 空查询 = 纯分组工具用法(如过滤/排序测试), 不做相关性过滤
+    let relevant_results: Vec<SearchResult> = if query_no_space.is_empty() {
+        results
+    } else {
+        results
+            .into_iter()
+            .filter(|item| is_relevant_result(&item.title, query, normalized_query))
+            .collect()
+    };
 
     // 聚合分组
     let mut map: HashMap<String, Vec<SearchResult>> = HashMap::new();
@@ -121,22 +95,42 @@ pub fn aggregate_search_results(
         .collect()
 }
 
-/// 子序列匹配: 检查 pattern 的所有字符是否按顺序出现在 text 中
-fn subsequence_match(text: &str, pattern: &str) -> bool {
-    let mut pattern_chars = pattern.chars();
-    let mut current_pattern = pattern_chars.next();
+/// 严格相关性判定: 只保留与查询词双向包含的标题
+/// - 标题包含查询词(处理空格/大小写差异)
+/// - 查询词包含标题(长查询词如豆瓣推荐长标题, 标题为其子串; 标题至少 2 字)
+/// - 不再使用字符顺序子序列匹配(会把"狂飙"匹配到"狂野飙客"这类无关结果)
+pub fn is_relevant_result(title: &str, query: &str, normalized_query: Option<&str>) -> bool {
+    let query_lower = query.trim().to_lowercase();
+    let query_no_space = query_lower.replace(' ', "");
+    if query_no_space.is_empty() {
+        return false;
+    }
 
-    for ch in text.chars() {
-        if let Some(p) = current_pattern {
-            if ch == p {
-                current_pattern = pattern_chars.next();
-            }
-        } else {
-            return true;
+    let mut candidates = vec![query_no_space.clone()];
+    if let Some(nq) = normalized_query {
+        let nq_no_space = nq.trim().to_lowercase().replace(' ', "");
+        if !nq_no_space.is_empty() && !candidates.contains(&nq_no_space) {
+            candidates.push(nq_no_space);
         }
     }
 
-    current_pattern.is_none()
+    let title_no_space = title.trim().to_lowercase().replace(' ', "");
+    if title_no_space.is_empty() {
+        return false;
+    }
+
+    for cand in &candidates {
+        // 标题包含查询词
+        if title_no_space.contains(cand) {
+            return true;
+        }
+        // 查询词包含标题(标题是被长查询覆盖的短标题); 标题至少 2 个字符
+        let title_chars = title_no_space.chars().count();
+        if title_chars >= 2 && cand.contains(&title_no_space) {
+            return true;
+        }
+    }
+    false
 }
 
 /// 计算分组统计信息
@@ -287,15 +281,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_subsequence_match() {
-        assert!(subsequence_match("abcdef", "ace"));
-        assert!(subsequence_match("hello world", "hld"));
-        assert!(!subsequence_match("abc", "adc"));
+    fn test_is_relevant_result_strict() {
+        // 标题包含查询词 → 相关
+        assert!(is_relevant_result("肖申克的救赎", "肖申克", None));
+        assert!(is_relevant_result("肖申克的救赎", "肖申克的救赎", None));
+        // 查询词包含标题(长查询/豆瓣长标题) → 相关
+        assert!(is_relevant_result("万物生灵", "万物生灵：2025圣诞特别集", None));
+        // 空格差异 → 相关
+        assert!(is_relevant_result("复仇者 联盟", "复仇者联盟", None));
+        // 大小写差异 → 相关
+        assert!(is_relevant_result("Suffs (2026)", "suffs", None));
 
-        // 边界情况
-        assert!(subsequence_match("", ""));
-        assert!(subsequence_match("abc", ""));
-        assert!(!subsequence_match("", "a"));
+        // 完全无关 → 不相关
+        assert!(!is_relevant_result("狂野飙客", "狂飙", None));
+        assert!(!is_relevant_result("抓鬼大师", "抓特务", None));
+        assert!(!is_relevant_result("海贼王", "火影忍者", None));
+
+        // 单字标题太短, 即便被查询包含也不算相关
+        assert!(!is_relevant_result("狂", "狂飙", None));
+        // 空标题不相关
+        assert!(!is_relevant_result("", "肖申克", None));
+        // 空查询不相关(避免全量放行)
+        assert!(!is_relevant_result("任何标题", "", None));
+    }
+
+    #[test]
+    fn test_subsequence_match() {
+        // 已被严格相关性判定 is_relevant_result 取代, 保留用例防止回归引入宽松匹配
+        assert!(!is_relevant_result("狂野飙客", "狂飙", None));
+        assert!(!is_relevant_result("抓鬼大师", "抓特务", None));
     }
 
     #[test]

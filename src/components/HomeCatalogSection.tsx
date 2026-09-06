@@ -2,7 +2,6 @@
 'use client';
 
 import { invoke } from '@tauri-apps/api/core';
-import { useRouter } from 'next/navigation';
 import { useEffect, useRef, useState } from 'react';
 
 import { HomeCatalogResponse } from '@/lib/types';
@@ -56,7 +55,6 @@ function HomeSourceSwitcher({
 }
 
 export default function HomeCatalogSection() {
-  const router = useRouter();
   const { sources, isLoadingSources } = useSourceFilter();
 
   const [selectedSource, setSelectedSource] = useState<string>('');
@@ -90,10 +88,6 @@ export default function HomeCatalogSection() {
     if (cached) {
       setCatalog(cached);
       setLoading(false);
-      // 无目录 → 静默跳转搜索页
-      if (cached.categories.length === 0) {
-        router.push('/search');
-      }
       return;
     }
 
@@ -105,15 +99,11 @@ export default function HomeCatalogSection() {
         if (cancelled) return;
         cacheRef.current.set(selectedSource, resp);
         setCatalog(resp);
-        if (resp.categories.length === 0) {
-          router.push('/search');
-        }
       })
       .catch((err) => {
         console.error('获取首页目录失败:', err);
         if (cancelled) return;
         setCatalog(EMPTY_CATALOG);
-        router.push('/search');
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -122,7 +112,7 @@ export default function HomeCatalogSection() {
     return () => {
       cancelled = true;
     };
-  }, [selectedSource, router]);
+  }, [selectedSource]);
 
   const handleSelect = (key: string) => {
     setSelectedSource(key);
@@ -165,14 +155,25 @@ export default function HomeCatalogSection() {
     );
   }
 
-  // 目录为空时正在跳转，仅渲染切换器
+  // 目录为空：保留切换器，展示空态提示
   if (catalog.categories.length === 0) {
     return (
-      <HomeSourceSwitcher
-        sources={sources}
-        selected={catalog.source_key || selectedSource}
-        onSelect={handleSelect}
-      />
+      <>
+        <HomeSourceSwitcher
+          sources={sources}
+          selected={catalog.source_key || selectedSource}
+          onSelect={handleSelect}
+        />
+        <div className='flex flex-col items-center justify-center gap-2 py-12 text-center'>
+          <span className='text-4xl'>📭</span>
+          <p className='text-sm text-gray-500 dark:text-gray-400'>
+            当前源暂不支持目录浏览
+          </p>
+          <p className='text-xs text-gray-400 dark:text-gray-500'>
+            请在上方切换其它源，或前往搜索页查找视频
+          </p>
+        </div>
+      </>
     );
   }
 

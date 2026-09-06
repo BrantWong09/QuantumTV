@@ -123,6 +123,13 @@ export interface InitializePlayerByQueryResponse {
   test_results: Array<[string, SourceTestResult]>;
 }
 
+/** Spider 网盘集 playerContent 解析结果 */
+export interface ResolveEpisodeResponse {
+  url: string;
+  header: Record<string, string>;
+  source_site_type: number;
+}
+
 // 收藏数据结构
 export interface Favorite {
   source_name: string;
@@ -194,6 +201,14 @@ export interface IStorage {
   clearAllData(): Promise<void>;
 }
 
+// 单站点内的一组源头 (线路)
+export interface PlayGroup {
+  flag: string;
+  episodes: string[];
+  episodes_titles: string[];
+  episodes_raw: string[];
+}
+
 // 搜索结果数据结构
 export interface SearchResult {
   id: string;
@@ -209,6 +224,10 @@ export interface SearchResult {
   type_name?: string;
   douban_id?: number;
   source_site_type?: number;
+  /** Spider 网盘集原始 id (与 episodes 对齐) */
+  episodes_raw?: string[];
+  /** 该详情内部的多组源头 (线路); 顶层 episodes 为当前默认组 */
+  play_groups?: PlayGroup[];
 }
 
 /** 聚合后的分组*/

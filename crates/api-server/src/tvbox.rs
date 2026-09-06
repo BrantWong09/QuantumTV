@@ -1071,6 +1071,8 @@ pub struct SearchResultItem {
     #[serde(default)]
     pub vod_play_url: Option<String>,
     #[serde(default)]
+    pub vod_play_from: Option<String>,
+    #[serde(default)]
     pub vod_class: Option<String>,
     #[serde(default)]
     pub vod_year: Option<String>,
@@ -1151,6 +1153,7 @@ pub async fn search_handler(
                     vod_pic: item.vod_pic,
                     vod_remarks: item.vod_remarks,
                     vod_play_url: item.vod_play_url,
+                    vod_play_from: item.vod_play_from,
                     vod_class: item.vod_class,
                     vod_year: item.vod_year,
                     vod_content: item.vod_content,

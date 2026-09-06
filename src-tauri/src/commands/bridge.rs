@@ -33,6 +33,15 @@ fn bridge_settings_from_config(config: &serde_json::Value) -> Option<BridgeSetti
         .and_then(|v| serde_json::from_value::<BridgeSettingsDto>(v.clone()).ok())
 }
 
+/// 从持久化数据构建 core 的 BridgeConfig (供非命令模块复用, 如网盘登录跳转)
+pub fn bridge_config_from_data(data: &crate::storage::StorageData) -> quantumtv_core::bridge::BridgeConfig {
+    let settings = bridge_settings_from_config(&data.config);
+    match settings {
+        Some(s) => quantumtv_core::bridge::BridgeConfig::from_map(&build_bridge_map(&s)),
+        None => quantumtv_core::bridge::BridgeConfig::from_env(),
+    }
+}
+
 fn validate_settings(s: &BridgeSettingsDto) -> Result<(), String> {
     let remote = s.remote_url.trim();
     if !remote.is_empty() {

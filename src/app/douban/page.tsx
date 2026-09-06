@@ -774,6 +774,36 @@ function DoubanPageClient() {
     [selectedSourceCategory, fetchSourceCategoryData],
   );
 
+  // ---------------------------------------------------------------------------
+  // URL 驱动的源直达：?source=KEY&type_id=ID（顶栏导航按源跳转时携带）
+  // ---------------------------------------------------------------------------
+  const urlSourceParam = searchParams.get('source') || '';
+  const urlTypeIdParam = searchParams.get('type_id') || '';
+  const urlInitDoneRef = useRef(false);
+
+  // 进入页面且 URL 带具体源时，切换到该源（仅执行一次，避免与用户手动切换冲突）
+  useEffect(() => {
+    if (!urlSourceParam || urlSourceParam === 'auto') return;
+    if (urlInitDoneRef.current) return;
+    urlInitDoneRef.current = true;
+    void handleSourceChange(urlSourceParam);
+    // 仅在挂载/URL source 变化时触发
+     
+  }, [urlSourceParam]);
+
+  // URL 指定了分类时，等分类列表就绪后选中对应分类
+  useEffect(() => {
+    if (!urlTypeIdParam) return;
+    if (urlSourceParam === 'auto' || !urlSourceParam) return;
+    const matched = filteredSourceCategories.find(
+      (cat) => String(cat.type_id) === urlTypeIdParam,
+    );
+    if (matched) {
+      handleSourceCategoryChange(matched);
+    }
+     
+  }, [urlTypeIdParam, filteredSourceCategories]);
+
   const getPageTitle = () => {
     // 根据 type 生成标题
     return type === 'movie'

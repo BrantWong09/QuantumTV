@@ -5,7 +5,7 @@ use crate::storage::StorageManager;
 use image::{GenericImageView, ImageOutputFormat};
 use moka::future::Cache;
 use quantumtv_core::playback::{SkipAction, SkipDetection};
-use quantumtv_core::types::SearchResult;
+use quantumtv_core::types::{PlayGroup, SearchResult};
 use quantumtv_core::{
     prefer_best_source, test_video_source, SourceTestResult as CoreSourceTestResult,
 };
@@ -225,6 +225,7 @@ pub struct InitializePlayerByQueryResponse {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct PlayRecordMeta {
     episode_index: i32,
     play_time: i32,
@@ -264,14 +265,6 @@ fn normalize_title_for_match(title: &str) -> String {
     title.replace(' ', "").to_lowercase()
 }
 
-fn derive_search_type_filter(total_episodes: Option<i32>) -> Option<SearchTypeFilter> {
-    match total_episodes {
-        Some(total) if total > 1 => Some(SearchTypeFilter::Tv),
-        Some(1) => Some(SearchTypeFilter::Movie),
-        _ => None,
-    }
-}
-
 fn filter_sources_for_fallback(
     results: &[SearchResult],
     title: &str,
@@ -305,20 +298,6 @@ fn filter_sources_for_fallback(
         })
         .cloned()
         .collect()
-}
-
-fn choose_fallback_candidates(
-    results: Vec<SearchResult>,
-    title: &str,
-    year: Option<&str>,
-    search_type: Option<SearchTypeFilter>,
-) -> Vec<SearchResult> {
-    let filtered = filter_sources_for_fallback(&results, title, year, search_type);
-    if filtered.is_empty() {
-        results
-    } else {
-        filtered
-    }
 }
 
 fn parse_search_type_filter(search_type: Option<&str>) -> Option<SearchTypeFilter> {
@@ -424,61 +403,6 @@ fn persist_encountered_sources(
         .collect::<Vec<_>>();
 
     let _ = manager.ensure_sources_persisted(db, source_keys);
-}
-
-async fn select_best_source_from_search(
-    query: String,
-    fallback_year: Option<String>,
-    search_type: Option<SearchTypeFilter>,
-    app_handle: tauri::AppHandle,
-    storage: State<'_, StorageManager>,
-    cache: State<'_, SearchCacheManager>,
-    db: &crate::db::db_client::Db,
-    source_manager: &SourceIntelligenceManager,
-) -> Result<GetVideoDetailOptimizedResponse, String> {
-    let (search_results, _) = search_with_cache_hit(query.clone(), app_handle, storage, cache, db)
-        .await
-        .map_err(|e| format!("Fallback search failed: {}", e))?;
-
-    if search_results.is_empty() {
-        return Err("Fallback search returned no results".to_string());
-    }
-
-    let mut candidates = choose_fallback_candidates(
-        search_results,
-        &query,
-        fallback_year.as_deref(),
-        search_type,
-    );
-
-    if candidates.is_empty() {
-        return Err("No fallback candidates available".to_string());
-    }
-
-    candidates = reorder_results_with_source_intelligence(candidates, source_manager);
-
-    let best_source = if candidates.len() == 1 {
-        candidates[0].clone()
-    } else if has_source_intelligence(&candidates, source_manager) {
-        candidates[0].clone()
-    } else {
-        let client = get_video_client();
-        let (best, tests) = prefer_best_source(client, candidates.clone()).await?;
-        persist_source_test_results(source_manager, db, &candidates, &tests);
-        best
-    };
-
-    let other_sources = candidates
-        .into_iter()
-        .filter(|source_item| {
-            !(source_item.source == best_source.source && source_item.id == best_source.id)
-        })
-        .collect();
-
-    Ok(GetVideoDetailOptimizedResponse {
-        detail: best_source,
-        other_sources,
-    })
 }
 
 async fn probe_and_persist_source_health(
@@ -678,6 +602,9 @@ pub struct ApiSearchItem {
     pub vod_pic: String,
     pub vod_remarks: Option<String>,
     pub vod_play_url: Option<String>,
+    /// 多组源头名 (如 "百度网盘$$$夸克网盘"), 与 vod_play_url 中 $$$ 分组一一对应
+    #[serde(default)]
+    pub vod_play_from: Option<String>,
     pub vod_class: Option<String>,
     pub vod_year: Option<String>,
     pub vod_content: Option<String>,
@@ -974,6 +901,22 @@ pub struct DoubanCommentsResponse {
 }
 static VIDEO_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+/// 搜索代际: 每次 search_with_cache_hit 开始时自增。
+/// 旧的搜索任务发现自己的代际落后即中止(点播放/发起新搜索时使旧搜索尽快断掉,
+/// 不再继续向桥接发搜索请求)。
+static SEARCH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 使当前进行中的搜索全部失效(供"点播放即断搜索"命令调用)
+#[tauri::command]
+pub fn abort_active_search() {
+    SEARCH_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 检查指定代际的搜索是否已被新的代际取代
+fn search_generation_is_stale(my_gen: u64) -> bool {
+    SEARCH_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != my_gen
+}
+
 pub(crate) fn get_video_client() -> &'static reqwest::Client {
     VIDEO_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -1053,8 +996,23 @@ const YELLOW_WORDS: &[&str] = &[
     "诱惑",
 ];
 
-fn parse_episodes(play_url: &str) -> (Vec<String>, Vec<String>) {
-    parse_episodes_for(play_url, false)
+/// 解析单组 "第1集$url#第2集$url" 的选集列表
+/// spider_mode=true 时收录非 http 的网盘集 id (播放前经 playerContent 二次解析)
+fn parse_episode_group_items(group: &str, spider_mode: bool) -> (Vec<String>, Vec<String>) {
+    let mut episodes = Vec::new();
+    let mut titles = Vec::new();
+    let items = group.split('#');
+    for item in items {
+        let parts: Vec<&str> = item.split('$').collect();
+        if parts.len() == 2 && (is_playable_m3u8(parts[1]) || (spider_mode && !parts[1].is_empty())) {
+            titles.push(parts[0].to_string());
+            episodes.push(parts[1].to_string());
+        } else if parts.len() == 1 && is_playable_m3u8(parts[0]) {
+            titles.push((episodes.len() + 1).to_string());
+            episodes.push(parts[0].to_string());
+        }
+    }
+    (episodes, titles)
 }
 
 /// spider_mode=true 时收录非 http 的网盘集 id (播放前经 playerContent 二次解析)
@@ -1064,25 +1022,59 @@ fn parse_episodes_for(play_url: &str, spider_mode: bool) -> (Vec<String>, Vec<St
 
     let groups = play_url.split("$$$");
     for group in groups {
-        let mut group_episodes = Vec::new();
-        let mut group_titles = Vec::new();
-        let items = group.split('#');
-        for item in items {
-            let parts: Vec<&str> = item.split('$').collect();
-            if parts.len() == 2 && (is_playable_m3u8(parts[1]) || (spider_mode && !parts[1].is_empty())) {
-                group_titles.push(parts[0].to_string());
-                group_episodes.push(parts[1].to_string());
-            } else if parts.len() == 1 && is_playable_m3u8(parts[0]) {
-                group_titles.push((group_episodes.len() + 1).to_string());
-                group_episodes.push(parts[0].to_string());
-            }
-        }
+        let (group_episodes, group_titles) = parse_episode_group_items(group, spider_mode);
         if group_episodes.len() > episodes.len() {
             episodes = group_episodes;
             titles = group_titles;
         }
     }
     (episodes, titles)
+}
+
+/// 拆分 vod_play_url 的全部 $$$ 线路组, 组名对齐 vod_play_from (如 "百度网盘$$$夸克网盘")
+/// 返回 (默认组集数, 默认组集名, 全部线路组); 默认组 = 集数最多的一组(等长取第一组, 兼容旧行为)
+fn parse_episode_groups(
+    play_url: &str,
+    play_from: Option<&str>,
+    spider_mode: bool,
+) -> (Vec<String>, Vec<String>, Vec<PlayGroup>) {
+    let flags: Vec<&str> = play_from
+        .unwrap_or("")
+        .split("$$$")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut default_episodes = Vec::new();
+    let mut default_titles = Vec::new();
+    let mut groups = Vec::new();
+
+    for (idx, group) in play_url.split("$$$").enumerate() {
+        let (group_episodes, group_titles) = parse_episode_group_items(group, spider_mode);
+        if group_episodes.is_empty() {
+            continue;
+        }
+        let flag = flags
+            .get(idx)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("线路{}", groups.len() + 1));
+        groups.push(PlayGroup {
+            flag,
+            episodes: group_episodes.clone(),
+            episodes_titles: group_titles.clone(),
+            episodes_raw: if spider_mode {
+                group_episodes.clone()
+            } else {
+                Vec::new()
+            },
+        });
+        if group_episodes.len() > default_episodes.len() {
+            default_episodes = group_episodes;
+            default_titles = group_titles;
+        }
+    }
+
+    (default_episodes, default_titles, groups)
 }
 
 
@@ -1114,8 +1106,9 @@ pub(crate) async fn search_site_results(
         let results = items
             .into_iter()
             .map(|item| {
-                let (episodes, episodes_titles) =
-                    parse_episodes_for(item.vod_play_url.as_deref().unwrap_or(""), true);
+                let play_url = item.vod_play_url.as_deref().unwrap_or("");
+                let (episodes, episodes_titles, play_groups) =
+                    parse_episode_groups(play_url, item.vod_play_from.as_deref(), true);
                 SearchResult {
                     id: match item.vod_id {
                         Value::String(s) => s,
@@ -1126,6 +1119,7 @@ pub(crate) async fn search_site_results(
                     poster: item.vod_pic,
                     episodes,
                     episodes_titles,
+                    play_groups,
                     source: site.key.clone(),
                     source_name: site.name.clone(),
                     class: item.vod_class,
@@ -1167,8 +1161,9 @@ pub(crate) async fn search_site_results(
                 .list
                 .into_iter()
                 .map(|item| {
-                    let (episodes, episodes_titles) =
-                        parse_episodes_for(item.vod_play_url.as_deref().unwrap_or(""), false);
+                    let play_url = item.vod_play_url.as_deref().unwrap_or("");
+                    let (episodes, episodes_titles, play_groups) =
+                        parse_episode_groups(play_url, item.vod_play_from.as_deref(), false);
                     SearchResult {
                         id: match item.vod_id {
                             Value::String(s) => s,
@@ -1179,6 +1174,7 @@ pub(crate) async fn search_site_results(
                         poster: item.vod_pic,
                         episodes,
                         episodes_titles,
+                        play_groups,
                         source: site.key.clone(),
                         source_name: site.name.clone(),
                         class: item.vod_class,
@@ -1292,104 +1288,91 @@ pub(crate) async fn search_with_cache_hit(
         .app_data_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
-    // 限制并发数：最多同时请求 20 个源，充分利用并发
-    let semaphore = Arc::new(Semaphore::new(20));
+    // 本次搜索的代际(每次搜索自增, 旧代际任务在检查点自行退出)
+    let my_generation = SEARCH_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
     let client = get_video_client();
-    let completed = Arc::new(tokio::sync::Mutex::new(0i32));
+    // 串行搜索: 每次只请求一个站点, 避免并发请求风暴触发站点限流
+    // (此前 20 并发曾在几分钟内打出 200+ 请求, 被 Cloudflare 1020 封禁)
+    let completed = std::cell::Cell::new(0i32);
+    let app_handle_opt = if use_streaming {
+        Some(app_handle.clone())
+    } else {
+        None
+    };
 
-    let mut handles = Vec::new();
-    for site in &sites {
-        let cache_root = cache_root.clone();
-        let semaphore = semaphore.clone();
-        let client = client.clone();
-        let query = query.clone();
-        let site_clone = site.clone();
-        // 仅在启用流式搜索时才传递 app_handle
-        let app_handle_opt = if use_streaming {
-            Some(app_handle.clone())
-        } else {
-            None
-        };
-        let completed = completed.clone();
-        // 克隆过滤配置到闭包中
-        let disable_filter = disable_yellow_filter;
-
-        let handle = tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.ok()?;
-
-            // 流式搜索失败/完成时发送事件(统一处理)
-            async fn emit_stream_event(
-                app_handle_opt: &Option<tauri::AppHandle>,
-                completed: &Arc<tokio::sync::Mutex<i32>>,
-                site_clone: &ApiSite,
-                total_sources: i32,
-                results: Vec<SearchResult>,
-            ) {
-                if let Some(app_handle) = app_handle_opt {
-                    let window = app_handle
-                        .get_webview_window("main")
-                        .or_else(|| app_handle.webview_windows().values().next().cloned());
-                    if let Some(window) = window {
-                        let mut count = completed.lock().await;
-                        *count += 1;
-                        let _ = window.emit(
-                            "search-stream-result",
-                            SearchStreamEvent {
-                                results,
-                                source: site_clone.key.clone(),
-                                source_name: site_clone.name.clone(),
-                                total_sources,
-                                completed_sources: *count,
-                            },
-                        );
-                    }
-                }
+    // 流式搜索失败/完成时发送事件(统一处理)
+    let emit_stream_event = |completed: &std::cell::Cell<i32>,
+                             site_key: &str,
+                             site_name: &str,
+                             results: Vec<SearchResult>| {
+        if let Some(app_handle) = &app_handle_opt {
+            let window = app_handle
+                .get_webview_window("main")
+                .or_else(|| app_handle.webview_windows().values().next().cloned());
+            if let Some(window) = window {
+                completed.set(completed.get() + 1);
+                let _ = window.emit(
+                    "search-stream-result",
+                    SearchStreamEvent {
+                        results,
+                        source: site_key.to_string(),
+                        source_name: site_name.to_string(),
+                        total_sources,
+                        completed_sources: completed.get(),
+                    },
+                );
             }
-
-            // 按 site_type 分流搜索,统一产出 Vec<SearchResult>
-            let mut source_results = match search_site_results(
-                &site_clone,
-                &query,
-                &client,
-                &cache_root,
-            )
-            .await
-            {
-                Ok(results) => results,
-                Err(_) => {
-                    emit_stream_event(&app_handle_opt, &completed, &site_clone, total_sources, vec![])
-                        .await;
-                    return None;
-                }
-            };
-
-            // 流式输出前进行内容关键词过滤(源已经在搜索前过滤了)
-            if !disable_filter {
-                source_results.retain(|res| {
-                    let type_name = res.type_name.as_deref().unwrap_or("");
-                    !YELLOW_WORDS.iter().any(|w| type_name.contains(w))
-                });
-            }
-
-            emit_stream_event(
-                &app_handle_opt,
-                &completed,
-                &site_clone,
-                total_sources,
-                source_results.clone(),
-            )
-            .await;
-
-            Some(source_results)
-        });
-        handles.push(handle);
-    }
+        }
+    };
 
     let mut all_results = Vec::new();
-    for handle in handles {
-        if let Ok(Some(results)) = handle.await {
-            all_results.extend(results);
+    for site in &sites {
+        // 代际检查点 1: 已有更新的搜索启动(如用户点了播放), 立即停止, 不再请求后续站点
+        if search_generation_is_stale(my_generation) {
+            return Ok((Vec::new(), false));
         }
+
+        // 按 site_type 分流搜索,统一产出 Vec<SearchResult>
+        let mut source_results = match search_site_results(
+            site,
+            &query,
+            &client,
+            &cache_root,
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err(_) => {
+                // 代际已过期: 静默退出(不emit)
+                if search_generation_is_stale(my_generation) {
+                    return Ok((Vec::new(), false));
+                }
+                emit_stream_event(&completed, &site.key, &site.name, vec![]);
+                continue;
+            }
+        };
+
+        // 代际检查点 2: 搜索期间用户点播放/发起新搜索, 丢弃结果并停止流式事件
+        if search_generation_is_stale(my_generation) {
+            return Ok((Vec::new(), false));
+        }
+
+        // 流式输出前进行内容关键词过滤(源已经在搜索前过滤了)
+        if !disable_yellow_filter {
+            source_results.retain(|res| {
+                let type_name = res.type_name.as_deref().unwrap_or("");
+                !YELLOW_WORDS.iter().any(|w| type_name.contains(w))
+            });
+        }
+
+        emit_stream_event(&completed, &site.key, &site.name, source_results.clone());
+        all_results.extend(source_results);
+    }
+
+    // 代际已过期: 本轮搜索已被取代, 不聚合/不缓存/不发完成事件
+    if search_generation_is_stale(my_generation) {
+        return Ok((Vec::new(), false));
     }
 
     // Filter duplicates
@@ -1404,6 +1387,14 @@ pub(crate) async fn search_with_cache_hit(
     for res in all_results {
         let key = format!("{}|{}", res.source, res.id);
         if seen.insert(key) {
+            // 相关性过滤: 只保留与查询词严格相关的结果(双向包含), 滤除各站返回的无关填充项
+            if !quantumtv_core::search_aggregation::is_relevant_result(
+                &res.title,
+                &query,
+                None,
+            ) {
+                continue;
+            }
             // 按关键词筛选成人内容
             if !disable_yellow_filter {
                 let type_name = res.type_name.as_deref().unwrap_or("");
@@ -1500,6 +1491,7 @@ async fn fetch_detail_item(
             vod_pic: item.vod_pic,
             vod_remarks: item.vod_remarks,
             vod_play_url: item.vod_play_url,
+            vod_play_from: item.vod_play_from,
             vod_class: item.vod_class,
             vod_year: item.vod_year,
             vod_content: item.vod_content,
@@ -1547,7 +1539,12 @@ pub async fn get_video_detail(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let item = fetch_detail_item(&site, &id, &cache_root).await?;
 
-    let (episodes, episodes_titles) = parse_episodes_for(item.vod_play_url.as_deref().unwrap_or(""), site.site_type.unwrap_or(1) == 3);
+    let spider_mode = site.site_type.unwrap_or(1) == 3;
+    let (episodes, episodes_titles, play_groups) = parse_episode_groups(
+        item.vod_play_url.as_deref().unwrap_or(""),
+        item.vod_play_from.as_deref(),
+        spider_mode,
+    );
     let episodes_raw = episodes.clone();
 
     Ok(SearchResult {
@@ -1560,6 +1557,7 @@ pub async fn get_video_detail(
         poster: item.vod_pic,
         episodes: episodes.clone(),
         episodes_titles,
+        play_groups,
         episodes_raw,
         login_hint: None,
         source: site.key,
@@ -1595,10 +1593,15 @@ pub async fn get_video_detail_optimized(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let item = fetch_detail_item(&site, &id, &cache_root).await?;
 
-    let (episodes, episodes_titles) = parse_episodes_for(item.vod_play_url.as_deref().unwrap_or(""), site.site_type.unwrap_or(1) == 3);
+    let spider_mode = site.site_type.unwrap_or(1) == 3;
+    let (episodes, episodes_titles, play_groups) = parse_episode_groups(
+        item.vod_play_url.as_deref().unwrap_or(""),
+        item.vod_play_from.as_deref(),
+        spider_mode,
+    );
     let episodes_raw = episodes.clone();
 
-    let detail = SearchResult {
+    let mut detail = SearchResult {
         id: match item.vod_id {
             Value::String(s) => s,
             Value::Number(n) => n.to_string(),
@@ -1608,10 +1611,11 @@ pub async fn get_video_detail_optimized(
         poster: item.vod_pic.clone(),
         episodes: episodes.clone(),
         episodes_titles,
+        play_groups,
         episodes_raw,
         login_hint: None,
-        source: site.key,
-        source_name: site.name,
+        source: site.key.clone(),
+        source_name: site.name.clone(),
         class: item.vod_class.clone(),
         year: item.vod_year.clone(),
         desc: item.vod_content.as_ref().map(|c| clean_html_tags(c)),
@@ -1622,6 +1626,12 @@ pub async fn get_video_detail_optimized(
             .map(|v| v as i32),
         source_site_type: site.site_type,
     };
+
+    // Spider 网盘源首集直链化: 集是网盘分享 id(非 http), 须经 playerContent 解析为真实直链
+    // (与 initialize_player_by_query 的补全路径一致; 直连 source+id 入口也必须走这一步)
+    if spider_mode && !detail.episodes.is_empty() {
+        enrich_first_episode_direct(&mut detail, &site).await;
+    }
 
     // 如果需要搜索相似源，尝试从缓存快速获取
     let other_sources = if also_search_similar.unwrap_or(false) {
@@ -2589,13 +2599,15 @@ pub async fn initialize_player_by_query(
                 if site.site_type.unwrap_or(1) == 3 {
                     match fetch_detail_item(&site, &first.id, &cache_root).await {
                         Ok(item) => {
-                            let (episodes, episodes_titles) = parse_episodes_for(
+                            let (episodes, episodes_titles, play_groups) = parse_episode_groups(
                                 item.vod_play_url.as_deref().unwrap_or(""),
+                                item.vod_play_from.as_deref(),
                                 true,
                             );
                             filtered[0] = SearchResult {
                                 episodes: episodes.clone(),
                                 episodes_titles,
+                                play_groups,
                                 source_site_type: Some(3),
                                 login_hint: None,
                                 episodes_raw: episodes,
@@ -2697,7 +2709,11 @@ async fn fetch_detail_for_source_key(
     let cache_root = std::env::temp_dir();
     let item = fetch_detail_item(&site, id, &cache_root).await?;
 
-    let (episodes, episodes_titles) = parse_episodes(item.vod_play_url.as_deref().unwrap_or(""));
+    let (episodes, episodes_titles, play_groups) = parse_episode_groups(
+        item.vod_play_url.as_deref().unwrap_or(""),
+        item.vod_play_from.as_deref(),
+        site.site_type.unwrap_or(1) == 3,
+    );
     Ok(SearchResult {
         id: match item.vod_id {
             Value::String(s) => s,
@@ -2708,6 +2724,7 @@ async fn fetch_detail_for_source_key(
         poster: item.vod_pic,
         episodes,
         episodes_titles,
+        play_groups,
         source: site.key,
         source_name: site.name,
         class: item.vod_class,
@@ -2889,6 +2906,7 @@ pub async fn player_tick(
 /// - 跳过配置
 /// - 播放器配置（去广告、优选开关）
 #[tauri::command]
+#[allow(unused_variables)]
 pub async fn initialize_player_view(
     source: String,
     id: String,
@@ -2997,80 +3015,23 @@ pub async fn initialize_player_view(
     let skip_config = skip_config?;
     let (block_ad_enabled, optimization_enabled) = player_config?;
 
-    let fallback_title = title
-        .as_ref()
-        .and_then(|t| {
-            let trimmed = t.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        })
-        .or_else(|| {
-            play_record_meta.as_ref().and_then(|record| {
-                let trimmed = record.search_title.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            })
-        })
-        .or_else(|| play_record_meta.as_ref().map(|record| record.title.clone()));
-
-    let fallback_year = play_record_meta
-        .as_ref()
-        .map(|record| record.year.trim().to_string())
-        .filter(|year| !year.is_empty());
-
-    let search_type = derive_search_type_filter(
-        play_record_meta
-            .as_ref()
-            .map(|record| record.total_episodes),
-    );
-
+    // 用户明确点了某个源(source+id), 不做静默换源兜底:
+    // 详情失败/空选集时直接报错, 让前端提示"该源暂不可用", 而不是偷偷换成别的源
     let mut detail_response = match detail_result {
         Ok(detail) if !detail.detail.episodes.is_empty() => detail,
-        Ok(_) | Err(_) => {
-            let query = fallback_title
-                .clone()
-                .ok_or_else(|| "Missing title for fallback search".to_string())?;
-            select_best_source_from_search(
-                query,
-                fallback_year.clone(),
-                search_type,
-                app_handle.clone(),
-                storage.clone(),
-                cache.clone(),
-                &db,
-                &source_manager,
-            )
-            .await?
+        Ok(_) => {
+            return Err(format!(
+                "该源暂无选集(站点可能被限流或资源下线): {}",
+                source
+            ));
+        }
+        Err(e) => {
+            return Err(format!("获取该源详情失败: {}", e));
         }
     };
 
     detail_response.other_sources =
         reorder_results_with_source_intelligence(detail_response.other_sources, &source_manager);
-
-    if source_manager.should_skip_source(&detail_response.detail.source) {
-        if let Some(query) = fallback_title.clone() {
-            if let Ok(fallback) = select_best_source_from_search(
-                query,
-                fallback_year.clone(),
-                search_type,
-                app_handle.clone(),
-                storage.clone(),
-                cache.clone(),
-                &db,
-                &source_manager,
-            )
-            .await
-            {
-                detail_response = fallback;
-            }
-        }
-    }
 
     let probe_episode_index = play_record_meta
         .as_ref()
@@ -3112,6 +3073,7 @@ pub async fn initialize_player_view(
                 );
             }
             Err(_) => {
+                // probe 失败仅记录源健康度, 不换源(用户点谁就播谁)
                 let _ = source_manager.record_runtime_test_result_persisted(
                     &db,
                     detail_response.detail.source.clone(),
@@ -3119,22 +3081,6 @@ pub async fn initialize_player_view(
                     0,
                     Some("playback probe failed".to_string()),
                 );
-                if let Some(query) = fallback_title.clone() {
-                    if let Ok(fallback) = select_best_source_from_search(
-                        query,
-                        fallback_year.clone(),
-                        search_type,
-                        app_handle.clone(),
-                        storage.clone(),
-                        cache.clone(),
-                        &db,
-                        &source_manager,
-                    )
-                    .await
-                    {
-                        detail_response = fallback;
-                    }
-                }
             }
         }
     }
@@ -3214,6 +3160,7 @@ mod tests {
             source_site_type: Some(1),
             login_hint: None,
             episodes_raw: Vec::new(),
+            play_groups: Vec::new(),
         }
     }
 
@@ -3243,20 +3190,6 @@ mod tests {
     }
 
     #[test]
-    fn derive_search_type_filter_detects_tv_and_movie() {
-        assert_eq!(
-            derive_search_type_filter(Some(10)),
-            Some(SearchTypeFilter::Tv)
-        );
-        assert_eq!(
-            derive_search_type_filter(Some(1)),
-            Some(SearchTypeFilter::Movie)
-        );
-        assert_eq!(derive_search_type_filter(Some(0)), None);
-        assert_eq!(derive_search_type_filter(None), None);
-    }
-
-    #[test]
     fn filter_sources_for_fallback_matches_title_year_and_type() {
         let results = vec![
             make_result("Test Show", "2020", 12, "s1", "1"),
@@ -3280,23 +3213,6 @@ mod tests {
         let filtered_no_year =
             filter_sources_for_fallback(&results, "Test Show", None, Some(SearchTypeFilter::Tv));
         assert_eq!(filtered_no_year.len(), 3);
-    }
-
-    #[test]
-    fn choose_fallback_candidates_returns_original_when_filtered_empty() {
-        let results = vec![
-            make_result("Movie A", "2022", 1, "s1", "1"),
-            make_result("Movie A", "2022", 1, "s2", "2"),
-        ];
-
-        let candidates = choose_fallback_candidates(
-            results.clone(),
-            "Movie A",
-            Some("2022"),
-            Some(SearchTypeFilter::Tv),
-        );
-
-        assert_eq!(candidates.len(), results.len());
     }
 
     #[test]
@@ -3324,6 +3240,70 @@ mod tests {
         assert_eq!(ordered[0].source, best.source);
         assert_eq!(ordered[0].id, best.id);
         assert_eq!(ordered[1].source, other.source);
+    }
+
+    #[test]
+    fn parse_episode_groups_aligns_play_from_and_url() {
+        // 百度网盘 组 + 夸克网盘 组, 各自独立选集
+        let (default_eps, default_titles, groups) = parse_episode_groups(
+            "第1集$http://a/1.m3u8#第2集$http://a/2.m3u8$$$第1集$http://b/1.m3u8#第2集$http://b/2.m3u8",
+            Some("百度网盘$$$夸克网盘"),
+            false,
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].flag, "百度网盘");
+        assert_eq!(groups[0].episodes.len(), 2);
+        assert_eq!(groups[0].episodes_titles, vec!["第1集", "第2集"]);
+        assert_eq!(groups[1].flag, "夸克网盘");
+        assert_eq!(groups[1].episodes.len(), 2);
+        // 默认选集取集数最多的一组(等长取第一组, 与旧行为一致)
+        assert_eq!(default_eps, groups[0].episodes);
+        assert_eq!(default_titles, groups[0].episodes_titles);
+    }
+
+    #[test]
+    fn parse_episode_groups_picks_longest_when_counts_differ() {
+        let (default_eps, _, groups) = parse_episode_groups(
+            "第1集$http://a/1.m3u8$$$第1集$http://b/1.m3u8#第2集$http://b/2.m3u8#第3集$http://b/3.m3u8",
+            None,
+            false,
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[1].episodes.len(), 3);
+        assert_eq!(default_eps, groups[1].episodes);
+        // 无 play_from 时生成占位名
+        assert!(!groups[0].flag.is_empty());
+    }
+
+    #[test]
+    fn parse_episode_groups_keeps_single_group_without_from() {
+        let (default_eps, titles, groups) = parse_episode_groups(
+            "http://a/1.m3u8#http://a/2.m3u8",
+            None,
+            false,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].episodes.len(), 2);
+        assert_eq!(default_eps, groups[0].episodes);
+        assert_eq!(titles, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn parse_episode_groups_spider_mode_keeps_raw_ids() {
+        let (default_eps, _, groups) = parse_episode_groups(
+            "第1集$netdisk://quark/1#第2集$netdisk://quark/2$$$第1集$netdisk://baidu/1#第2集$netdisk://baidu/2#第3集$netdisk://baidu/3",
+            Some("夸克$$$百度"),
+            true,
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].flag, "夸克");
+        assert_eq!(groups[0].episodes.len(), 2);
+        assert_eq!(groups[0].episodes, vec!["netdisk://quark/1", "netdisk://quark/2"]);
+        assert_eq!(groups[1].flag, "百度");
+        assert_eq!(groups[1].episodes.len(), 3);
+        // spider 原始 id 收录进 episodes_raw
+        assert_eq!(groups[1].episodes_raw.len(), 3);
+        assert_eq!(default_eps, groups[1].episodes);
     }
 
     fn setup_test_db() -> crate::db::db_client::Db {
@@ -3796,40 +3776,6 @@ mod tests {
         // None case
         assert_eq!(parse_search_type_filter(None), None);
     }
-
-    #[test]
-    fn derive_search_type_filter_tv_range() {
-        // Test TV: total > 1
-        assert_eq!(
-            derive_search_type_filter(Some(2)),
-            Some(SearchTypeFilter::Tv)
-        );
-        assert_eq!(
-            derive_search_type_filter(Some(10)),
-            Some(SearchTypeFilter::Tv)
-        );
-        assert_eq!(
-            derive_search_type_filter(Some(100)),
-            Some(SearchTypeFilter::Tv)
-        );
-    }
-
-    #[test]
-    fn derive_search_type_filter_movie_range() {
-        // Test Movie: total == 1
-        assert_eq!(
-            derive_search_type_filter(Some(1)),
-            Some(SearchTypeFilter::Movie)
-        );
-    }
-
-    #[test]
-    fn derive_search_type_filter_edge_values() {
-        // Test edge cases that don't match
-        assert_eq!(derive_search_type_filter(Some(0)), None);
-        assert_eq!(derive_search_type_filter(Some(-1)), None);
-        assert_eq!(derive_search_type_filter(None), None);
-    }
 }
 
 // ---------- 首页目录（Home Catalog） ----------
@@ -4071,6 +4017,7 @@ mod home_catalog_tests {
             vod_pic: "http://pic".to_string(),
             vod_remarks: None,
             vod_play_url: Some("http://a.m3u8#http://b.m3u8".to_string()),
+            vod_play_from: None,
             vod_class: Some("电影".to_string()),
             vod_year: Some("2020".to_string()),
             vod_content: None,

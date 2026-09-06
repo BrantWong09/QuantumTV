@@ -1126,7 +1126,7 @@ const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
                 ></div>
               </div>
             </div>
-            {config.showSourceName && source_name && (
+            {config.showSourceName && source_name && !isAggregate && (
               <span
                 className='block text-xs text-gray-500 dark:text-gray-400 mt-1.5'
                 style={
@@ -1165,6 +1165,72 @@ const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
                 </span>
               </span>
             )}
+            {/* 聚合卡: 每个标签常显其来源站点(最多2个 + 汇总) */}
+            {config.showSourceName &&
+              isAggregate &&
+              dynamicSourceNames &&
+              dynamicSourceNames.length > 0 &&
+              (() => {
+                const uniqueSources = Array.from(
+                  new Set(dynamicSourceNames),
+                ).slice(0, 2);
+                const total = dynamicSourceNames.length;
+                return (
+                  <div
+                    className='mt-1.5 flex flex-wrap items-center justify-center gap-1 overflow-hidden'
+                    style={
+                      {
+                        WebkitUserSelect: 'none',
+                        userSelect: 'none',
+                        WebkitTouchCallout: 'none',
+                      } as React.CSSProperties
+                    }
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      return false;
+                    }}
+                  >
+                    {uniqueSources.map((name) => (
+                      <span
+                        key={name}
+                        title={name}
+                        className='max-w-full truncate rounded-lg border border-gray-300/60 px-1.5 py-0.5 text-[10px] text-gray-500 transition-colors duration-300 ease-out group-hover:border-purple-400/60 group-hover:text-purple-600 dark:border-gray-600/60 dark:text-gray-400 dark:group-hover:text-purple-400'
+                        style={
+                          {
+                            WebkitUserSelect: 'none',
+                            userSelect: 'none',
+                            WebkitTouchCallout: 'none',
+                          } as React.CSSProperties
+                        }
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          return false;
+                        }}
+                      >
+                        {name}
+                      </span>
+                    ))}
+                    {total > uniqueSources.length && (
+                      <span
+                        className='rounded-lg border border-gray-300/60 px-1.5 py-0.5 text-[10px] text-gray-500 dark:border-gray-600/60 dark:text-gray-400'
+                        style={
+                          {
+                            WebkitUserSelect: 'none',
+                            userSelect: 'none',
+                            WebkitTouchCallout: 'none',
+                          } as React.CSSProperties
+                        }
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          return false;
+                        }}
+                      >
+                        +{total - uniqueSources.length}
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
           </div>
         </div>
 

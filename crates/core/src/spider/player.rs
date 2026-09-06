@@ -20,7 +20,20 @@ pub async fn resolve_spider_episode(
         "flag": flag,
         "id": id,
     });
-    let data = bridge_post_with(bridge_url, "/playerContent", &body, false, 120).await?;
+    let data = match bridge_post_with(bridge_url, "/playerContent", &body, false, 120).await {
+        Ok(d) => d,
+        Err(e) => {
+            // 桥接透传的 Java 异常(如 InvocationTargetException)几乎都是
+            // spider 内部调网盘 API 失败(未登录对应网盘/cookie 失效) → 给可操作的提示
+            if e.contains("InvocationTargetException")
+                || e.contains("JSONException")
+                || e.contains("bridge error")
+            {
+                return Err(format!("{} (原因: {})", netdisk_login_hint_for(class_name, flag), short_err(&e)));
+            }
+            return Err(e);
+        }
+    };
     let obj: Value = serde_json::from_str(&data)
         .map_err(|e| format!("playerContent 响应解析失败: {e}, body: {}", &data[..data.len().min(120)]))?;
     let url = obj["url"].as_str().unwrap_or("").trim().to_string();
@@ -47,6 +60,38 @@ pub fn netdisk_login_hint(class_name: &str) -> String {
     }
 }
 
+/// flag(线路名)比类名更准确: 它直接就是网盘名(如 "夸克网盘"/"UC网盘"/"百度原画")
+pub fn netdisk_login_hint_for(class_name: &str, flag: &str) -> String {
+    let flag_lower = flag.to_lowercase();
+    let where_to = "请到 管理 → 网盘账号 扫码/粘贴登录";
+    if flag_lower.contains("quark") || flag.contains("夸克") {
+        format!("该线路需要登录夸克网盘: {where_to}")
+    } else if flag_lower.contains("uc") || flag.contains("UC网盘") {
+        format!("该线路需要登录 UC 网盘: {where_to}")
+    } else if flag.contains("百度") {
+        format!("该线路需要登录百度网盘: {where_to}")
+    } else if flag.contains("阿里") {
+        format!("该线路需要登录阿里云盘: {where_to}")
+    } else if flag.contains("天翼") {
+        format!("该线路需要登录天翼云盘: {where_to}")
+    } else if flag.contains("115") {
+        format!("该线路需要登录 115 网盘: {where_to}")
+    } else if flag.contains("迅雷") {
+        format!("该线路需要登录迅雷云盘: {where_to}")
+    }
+    // flag 无信息时退回按类名推断
+    else {
+        netdisk_login_hint(class_name)
+    }
+}
+
+/// 把桥接透传的长异常串压成一行要点
+fn short_err(e: &str) -> String {
+    let trimmed = e.trim();
+    let end = trimmed.char_indices().nth(120).map(|(i, _)| i).unwrap_or(trimmed.len());
+    trimmed[..end].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,5 +101,16 @@ mod tests {
         assert!(netdisk_login_hint("WexquarkGuard").contains("夸克"));
         assert!(netdisk_login_hint("WexzhizhenGuard").contains("网盘"));
         assert!(netdisk_login_hint("WexAliSomethingGuard").contains("阿里"));
+    }
+
+    #[test]
+    fn login_hint_prefers_flag_over_class_name() {
+        // flag 是线路名(网盘名), 比类名更准确
+        assert!(netdisk_login_hint_for("WexmuouggGuard", "夸克网盘").contains("夸克"));
+        assert!(netdisk_login_hint_for("WexmuouggGuard", "UC网盘").contains("UC"));
+        assert!(netdisk_login_hint_for("WexWoBaiduPanGuard", "百度原画#01").contains("百度"));
+        assert!(netdisk_login_hint_for("WexWoXunLeiPanGuard", "迅雷原画").contains("迅雷"));
+        // flag 无信息时退回按类名推断
+        assert!(netdisk_login_hint_for("WexquarkGuard", "").contains("夸克"));
     }
 }

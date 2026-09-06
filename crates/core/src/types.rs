@@ -1,5 +1,20 @@
 use serde::{Deserialize, Serialize};
 
+/// 单个站点详情里的一组源头 (线路), 对应 vod_play_from 中一个 flag 及其剧集
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct PlayGroup {
+    /// 源头名 (如 百度网盘 / 夸克网盘 / UC网盘)
+    #[serde(default)]
+    pub flag: String,
+    #[serde(default)]
+    pub episodes: Vec<String>,
+    #[serde(default)]
+    pub episodes_titles: Vec<String>,
+    /// Spider 网盘集原始 id (与 episodes 对齐; 非网盘源为空)
+    #[serde(default)]
+    pub episodes_raw: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SearchResult {
     #[serde(default)]
@@ -30,4 +45,7 @@ pub struct SearchResult {
     /// Spider 网盘集原始 id (直链化前的待解析列表, 与 episodes 对齐; 已解析集为空)
     #[serde(default)]
     pub episodes_raw: Vec<String>,
+    /// 该详情内部的多组源头 (线路), 每个含独立剧集; 顶层 episodes 为当前默认组
+    #[serde(default)]
+    pub play_groups: Vec<PlayGroup>,
 }

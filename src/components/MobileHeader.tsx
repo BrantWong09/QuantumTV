@@ -5,6 +5,7 @@ import Link from 'next/link';
 
 import { BackButton } from './BackButton';
 import { useSite } from './SiteProvider';
+import SourceSwitcher from './SourceSwitcher';
 import { ThemeToggle } from './ThemeToggle';
 import { UserMenu } from './UserMenu';
 
@@ -39,6 +40,7 @@ const MobileHeader = ({ showBackButton = false }: MobileHeaderProps) => {
         </div>
 
         <div className='flex items-center gap-1'>
+          <SourceSwitcher />
           <ThemeToggle />
           <UserMenu />
         </div>

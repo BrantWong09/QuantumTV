@@ -2,6 +2,7 @@
 
 'use client';
 
+import { invoke } from '@tauri-apps/api/core';
 import { Cat, Clover, Film, Home, Search, Star, Tv } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import {
@@ -10,12 +11,64 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useState,
   useTransition,
 } from 'react';
+
+import { AUTO_SOURCE_KEY, useGlobalSource } from './SourceProvider';
 
 function cn(...classes: (string | boolean | undefined | null)[]): string {
   return classes.filter(Boolean).join(' ');
 }
+
+interface SourceCategoryItem {
+  type_id: string | number;
+  type_name: string;
+  type_pid?: string | number;
+}
+
+// 豆瓣 4 类槽位与源分类名关键词映射（与 TopNavbar 保持一致）
+const DOUBAN_SLOTS: {
+  label: string;
+  type: string;
+  keywords: string[];
+  icon: typeof Home;
+  activeGradient: string;
+  glowColor: string;
+}[] = [
+  {
+    label: '电影',
+    type: 'movie',
+    keywords: ['电影', '影片'],
+    icon: Film,
+    activeGradient: 'from-fuchsia-500 to-pink-500',
+    glowColor: 'shadow-fuchsia-500/40',
+  },
+  {
+    label: '剧集',
+    type: 'tv',
+    keywords: ['电视剧', '连续剧', '剧集', '电视', '剧场'],
+    icon: Tv,
+    activeGradient: 'from-purple-500 to-violet-500',
+    glowColor: 'shadow-purple-500/40',
+  },
+  {
+    label: '动漫',
+    type: 'anime',
+    keywords: ['动漫', '动画', '番剧', '日漫', '国漫'],
+    icon: Cat,
+    activeGradient: 'from-teal-400 to-emerald-500',
+    glowColor: 'shadow-teal-500/40',
+  },
+  {
+    label: '综艺',
+    type: 'show',
+    keywords: ['综艺', '娱乐', '真人秀'],
+    icon: Clover,
+    activeGradient: 'from-amber-400 to-orange-500',
+    glowColor: 'shadow-amber-500/40',
+  },
+];
 
 interface NavItem {
   icon: typeof Home;
@@ -78,16 +131,63 @@ const MobileBottomNav = memo(function MobileBottomNav({
   activePath = '/',
 }: MobileBottomNavProps) {
   const router = useRouter();
+  const { currentSource } = useGlobalSource();
   const [isPending, startTransition] = useTransition();
   const itemRefs = useRef<(HTMLElement | null)[]>([]);
+  const [sourceCategories, setSourceCategories] = useState<
+    SourceCategoryItem[]
+  >([]);
+
+  // 选定具体源时拉取该源分类，用于底部 4 个入口
+  useEffect(() => {
+    if (currentSource === AUTO_SOURCE_KEY) {
+      setSourceCategories([]);
+      return;
+    }
+    let cancelled = false;
+    invoke<SourceCategoryItem[]>('get_source_categories', {
+      sourceKey: currentSource,
+    })
+      .then((cats) => {
+        if (!cancelled) setSourceCategories(cats || []);
+      })
+      .catch(() => {
+        if (!cancelled) setSourceCategories([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentSource]);
 
   const navItems = useMemo(() => {
     const runtimeConfig =
       typeof window !== 'undefined' ? (window as any).RUNTIME_CONFIG : null;
 
+    const base =
+      currentSource === AUTO_SOURCE_KEY
+        ? BASE_NAV_ITEMS
+        : [
+            BASE_NAV_ITEMS[0],
+            BASE_NAV_ITEMS[1],
+            ...DOUBAN_SLOTS.map((slot) => {
+              const matched = sourceCategories.find((cat) =>
+                slot.keywords.some((kw) => cat.type_name?.includes(kw)),
+              );
+              if (!matched) return null;
+              const typeId = String(matched.type_id);
+              return {
+                icon: slot.icon,
+                label: matched.type_name || slot.label,
+                href: `/douban?source=${encodeURIComponent(currentSource)}&type=${slot.type}&type_id=${encodeURIComponent(typeId)}`,
+                activeGradient: slot.activeGradient,
+                glowColor: slot.glowColor,
+              } as NavItem;
+            }).filter((item): item is NavItem => item !== null),
+          ];
+
     if (runtimeConfig?.CUSTOM_CATEGORIES?.length > 0) {
       return [
-        ...BASE_NAV_ITEMS,
+        ...base,
         {
           icon: Star,
           label: '自定义',
@@ -98,8 +198,8 @@ const MobileBottomNav = memo(function MobileBottomNav({
       ];
     }
 
-    return BASE_NAV_ITEMS;
-  }, []);
+    return base;
+  }, [currentSource, sourceCategories]);
 
   const isActive = useCallback(
     (href: string) => {

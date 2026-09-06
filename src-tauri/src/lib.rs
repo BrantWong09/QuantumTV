@@ -148,15 +148,9 @@ pub fn run() {
             // 启动所有后台任务
             scheduler::start_background_tasks(app.handle().clone());
 
-            // 网盘账号 cookie 注入桥接 + 常驻续期调度
-            {
-                let storage = app.state::<StorageManager>();
-                if let Some(ext) = commands::netdisk::build_ext_from_storage(&storage) {
-                    quantumtv_core::bridge::set_ext_payload(Some(ext));
-                }
-            }
-            tauri::async_runtime::spawn(commands::netdisk::start_refresh_scheduler(app.handle().clone()));
-
+            // 网盘登录已迁至桥接 APK 内 (CloudLoginActivity, WebView → CookieManager),
+            // 桌面端不再把网盘 cookie 注入桥接 ext —— 那会把 cookie 串当站点配置
+            // 喂给混淆 spider, 导致其解析崩溃 (ArrayIndexOutOfBounds / JSONException)。
             // 桥接自动拉起（远程优先，失败降级模拟器；失败静默降级）
             let bridge_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -197,18 +191,15 @@ pub fn run() {
             commands::search::search_page_query,
             commands::search::search_page_open,
             commands::search::apply_search_filter,
+            commands::video::abort_active_search,
+            commands::video::resolve_spider_episode,
             commands::search::get_search_cache_stats,
             commands::bridge::get_bridge_config,
             commands::bridge::save_bridge_config,
             commands::bridge::get_bridge_status,
             commands::bridge::retry_bridge,
-            // 网盘账号
-            commands::netdisk::netdisk_scan_start,
-            commands::netdisk::netdisk_scan_poll,
-            commands::netdisk::netdisk_get_accounts,
-            commands::netdisk::netdisk_save_cookie,
-            commands::netdisk::netdisk_delete_account,
-            commands::netdisk::netdisk_refresh_now,
+            // 网盘账号 (登录在桥接 APK 内完成, 桌面仅拉起登录页)
+            commands::netdisk::netdisk_launch_login,
             commands::settings::get_settings_bootstrap,
             commands::config::is_adult_source,
             // 跳过片头片尾

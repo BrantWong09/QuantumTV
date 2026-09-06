@@ -98,7 +98,7 @@ function SearchPageClient() {
     yearOrder: 'none' as const,
   });
 
-  const [viewMode, setViewMode] = useState<'agg' | 'all'>('agg');
+  const [viewMode, setViewMode] = useState<'agg' | 'all'>('all');
 
   const [filterOptions, setFilterOptions] = useState<{
     categoriesAll: SearchFilterCategory[];
@@ -375,7 +375,10 @@ function SearchPageClient() {
       .finally(() => {
         setIsLoading(false);
       });
-  }, [qParam, useFluidSearch]);
+    // 注意: useFluidSearch 仅由本 effect 内的响应设置, 不作为依赖,
+    // 否则 bootstrap 返回时状态翻转会导致整次搜索重跑(双倍请求)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [qParam]);
 
   // 流式搜索支持（如果需要）
   useEffect(() => {
@@ -708,32 +711,35 @@ function SearchPageClient() {
                           const type = episodes === 1 ? 'movie' : 'tv';
 
                           return (
-                            <div key={`agg-${mapKey}`} className='w-full relative'>
+                            <div
+                              key={`agg-${mapKey}`}
+                              className='w-full relative'
+                            >
                               {rep.source_site_type === 3 && (
                                 <span className='absolute top-1 right-1 px-1 py-0.5 text-[9px] rounded bg-purple-500/30 text-purple-200 z-10'>
                                   Spider
                                 </span>
                               )}
-            <VideoCard
-              ref={getGroupRef(mapKey)}
-              from='search'
-              isAggregate={true}
-              title={title}
-              poster={poster}
-              year={year}
-              episodes={episodes}
-              source_names={source_names}
-              // 聚合代表源携带 source/id: 点击直达该源的详情(桥接), 而非标题兜底搜索
-              source={rep.source}
-              id={rep.id}
-              douban_id={douban_id}
-              query={
-                searchQuery.trim() !== title
-                  ? searchQuery.trim()
-                  : ''
-              }
-              type={type}
-            />
+                              <VideoCard
+                                ref={getGroupRef(mapKey)}
+                                from='search'
+                                isAggregate={true}
+                                title={title}
+                                poster={poster}
+                                year={year}
+                                episodes={episodes}
+                                source_names={source_names}
+                                // 聚合代表源携带 source/id: 点击直达该源的详情(桥接), 而非标题兜底搜索
+                                source={rep.source}
+                                id={rep.id}
+                                douban_id={douban_id}
+                                query={
+                                  searchQuery.trim() !== title
+                                    ? searchQuery.trim()
+                                    : ''
+                                }
+                                type={type}
+                              />
                             </div>
                           );
                         },

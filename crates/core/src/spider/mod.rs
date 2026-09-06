@@ -249,6 +249,9 @@ pub struct SpiderSearchItem {
     pub vod_remarks: Option<String>,
     #[serde(default)]
     pub vod_play_url: Option<String>,
+    /// 多组源头名 (如 "百度网盘$$$夸克网盘"), 与 vod_play_url 中 $$$ 分组一一对应
+    #[serde(default)]
+    pub vod_play_from: Option<String>,
     #[serde(default)]
     pub vod_year: Option<String>,
     #[serde(default)]
@@ -360,6 +363,8 @@ pub async fn spider_bridge_category(
 static BRIDGE_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 /// /init 每进程只成功调一次(设备端 doInit 与 spider 调用共享锁, 重复 /init 会触发 native 竞态)
 static BRIDGE_INITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// /init 发送互斥: 防止"claimed 持有者 + ext 变更者"并发各发一次
+static BRIDGE_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// 最近一次 /init 携带的 ext (网盘 cookie 载荷)
 static INIT_EXT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -385,12 +390,17 @@ async fn bridge_post_with(
         .build()
         .map_err(|e| format!("bridge client: {}", e))?;
 
-    if !BRIDGE_INITED.swap(true, std::sync::atomic::Ordering::SeqCst)
-        || crate::bridge::take_ext_if_dirty().is_some_and(|ext| {
-            // ext 变更(网盘 cookie 更新): 重新 init 携带新 ext, 设备端会重建 spider
-            INIT_EXT.lock().ok().map(|mut g| { *g = Some(ext.clone()); true }).unwrap_or(false)
-        })
-    {
+    // 先无条件消费脏 ext(首启注入/网盘 cookie 变更都会置脏), 存到 INIT_EXT
+    let ext_changed = crate::bridge::take_ext_if_dirty().is_some_and(|ext| {
+        INIT_EXT.lock().ok().map(|mut g| { *g = Some(ext.clone()); true }).unwrap_or(false)
+    });
+    // 单飞: 只有把 false→true 的那一个调用者负责发 /init; 其余并发调用直接跳过
+    let claimed = BRIDGE_INITED
+        .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+        .is_ok();
+    if claimed || ext_changed {
+        // 加锁串行化 /init, 防止 "claimed 持有者" 与 "ext 变更者" 并发各发一次(native 竞态)
+        let _guard = BRIDGE_INIT_LOCK.lock().await;
         let ext_body = INIT_EXT.lock().ok().and_then(|g| g.clone())
             .map(|ext| serde_json::json!({"ext": ext}))
             .unwrap_or_else(|| serde_json::json!({}));
@@ -414,7 +424,11 @@ async fn bridge_post_with(
         .json(body)
         .send()
         .await
-        .map_err(|e| format!("bridge {}: {}", path, e))?;
+        .map_err(|e| {
+            // 桥接进程/模拟器重启后连接会失败; 复位 init 标记, 下次成功调用自动补发 /init(携 ext)
+            BRIDGE_INITED.store(false, std::sync::atomic::Ordering::SeqCst);
+            format!("bridge {}: {}", path, e)
+        })?;
 
     let text = resp.text().await.map_err(|e| format!("bridge body: {}", e))?;
     // 响应格式: {"code":200,"data":"<spider json string>"} 或 {"code":4xx,"err":"..."}

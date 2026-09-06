@@ -47,6 +47,36 @@ public class BridgeService extends Service {
     /** 上次成功 init 携带的 ext (用于检测网盘 cookie 变更并重建 spider) */
     private String lastInitExt;
 
+    /**
+     * 网盘账号在 WebView 登录后调用: 清空已缓存 spider 实例,
+     * 下次 spider 调用会按最新的系统 CookieManager 重新 init。
+     */
+    public static void invalidateSpiders() {
+        // 通过一个 static 引用访问服务单例的缓存 (服务是应用内唯一实例)
+        BridgeService instance = getRunningInstance();
+        if (instance == null) {
+            return;
+        }
+        synchronized (instance.spiderCache) {
+            instance.spiderCache.clear();
+        }
+        instance.initialized = false;
+        instance.lastInitExt = null;
+        Log.i(TAG, "spider 缓存已清空, 等待按新 CookieManager 重建");
+    }
+
+    private static BridgeService runningInstance;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        runningInstance = this;
+    }
+
+    private static BridgeService getRunningInstance() {
+        return runningInstance;
+    }
+
     @Override
     public IBinder onBind(Intent intent) { return null; }
 
@@ -491,6 +521,7 @@ public class BridgeService extends Service {
 
     @Override
     public void onDestroy() {
+        if (runningInstance == this) runningInstance = null;
         try { if (server != null) server.close(); } catch (Exception e) {}
         super.onDestroy();
     }
