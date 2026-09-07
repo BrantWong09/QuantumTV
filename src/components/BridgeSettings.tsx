@@ -134,8 +134,8 @@ export default function BridgeSettings({
           <code className='rounded bg-gray-100 px-1 dark:bg-gray-800'>
             android/spider-bridge/out/bridge.apk
           </code>{' '}
-          拖入模拟器窗口安装并保持运行，桥接自动建立（无需 adb）。
-          模拟器重启后服务自启，隧道自动重连。
+          拖入模拟器窗口安装，然后<b className='text-gray-700 dark:text-gray-300'>点开一次模拟器里的 Bridge 应用</b>
+          （或重启模拟器）即可建立隧道（无需 adb）。服务常驻：断线 5 秒内自动重连。
         </p>
       </div>
 
