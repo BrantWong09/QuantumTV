@@ -435,11 +435,15 @@ async fn bridge_post_with(
     let env: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| format!("bridge response not JSON: {} body={}", e, &text[..text.len().min(200)]))?;
     if env["code"] != serde_json::json!(200) {
-        return Err(format!(
-            "bridge error: {} ({})",
-            env["err"].as_str().unwrap_or("unknown"),
-            text
-        ));
+        let raw = env["err"].as_str().unwrap_or("unknown");
+        // spider 内部异常统一是 InvocationTargetException (站点挂了/域名池失效/配置拉取失败等),
+        // 对用户只暴露可读文案; 桥接已有实例重建重试, 仍失败说明站点当前确实不可用
+        let msg = if raw.contains("InvocationTargetException") {
+            "站点执行失败(可能已失效或暂时不可用), 请稍后重试或更换播放源"
+        } else {
+            raw
+        };
+        return Err(format!("bridge error: {}", msg));
     }
     let data = env["data"]
         .as_str()

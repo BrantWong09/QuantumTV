@@ -195,12 +195,23 @@ async fn start_cas(drive: &str, client_id: &str) -> Result<QrSession, String> {
     let token = parse_cas_token(&json).ok_or_else(|| format!("取码失败: {json}"))?;
     Ok(QrSession {
         drive: drive.to_string(),
-        qr: QrKind::Text(format!(
-            "https://su.quark.cn/4_eMHBJ?token={token}&client_id={client_id}&ssb=weblogin"
-        )),
+        // 夸克/UC 二维码内容域名不同: su.quark.cn 会被夸克 App 拦截, UC 必须用 su.uc.cn
+        // (参考 xiaoya uc_cookie.py / Greatwallcorner UCApi.java, 5 个实现交叉确认)
+        qr: QrKind::Text(cas_qr_content(drive, &token, client_id)),
         token,
         cas_cookies,
     })
+}
+
+/// cas token → 扫码二维码内容
+pub(crate) fn cas_qr_content(drive: &str, token: &str, client_id: &str) -> String {
+    if drive == "quark" {
+        format!("https://su.quark.cn/4_eMHBJ?token={token}&client_id={client_id}&ssb=weblogin")
+    } else {
+        format!(
+            "https://su.uc.cn/1_n0ZCv?uc_param_str=dsdnfrpfbivesscpgimibtbmnijblauputogpintnwktprchmt&token={token}&client_id={client_id}&uc_biz_str=S%3Acustom%7CC%3Atitlebar_fix"
+        )
+    }
 }
 
 async fn poll_cas(session: &QrSession) -> Result<PollOutcome, String> {
@@ -287,6 +298,18 @@ async fn exchange_cas_cookie(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn cas_qr_content_uses_uc_domain_for_uc() {
+        // 回归: UC 二维码内容必须是 su.uc.cn (su.quark.cn 会被夸克 App 拦截跳下载页)
+        let quark = cas_qr_content("quark", "tk", "532");
+        assert!(quark.starts_with("https://su.quark.cn/4_eMHBJ?"), "{quark}");
+        assert!(quark.contains("client_id=532"));
+        let uc = cas_qr_content("uc", "tk", "381");
+        assert!(uc.starts_with("https://su.uc.cn/1_n0ZCv?"), "{uc}");
+        assert!(uc.contains("client_id=381"));
+        assert!(uc.contains("token=tk"));
+    }
 
     #[test]
     fn cas_token_accepts_both_status_shapes() {

@@ -12,8 +12,14 @@ type PollDto =
   | { status: 'confirmed'; data: { cookie: string } }
   | { status: 'expired' };
 
+const SCAN_HINT: Record<string, string> = {
+  quark: '请用手机「夸克App」内扫码并在App中确认',
+  uc: '请用手机「UC浏览器/UC网盘App」内扫码并确认',
+  baidu: '请用手机「百度App」扫码并确认',
+};
+
 const STATUS_TEXT: Record<string, string> = {
-  waiting: '等待扫码…（请用对应网盘 App 扫码）',
+  waiting: '等待扫码…',
   scanned: '已扫码, 请在手机上确认',
   confirmed: '登录成功',
   expired: '二维码已过期',
@@ -140,7 +146,13 @@ export default function CloudQrModal({
         </div>
         <div className='mt-3 flex items-center justify-between'>
           <span className='text-xs text-gray-500 dark:text-gray-400'>
-            {STATUS_TEXT[status]}
+            {status === 'loading'
+              ? '正在获取二维码…'
+              : status === 'expired'
+                ? STATUS_TEXT.expired
+                : status === 'waiting'
+                  ? SCAN_HINT[drive] ?? ''
+                  : STATUS_TEXT[status]}
           </span>
           {expired && (
             <button

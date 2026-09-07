@@ -369,10 +369,26 @@ public class BridgeService extends Service {
             String className = parseField(body, "class");
             String ids = parseField(body, "ids");
             if (className == null || ids == null) return json(400, "missing class/ids", null);
-            return invokeSpider(className, "detailContent", new Class[]{List.class}, new Object[]{java.util.Arrays.asList(ids.split(","))}, true);
+            return invokeSpiderWithRetry(className, "detailContent", new Class[]{List.class}, new Object[]{java.util.Arrays.asList(ids.split(","))}, true);
         } catch (Throwable t) {
             return json(500, t.toString(), null);
         }
+    }
+
+    /**
+     * spider 500 时重建实例重试一次。
+     * 场景: wex 系 spider 的运行时站点配置 (CDN 多 IP, 模拟器 DNS 轮询可能拿到死 IP)
+     * 拉取失败后进程内缓存 null, 后续 detail/category 持续 NPE; 重建实例触发重新拉取。
+     * 实测: 重启桥接进程即恢复 → 等价的实例级重建 + 单次重试。
+     */
+    private String invokeSpiderWithRetry(String className, String method, Class<?>[] paramTypes, Object[] args, boolean priority) {
+        String r = invokeSpider(className, method, paramTypes, args, priority);
+        if (r != null && r.contains("\"code\":500")) {
+            Log.w(TAG, method + " 500, 重建 spider 实例后重试一次");
+            invalidateSpiders();
+            r = invokeSpider(className, method, paramTypes, args, priority);
+        }
+        return r;
     }
 
     private String doPlayerContent(String body) {
@@ -392,7 +408,7 @@ public class BridgeService extends Service {
                 Log.w(TAG, "3-arg playerContent failed: " + t3);
             }
             if (r3 != null && !r3.contains("NoSuchMethodException")) return r3;
-            return invokeSpider(className, "playerContent",
+            return invokeSpiderWithRetry(className, "playerContent",
                 new Class[]{String.class, String.class},
                 new Object[]{flag, id}, true);
         } catch (Throwable t) {
@@ -418,9 +434,9 @@ public class BridgeService extends Service {
             if (className == null) return json(400, "missing class", null);
             if (tid == null) tid = "1";
             if (pg == null) pg = "1";
-            return invokeSpider(className, "categoryContent",
+            return invokeSpiderWithRetry(className, "categoryContent",
                 new Class[]{String.class, String.class, boolean.class, java.util.HashMap.class},
-                new Object[]{tid, pg, true, new java.util.HashMap<String, String>()});
+                new Object[]{tid, pg, true, new java.util.HashMap<String, String>()}, true);
         } catch (Throwable t) {
             return json(500, t.toString(), null);
         }
