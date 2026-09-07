@@ -155,7 +155,11 @@ fn normalize_source_config_array(items: &[Value], default_from: &str, global_spi
 fn extract_tvbox_fields(item: &Value, global_spider: &str) -> serde_json::Map<String, Value> {
     let mut fields = serde_json::Map::new();
     
-    let site_type = item.get("type").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+    let site_type = item
+        .get("type")
+        .or_else(|| item.get("site_type"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1) as i32;
     fields.insert("site_type".to_string(), serde_json::json!(site_type));
     
     let searchable = item.get("searchable").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
@@ -628,6 +632,49 @@ mod tests {
         let obj = result.as_object().unwrap();
         assert_eq!(obj.get("is_adult").unwrap(), true);
         assert_eq!(obj.get("from").unwrap(), "custom");
+    }
+
+    #[test]
+    fn normalize_db_style_source_preserves_site_type() {
+        // 与 DB 中已规范化存储的源结构一致: 含 site_type, 不含 TVBox 的 type 字段
+        let input = json!({
+            "key": "spider1",
+            "name": "Spider",
+            "api": "csp_SpiderGuard",
+            "detail": "",
+            "from": "config",
+            "disabled": false,
+            "is_adult": false,
+            "site_type": 3,
+            "spider": "http://jar.jar;md5;abc",
+            "searchable": 0
+        });
+        let result = normalize_source_config(&input, "config").unwrap();
+        let obj = result.as_object().unwrap();
+        assert_eq!(obj.get("site_type").unwrap(), 3);
+        assert_eq!(obj.get("searchable").unwrap(), 0);
+        assert_eq!(obj.get("spider").unwrap(), "http://jar.jar;md5;abc");
+    }
+
+    #[test]
+    fn double_normalization_keeps_site_type() {
+        // 模拟 parse 输出再经 persist 二次规范化, site_type 不得被重置为 1
+        let raw = json!({
+            "sites": [
+                { "key": "a", "name": "S", "type": 3, "api": "csp_AGuard", "searchable": 0 },
+                { "key": "b", "name": "C", "api": "http://c.example.com/api", "searchable": 1 }
+            ],
+            "spider": "http://jar.jar;md5;abc"
+        })
+        .to_string();
+        let parsed = parse_admin_config(&raw).unwrap();
+        let sources = parsed.get("SourceConfig").unwrap().as_array().unwrap().clone();
+        for source in &sources {
+            let again = normalize_source_config(source, "config").unwrap();
+            assert_eq!(again.get("site_type"), source.get("site_type"));
+            assert_eq!(again.get("searchable"), source.get("searchable"));
+        }
+        assert_eq!(sources[0].get("site_type").unwrap(), 3);
     }
 
     #[test]
