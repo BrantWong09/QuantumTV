@@ -16,10 +16,6 @@ import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 
-import java.io.File;
-import java.io.FileOutputStream;
-import java.nio.charset.StandardCharsets;
-
 /**
  * 网盘账号登录页 (WebView):
  * 直接在桥接 APK 内用系统 WebView 打开网盘登录页, 用户在模拟器窗口完成登录。
@@ -195,21 +191,7 @@ public class CloudLoginActivity extends Activity {
 
     /** 把登录 cookie 落盘到 files/TV/ 下 (部分 spider 读文件兜底) */
     private void persistCookieFile(String drive, String cookies) {
-        try {
-            File dir = new File(getFilesDir(), "TV");
-            if (!dir.exists()) dir.mkdirs();
-            File f = new File(dir, "." + drive + "cookie");
-            FileOutputStream fos = new FileOutputStream(f, false);
-            if (cookies != null) {
-                fos.write(cookies.getBytes(StandardCharsets.UTF_8));
-            }
-            fos.flush();
-            fos.close();
-            f.setReadable(true, false);
-            Log.i(TAG, "cookie 已写入: " + f.getAbsolutePath());
-        } catch (Exception e) {
-            Log.e(TAG, "persist cookie file failed", e);
-        }
+        BridgeService.writeCookieFile(this, drive, cookies);
     }
 
     @Override

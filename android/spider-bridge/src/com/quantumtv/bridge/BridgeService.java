@@ -195,6 +195,8 @@ public class BridgeService extends Service {
                 resp = doHome(bodyStr);
             } else if ("/category".equals(path) && "POST".equalsIgnoreCase(method)) {
                 resp = doCategory(bodyStr);
+            } else if ("/setCookie".equals(path) && "POST".equalsIgnoreCase(method)) {
+                resp = doSetCookie(bodyStr);
             } else {
                 resp = json(404, "not_found", null);
             }
@@ -506,6 +508,61 @@ public class BridgeService extends Service {
             }
         }
         return null;
+    }
+
+    /** 桌面端扫码登录: cookie 写入 CookieManager + 落盘, 并重建 spider 实例 */
+    private String doSetCookie(String body) {
+        try {
+            String drive = parseField(body, "drive");
+            String cookie = parseField(body, "cookie");
+            if (drive == null || cookie == null || cookie.isEmpty()) {
+                return json(400, "missing drive/cookie", null);
+            }
+            String[] hosts = cookieHosts(drive);
+            if (hosts == null) {
+                return json(400, "unsupported drive: " + drive, null);
+            }
+            android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+            cm.setAcceptCookie(true);
+            for (String h : hosts) {
+                cm.setCookie("https://" + h + "/", cookie);
+            }
+            cm.flush();
+            writeCookieFile(this, drive, cookie);
+            invalidateSpiders();
+            Log.i(TAG, "setCookie: drive=" + drive + " len=" + cookie.length());
+            return json(200, "ok", null);
+        } catch (Exception e) {
+            Log.e(TAG, "setCookie", e);
+            return json(500, "set_cookie_failed", null);
+        }
+    }
+
+    /** 各网盘登录态所在域 (与 spider 读取通道一致) */
+    private static String[] cookieHosts(String drive) {
+        switch (drive) {
+            case "quark": return new String[]{"pan.quark.cn", "quark.cn", "uop.quark.cn", "drive-pc.quark.cn"};
+            case "uc":    return new String[]{"drive.uc.cn", "uc.cn", "pc.uc.cn"};
+            case "baidu": return new String[]{"pan.baidu.com", "passport.baidu.com", "wappass.baidu.com"};
+            default: return null;
+        }
+    }
+
+    /** 登录 cookie 落盘到 files/TV/.<drive>cookie (部分 spider 读文件兜底) */
+    static void writeCookieFile(android.content.Context ctx, String drive, String cookies) {
+        try {
+            java.io.File dir = new java.io.File(ctx.getFilesDir(), "TV");
+            if (!dir.exists()) dir.mkdirs();
+            java.io.File f = new java.io.File(dir, "." + drive + "cookie");
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(f, false);
+            if (cookies != null) fos.write(cookies.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            fos.flush();
+            fos.close();
+            f.setReadable(true, false);
+            Log.i("CloudLogin", "cookie 已写入: " + f.getAbsolutePath());
+        } catch (Exception e) {
+            Log.e("CloudLogin", "persist cookie file failed", e);
+        }
     }
 
     private String parseField(String body, String key) {
