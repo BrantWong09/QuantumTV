@@ -30,6 +30,7 @@ pub(crate) fn encode_frame(id: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 /// 从缓冲前缀解一帧; 不完整返回 None; 成功时从 buf 消耗掉对应字节
+#[allow(dead_code)]
 pub(crate) fn parse_frame(buf: &mut Vec<u8>) -> Option<(Frame, usize)> {
     if buf.len() < 8 {
         return None;
@@ -58,16 +59,18 @@ use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 pub const DEFAULT_TUNNEL_PORT: u16 = 18099;
 
 struct TunnelConn {
+    #[allow(dead_code)]
     device: String,
     writer: mpsc::Sender<(u32, Vec<u8>)>,
 }
 
 /// 测试入口: 用现成 listener 启动隧道/虚拟桥接 (与 ensure_started 共用 accept 循环)
+#[cfg(test)]
 async fn serve(tunnel: TcpListener, bridge: TcpListener, bridge_url: String) {
     STARTED.store(true, Ordering::SeqCst);
     let h1 = tokio::spawn(async move { tunnel_accept_loop(tunnel, bridge_url).await; });
@@ -136,7 +139,7 @@ pub async fn shutdown_all() {
     log::info!("[桥接] 隧道服务已关闭");
 }
 
-async fn tunnel_accept_loop(mut listener: TcpListener, bridge_url: String) {
+async fn tunnel_accept_loop(listener: TcpListener, bridge_url: String) {
     loop {
         let (stream, _) = tokio::select! {
             _ = NOTIFY.notified() => return,
@@ -196,7 +199,7 @@ async fn reader_task(mut rd: tokio::net::tcp::OwnedReadHalf) {
     log::warn!("[桥接] 隧道断开, 等待 APK 重拨");
 }
 
-async fn bridge_accept_loop(mut listener: TcpListener) {
+async fn bridge_accept_loop(listener: TcpListener) {
     loop {
         let (stream, _) = tokio::select! {
             _ = NOTIFY.notified() => return,
