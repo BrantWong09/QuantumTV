@@ -6,8 +6,6 @@
 //! 参考: gaozhangmin/boxplayer, nuu987/tvbox-auxiliary, xiaoya-alist, DecryptLogin。
 
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 /// 本期支持扫码的网盘
 pub const SUPPORTED: &[&str] = &["quark", "uc", "baidu"];
 
@@ -73,13 +71,6 @@ pub enum PollOutcome {
     Scanned,
     Confirmed { cookie: String },
     Expired,
-}
-
-fn millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
 }
 
 /// cas 取码响应 → token; 兼容 status=200 (nuu987) 与 2000000 (xiaoya) 两种口径

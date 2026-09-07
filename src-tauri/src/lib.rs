@@ -198,8 +198,10 @@ pub fn run() {
             commands::bridge::save_bridge_config,
             commands::bridge::get_bridge_status,
             commands::bridge::retry_bridge,
-            // 网盘账号 (登录在桥接 APK 内完成, 桌面仅拉起登录页)
+            // 网盘账号 (夸克/UC/百度桌面扫码; 其余登录在桥接 APK 内完成)
             commands::netdisk::netdisk_launch_login,
+            commands::netdisk::cloud_login_start,
+            commands::netdisk::cloud_login_poll,
             commands::settings::get_settings_bootstrap,
             commands::config::is_adult_source,
             // 跳过片头片尾
