@@ -73,7 +73,8 @@ struct TunnelConn {
 #[cfg(test)]
 async fn serve(tunnel: TcpListener, bridge: TcpListener, bridge_url: String) {
     STARTED.store(true, Ordering::SeqCst);
-    let h1 = tokio::spawn(async move { tunnel_accept_loop(tunnel, bridge_url).await; });
+    *BRIDGE_URL.lock().unwrap() = bridge_url;
+    let h1 = tokio::spawn(async move { tunnel_accept_loop(tunnel).await; });
     let h2 = tokio::spawn(async move { bridge_accept_loop(bridge).await; });
     HANDLES.lock().unwrap().extend([h1, h2]);
 }
@@ -86,25 +87,45 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 static NOTIFY: LazyLock<Notify> = LazyLock::new(|| Notify::new());
 static HANDLES: LazyLock<StdMutex<Vec<tokio::task::JoinHandle<()>>>> =
     LazyLock::new(|| StdMutex::new(Vec::new()));
+static BRIDGE_URL: StdMutex<String> = StdMutex::new(String::new());
 
-/// 幂等启动两个常驻监听; 由 ensure_ready_with 在瀑布前调用
-pub async fn ensure_started(tunnel_port: u16, bridge_port: u16, bridge_url: String) -> Result<(), String> {
+/// 幂等启动两个常驻监听; 由 ensure_ready_with 在瀑布前调用。
+/// 端口被占/被系统保留时自动向后探测最多 10 个; 返回实际生效的桥接端口。
+pub async fn ensure_started(tunnel_port: u16, bridge_port: u16) -> Result<u16, String> {
     if STARTED.load(Ordering::SeqCst) {
-        return Ok(());
+        return Ok(bridge_port);
     }
-    let tl = TcpListener::bind(("127.0.0.1", tunnel_port))
+    let tl = bind_fallback(tunnel_port, "隧道")
         .await
-        .map_err(|e| format!("隧道监听 {tunnel_port} 失败: {e}"))?;
-    let bl = TcpListener::bind(("127.0.0.1", bridge_port))
+        .ok_or_else(|| format!("隧道监听 {tunnel_port} 起连续 10 个端口均失败"))?;
+    let bl = bind_fallback(bridge_port, "虚拟桥接")
         .await
-        .map_err(|e| format!("虚拟桥接监听 {bridge_port} 失败: {e}"))?;
+        .ok_or_else(|| format!("虚拟桥接监听 {bridge_port} 起连续 10 个端口均失败"))?;
+    let actual = bl.local_addr().map_err(|e| e.to_string())?.port();
+    *BRIDGE_URL.lock().unwrap() = format!("http://127.0.0.1:{actual}");
+    let tport = tl.local_addr().map_err(|e| e.to_string())?.port();
     STARTED.store(true, Ordering::SeqCst);
-    let url = bridge_url.clone();
-    let h1 = tokio::spawn(async move { tunnel_accept_loop(tl, url).await; });
+    let h1 = tokio::spawn(async move { tunnel_accept_loop(tl).await; });
     let h2 = tokio::spawn(async move { bridge_accept_loop(bl).await; });
     HANDLES.lock().unwrap().extend([h1, h2]);
-    log::info!("[桥接] 隧道服务就绪 (tunnel:{tunnel_port}, virtual:{bridge_port})");
-    Ok(())
+    log::info!("[桥接] 隧道服务就绪 (tunnel:{tport}, virtual:{actual})");
+    Ok(actual)
+}
+
+/// 从 port 起逐个尝试绑定, 最多 10 个 (Hyper-V 保留段/占用端口兜底)
+async fn bind_fallback(port: u16, label: &str) -> Option<TcpListener> {
+    for p in port..port.saturating_add(10) {
+        match TcpListener::bind(("127.0.0.1", p)).await {
+            Ok(l) => {
+                if p != port {
+                    log::warn!("[桥接] {label} 端口 {port} 不可用, 回退 {p}");
+                }
+                return Some(l);
+            }
+            Err(e) => log::warn!("[桥接] {label} 端口 {p} 绑定失败: {e}"),
+        }
+    }
+    None
 }
 
 /// Phase 0: 等待隧道注册
@@ -139,7 +160,7 @@ pub async fn shutdown_all() {
     log::info!("[桥接] 隧道服务已关闭");
 }
 
-async fn tunnel_accept_loop(listener: TcpListener, bridge_url: String) {
+async fn tunnel_accept_loop(listener: TcpListener) {
     loop {
         let (stream, _) = tokio::select! {
             _ = NOTIFY.notified() => return,
@@ -160,7 +181,8 @@ async fn tunnel_accept_loop(listener: TcpListener, bridge_url: String) {
                     *ACTIVE.lock().unwrap() = Some(TunnelConn { device: device.clone(), writer: tx });
                     tokio::spawn(writer_task(wr, rx));
                     tokio::spawn(reader_task(rd));
-                    super::set_effective(&bridge_url, super::EFFECTIVE_TUNNEL);
+                    let url = BRIDGE_URL.lock().unwrap().clone();
+                    super::set_effective(&url, super::EFFECTIVE_TUNNEL);
                     // Starting→Ready 由 ensure_ready_with 收尾; Failed/Idle 时隧道拨入即自愈
                     if super::status() != super::BridgeStatus::Starting {
                         super::set_status(super::BridgeStatus::Ready);

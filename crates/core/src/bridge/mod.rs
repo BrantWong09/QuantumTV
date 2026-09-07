@@ -255,12 +255,25 @@ pub async fn ensure_ready_with(cfg: BridgeConfig) -> Result<(), String> {
     if !try_begin_start() {
         return Ok(()); // 已在 Starting/Ready，直接复用
     }
-    tunnel::ensure_started(cfg.tunnel_port, cfg.host_port, cfg.bridge_url.clone()).await?;
-    let result = startup_steps(&cfg).await;
+    // 端口被占/被系统保留时 ensure_started 自动回退, bridge_url 与实际监听端口对齐
+    let actual = match tunnel::ensure_started(cfg.tunnel_port, cfg.host_port).await {
+        Ok(p) => p,
+        Err(e) => {
+            set_status(BridgeStatus::Failed);
+            log::warn!("[桥接] 静默降级: {}", e);
+            return Err(e);
+        }
+    };
+    let mut eff_cfg = cfg.clone();
+    if actual != cfg.host_port {
+        eff_cfg.host_port = actual;
+        eff_cfg.bridge_url = format!("http://127.0.0.1:{actual}");
+    }
+    let result = startup_steps(&eff_cfg).await;
     match result {
         Ok(()) => {
             set_status(BridgeStatus::Ready);
-            log::info!("[桥接] 就绪: {}", cfg.bridge_url);
+            log::info!("[桥接] 就绪: {}", effective_url().unwrap_or_default());
             Ok(())
         }
         Err(e) => {
