@@ -5,14 +5,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 interface BridgeSettingsDto {
   remote_url: string;
-  adb_addresses: string;
-  auto_scan: boolean;
 }
 
 interface BridgeStatusDto {
   status: 'idle' | 'starting' | 'ready' | 'failed';
   effective_url: string | null;
-  mode: 'none' | 'remote' | 'emulator' | 'avd';
+  mode: 'none' | 'remote' | 'tunnel';
 }
 
 const STATUS_LABEL: Record<BridgeStatusDto['status'], string> = {
@@ -30,10 +28,9 @@ const STATUS_COLOR: Record<BridgeStatusDto['status'], string> = {
 };
 
 const MODE_LABEL: Record<BridgeStatusDto['mode'], string> = {
-  none: '—',
-  remote: '远程真机',
-  emulator: '第三方模拟器',
-  avd: '官方模拟器',
+  none: '无',
+  remote: '远程直连',
+  tunnel: '模拟器隧道',
 };
 
 export default function BridgeSettings({
@@ -47,8 +44,6 @@ export default function BridgeSettings({
 }) {
   const [settings, setSettings] = useState<BridgeSettingsDto>({
     remote_url: '',
-    adb_addresses: '',
-    auto_scan: true,
   });
   const [status, setStatus] = useState<BridgeStatusDto | null>(null);
   const [saving, setSaving] = useState(false);
@@ -131,6 +126,19 @@ export default function BridgeSettings({
 
   return (
     <div className='space-y-4'>
+      {/* 模拟器隧道 */}
+      <div className='rounded-lg border border-gray-200 p-3 text-sm dark:border-gray-700'>
+        <div className='font-medium text-gray-900 dark:text-gray-100'>模拟器隧道（推荐）</div>
+        <p className='mt-1 text-xs text-gray-500 dark:text-gray-400'>
+          将项目内{' '}
+          <code className='rounded bg-gray-100 px-1 dark:bg-gray-800'>
+            android/spider-bridge/out/bridge.apk
+          </code>{' '}
+          拖入模拟器窗口安装并保持运行，桥接自动建立（无需 adb）。
+          模拟器重启后服务自启，隧道自动重连。
+        </p>
+      </div>
+
       {/* 远程桥接地址 */}
       <div>
         <label className='mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300'>
@@ -147,41 +155,9 @@ export default function BridgeSettings({
         />
         <p className='mt-1 text-xs text-gray-500 dark:text-gray-400'>
           在同一局域网设备（电视盒子/旧手机）安装 QuantumTV Bridge APK
-          后填入其地址；优先于本地模拟器。未鉴权，仅限可信局域网使用。
+          后填入其地址；未鉴权，仅限可信局域网使用。
         </p>
       </div>
-
-      {/* adb 地址列表 */}
-      <div>
-        <label className='mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300'>
-          adb 连接地址（逗号或换行分隔）
-        </label>
-        <textarea
-          value={settings.adb_addresses}
-          onChange={(e) =>
-            setSettings({ ...settings, adb_addresses: e.target.value })
-          }
-          rows={2}
-          placeholder='127.0.0.1:5555, 127.0.0.1:16384'
-          className='w-full rounded-lg border border-gray-300 px-3 py-2 text-sm dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100'
-        />
-        <p className='mt-1 text-xs text-gray-500 dark:text-gray-400'>
-          LDPlayer 默认 127.0.0.1:5555，MuMu 默认
-          127.0.0.1:16384。留空且开启自动扫描时自动探测常见端口。
-        </p>
-      </div>
-
-      {/* 自动扫描 */}
-      <label className='flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300'>
-        <input
-          type='checkbox'
-          checked={settings.auto_scan}
-          onChange={(e) =>
-            setSettings({ ...settings, auto_scan: e.target.checked })
-          }
-        />
-        自动扫描常见模拟器端口
-      </label>
 
       {/* 状态卡片 */}
       <div className='rounded-lg border border-gray-200 p-3 text-sm dark:border-gray-700'>

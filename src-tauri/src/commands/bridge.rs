@@ -4,19 +4,16 @@ use tauri::{Manager, State};
 use crate::storage::StorageManager;
 
 /// 桥接设置（持久化在 data.json 的 config.BridgeConfig）
-/// serde(default) 兼容旧数据缺字段；auto_scan 缺省 true 经字段级 default 处理
+/// serde(default) 兼容旧数据缺字段; 旧 adb_addresses/auto_scan 字段被静默忽略
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct BridgeSettingsDto {
     pub remote_url: String,
-    /// 逗号/换行分隔的 adb connect 地址
-    pub adb_addresses: String,
-    pub auto_scan: bool,
 }
 
 impl Default for BridgeSettingsDto {
     fn default() -> Self {
-        Self { remote_url: String::new(), adb_addresses: String::new(), auto_scan: true }
+        Self { remote_url: String::new() }
     }
 }
 
@@ -50,28 +47,18 @@ fn validate_settings(s: &BridgeSettingsDto) -> Result<(), String> {
             return Err("远程桥接地址仅支持 http/https".to_string());
         }
     }
-    for addr in s.adb_addresses.split([',', '\n']).map(str::trim).filter(|a| !a.is_empty()) {
-        let Some((_host, port)) = addr.rsplit_once(':') else {
-            return Err(format!("adb 地址格式无效（应为 host:port）: {}", addr));
-        };
-        port.parse::<u16>().map_err(|_| format!("adb 端口无效: {}", addr))?;
-    }
     Ok(())
 }
 
-/// UI 优先、env 兜底合并为 core 的配置 map（UI 三个键始终写入，空值表示显式清除）
+/// UI 优先、env 兜底合并为 core 的配置 map（UI 键始终写入，空值表示显式清除）
 fn build_bridge_map(s: &BridgeSettingsDto) -> std::collections::HashMap<String, String> {
     let mut m = std::collections::HashMap::new();
     for k in [
         "QUANTUMTV_BRIDGE_ENABLED",
-        "QUANTUMTV_BRIDGE_AVD",
-        "QUANTUMTV_BRIDGE_SDK",
         "QUANTUMTV_ADB_HOST_PORT",
+        "QUANTUMTV_TUNNEL_PORT",
         "QUANTUMTV_BRIDGE_URL",
-        "QUANTUMTV_BRIDGE_APK",
         "QUANTUMTV_BRIDGE_REMOTE_URL",
-        "QUANTUMTV_BRIDGE_ADB_ADDRESSES",
-        "QUANTUMTV_BRIDGE_AUTO_SCAN",
     ] {
         if let Ok(v) = std::env::var(k) {
             if !v.is_empty() {
@@ -79,29 +66,17 @@ fn build_bridge_map(s: &BridgeSettingsDto) -> std::collections::HashMap<String, 
             }
         }
     }
-    let addrs = s
-        .adb_addresses
-        .split([',', '\n'])
-        .map(str::trim)
-        .filter(|a| !a.is_empty())
-        .collect::<Vec<_>>()
-        .join(",");
     m.insert("QUANTUMTV_BRIDGE_REMOTE_URL".to_string(), s.remote_url.trim().to_string());
-    m.insert("QUANTUMTV_BRIDGE_ADB_ADDRESSES".to_string(), addrs);
-    m.insert("QUANTUMTV_BRIDGE_AUTO_SCAN".to_string(), if s.auto_scan { "1" } else { "0" }.to_string());
     m
 }
 
-/// Starting 防重入检查 + 关闭自拉起旧模拟器 + 后台重跑瀑布
+/// Starting 防重入检查 + 后台重跑瀑布 (隧道是常驻设施, 重试不断隧道)
 fn spawn_retry(settings: BridgeSettingsDto) -> Result<(), String> {
     if quantumtv_core::bridge::status() == quantumtv_core::bridge::BridgeStatus::Starting {
         return Err("桥接正在启动中，请稍后再试".to_string());
     }
     let cfg = quantumtv_core::bridge::BridgeConfig::from_map(&build_bridge_map(&settings));
     tauri::async_runtime::spawn(async move {
-        if quantumtv_core::bridge::we_started() {
-            quantumtv_core::bridge::shutdown().await;
-        }
         quantumtv_core::bridge::reset_effective();
         if let Err(e) = quantumtv_core::bridge::ensure_ready_with(cfg).await {
             log::warn!("[桥接] 桥接重试失败: {}", e);
@@ -150,9 +125,8 @@ pub async fn get_bridge_status() -> BridgeStatusDto {
         quantumtv_core::bridge::BridgeStatus::Failed => "failed",
     };
     let mode = match quantumtv_core::bridge::effective_kind() {
+        quantumtv_core::bridge::EFFECTIVE_TUNNEL => "tunnel",
         quantumtv_core::bridge::EFFECTIVE_REMOTE => "remote",
-        quantumtv_core::bridge::EFFECTIVE_EMULATOR => "emulator",
-        quantumtv_core::bridge::EFFECTIVE_AVD => "avd",
         _ => "none",
     };
     BridgeStatusDto {
