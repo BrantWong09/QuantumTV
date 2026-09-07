@@ -3,6 +3,7 @@ pub mod adult;
 pub mod bridge;
 pub mod netdisk;
 pub mod playback;
+pub mod qrcodelogin;
 pub mod search_aggregation;
 pub mod source_selection;
 pub mod spider;
