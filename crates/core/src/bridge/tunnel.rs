@@ -58,7 +58,7 @@ mod tests {
     fn frame_roundtrip() {
         let raw = encode_frame(7, b"{\"code\":200}");
         assert_eq!(&raw[..4], &[0, 0, 0, 7]); // id BE
-        assert_eq!(&raw[4..8], &[0, 0, 0, 11]); // len BE = 11
+        assert_eq!(&raw[4..8], &[0, 0, 0, 12]); // len BE = 12
         let mut buf = raw.clone();
         let (f, used) = parse_frame(&mut buf).unwrap();
         assert_eq!(used, raw.len());
