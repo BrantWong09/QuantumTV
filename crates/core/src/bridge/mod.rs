@@ -223,6 +223,7 @@ pub fn emulator_path(sdk_root: &Path) -> PathBuf {
 /// 模拟器 DNS: 默认公共 DNS (国内 CDN 多节点, ISP DNS 可能轮询到死 IP 导致
 /// wex spider 运行时配置 api.txt 拉取超时 → detail/category 连锁 NPE)。
 /// env QUANTUMTV_EMU_DNS 覆盖; 设为 "off"/"0" 跳过该参数。
+/// -writable-system: 允许 adb remount 后钉 /etc/hosts (kstore.vip 解析污染兜底)。
 pub fn emulator_args(avd: &str) -> Vec<String> {
     let mut args = vec![
         "-avd".to_string(),
@@ -231,6 +232,7 @@ pub fn emulator_args(avd: &str) -> Vec<String> {
         "-no-boot-anim".to_string(),
         "-gpu".to_string(),
         "auto".to_string(),
+        "-writable-system".to_string(),
     ];
     let dns = std::env::var("QUANTUMTV_EMU_DNS").unwrap_or_default();
     let dns = dns.trim();
