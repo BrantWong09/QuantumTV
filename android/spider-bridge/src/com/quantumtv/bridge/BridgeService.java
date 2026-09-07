@@ -358,7 +358,7 @@ public class BridgeService extends Service {
             String className = parseField(body, "class");
             String keyword = parseField(body, "keyword");
             if (className == null || keyword == null) return json(400, "missing class/keyword", null);
-            return invokeSpider(className, "searchContent", new Class[]{String.class, boolean.class}, new Object[]{keyword, true});
+            return invokeSpiderWithRetry(className, "searchContent", new Class[]{String.class, boolean.class}, new Object[]{keyword, true}, false);
         } catch (Throwable t) {
             return json(500, t.toString(), null);
         }
