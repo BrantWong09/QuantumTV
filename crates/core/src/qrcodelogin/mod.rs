@@ -11,6 +11,41 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// 本期支持扫码的网盘
 pub const SUPPORTED: &[&str] = &["quark", "uc", "baidu"];
 
+pub(crate) mod baidu;
+
+const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const QUARK_CLIENT_UA: &str =
+    "quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4 Safari/537.36 Channel/pckk_other_ch";
+
+/// 换 cookie 阶段可能 302, 必须禁跟随才能读到首响 Set-Cookie
+pub(super) fn http() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15))
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("http client: {e}"))
+}
+
+/// 取二维码 (扫码入口)
+pub async fn start(drive: &str) -> Result<QrSession, String> {
+    match drive {
+        "quark" => start_cas("quark", "532").await,
+        "uc" => start_cas("uc", "381").await,
+        "baidu" => baidu::start().await,
+        other => Err(format!("网盘 {other} 暂不支持扫码登录 (支持: quark/uc/baidu)")),
+    }
+}
+
+/// 轮询扫码状态 (Confirmed 时已完成 cookie 交换)
+pub async fn poll(session: &QrSession) -> Result<PollOutcome, String> {
+    match session.drive.as_str() {
+        "quark" | "uc" => poll_cas(session).await,
+        "baidu" => baidu::poll(session).await,
+        other => Err(format!("网盘 {other} 暂不支持扫码登录")),
+    }
+}
+
 /// 二维码负载: Text = 前端 qrcode 包自绘; PngBase64 = 网盘官方 PNG
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
@@ -144,6 +179,117 @@ pub(crate) fn build_cookie(base: &[String], extra: Vec<String>) -> String {
         out.push(p.clone());
     }
     out.join("; ")
+}
+
+async fn start_cas(drive: &str, client_id: &str) -> Result<QrSession, String> {
+    let rid = uuid::Uuid::new_v4();
+    let host = if drive == "quark" { "uop.quark.cn" } else { "api.open.uc.cn" };
+    let url = format!(
+        "https://{host}/cas/ajax/getTokenForQrcodeLogin?client_id={client_id}&v=1.2&request_id={rid}"
+    );
+    let resp = http()?
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, UA)
+        .send()
+        .await
+        .map_err(|e| format!("取码失败: {e}"))?;
+    let cas_cookies: Vec<String> = resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(set_cookie_kv)
+        .collect();
+    let json: serde_json::Value = resp.json().await.map_err(|e| format!("取码解析失败: {e}"))?;
+    let token = parse_cas_token(&json).ok_or_else(|| format!("取码失败: {json}"))?;
+    Ok(QrSession {
+        drive: drive.to_string(),
+        qr: QrKind::Text(format!(
+            "https://su.quark.cn/4_eMHBJ?token={token}&client_id={client_id}&ssb=weblogin"
+        )),
+        token,
+        cas_cookies,
+    })
+}
+
+async fn poll_cas(session: &QrSession) -> Result<PollOutcome, String> {
+    let client_id = if session.drive == "quark" { "532" } else { "381" };
+    let host = if session.drive == "quark" { "uop.quark.cn" } else { "api.open.uc.cn" };
+    let rid = uuid::Uuid::new_v4();
+    let url = format!(
+        "https://{host}/cas/ajax/getServiceTicketByQrcodeToken?client_id={client_id}&v=1.2&token={}&request_id={rid}",
+        session.token
+    );
+    let json: serde_json::Value = http()?
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, UA)
+        .send()
+        .await
+        .map_err(|e| format!("轮询失败: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("轮询解析失败: {e}"))?;
+    match parse_cas_poll(&json) {
+        CasPoll::Waiting => Ok(PollOutcome::Waiting),
+        CasPoll::Scanned => Ok(PollOutcome::Scanned),
+        CasPoll::Expired => Ok(PollOutcome::Expired),
+        CasPoll::Confirmed(ticket) => {
+            let cookie = exchange_cas_cookie(&session.drive, &session.cas_cookies, &ticket).await?;
+            Ok(PollOutcome::Confirmed { cookie })
+        }
+    }
+}
+
+/// service_ticket → cookie; 夸克再补 __puus (spider 播放链路轮换所需)
+async fn exchange_cas_cookie(
+    drive: &str,
+    cas_cookies: &[String],
+    ticket: &str,
+) -> Result<String, String> {
+    let client = http()?;
+    let info_host = if drive == "quark" { "pan.quark.cn" } else { "drive.uc.cn" };
+    let url = format!("https://{info_host}/account/info?st={ticket}&lw=scan");
+    let resp = client
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, UA)
+        .header(reqwest::header::COOKIE, &cas_cookies.join("; "))
+        .send()
+        .await
+        .map_err(|e| format!("换 cookie 失败: {e}"))?;
+    let mut pairs: Vec<String> = resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(set_cookie_kv)
+        .collect();
+
+    if drive == "quark" {
+        let merged = build_cookie(cas_cookies, pairs.clone());
+        let resp2 = client
+            .get("https://drive-pc.quark.cn/1/clouddrive/config?pr=ucpro&fr=pc&uc_param_str=")
+            .header(reqwest::header::USER_AGENT, QUARK_CLIENT_UA)
+            .header(reqwest::header::REFERER, "https://pan.quark.cn/")
+            .header(reqwest::header::COOKIE, &merged)
+            .send()
+            .await
+            .map_err(|e| format!("补 __puus 失败: {e}"))?;
+        let puus: Vec<String> = resp2
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter_map(set_cookie_kv)
+            .filter(|p| p.starts_with("__puus="))
+            .collect();
+        pairs.extend(puus);
+    }
+
+    let cookie = build_cookie(cas_cookies, pairs);
+    if cookie.is_empty() {
+        return Err("登录确认成功但未取到 cookie (Set-Cookie 为空), 请重试".to_string());
+    }
+    Ok(cookie)
 }
 
 #[cfg(test)]
