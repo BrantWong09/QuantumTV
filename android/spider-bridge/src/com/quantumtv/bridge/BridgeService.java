@@ -31,9 +31,9 @@ public class BridgeService extends Service {
     /** wex 系 spider 的配置入口 (AES 加密返回配置服务器地址) */
     private static final String WEX_CONFIG_URL = "https://9280.kstore.vip/api.txt";
     private ServerSocket server;
-    private ExecutorService pool;
+    ExecutorService pool;
     /** /detail 专用单线程池: 与搜索队列隔离, 保证点击播放低延迟 */
-    private ExecutorService detailExecutor;
+    ExecutorService detailExecutor;
     private boolean initialized = false;
     /** 站点级 ext 配置, /init 时由桌面端传入; TVBoxOSC 在 getSpider 后调用 spider.init(context, ext) */
     private volatile String extConfig = "";
@@ -90,6 +90,7 @@ public class BridgeService extends Service {
             pool = Executors.newFixedThreadPool(4);
             detailExecutor = Executors.newSingleThreadExecutor();
             new Thread(this::acceptLoop, "BridgeAccept").start();
+        TunnelClient.start(this);
         } catch (Exception e) {
             Log.e(TAG, "server start failed: " + e);
         }
@@ -121,7 +122,7 @@ public class BridgeService extends Service {
     }
 
     /** 从原始流读一行(以 \n 结尾, 去掉尾部 \r); 全程按字节, 不经缓冲 Reader, 避免预读吃掉 body 字节 */
-    private String readLineRaw(java.io.InputStream in) throws Exception {
+    private static String readLineRaw(java.io.InputStream in) throws Exception {
         java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
         int b;
         boolean any = false;
@@ -133,6 +134,49 @@ public class BridgeService extends Service {
         if (!any) return null;
         String s = buf.toString("UTF-8");
         return s.endsWith("\r") ? s.substring(0, s.length() - 1) : s;
+    }
+
+    /** 隧道帧 payload (原始 HTTP 请求字节) → [method, path, body]; 解析失败返回 null */
+    static String[] parseRequest(byte[] raw) {
+        try {
+            java.io.ByteArrayInputStream in = new java.io.ByteArrayInputStream(raw);
+            String line = readLineRaw(in);
+            if (line == null) return null;
+            String[] parts = line.split(" ");
+            if (parts.length < 2) return null;
+            int contentLength = 0;
+            String h;
+            while ((h = readLineRaw(in)) != null && !h.isEmpty()) {
+                if (h.toLowerCase().startsWith("content-length:")) {
+                    contentLength = Integer.parseInt(h.split(":", 2)[1].trim());
+                }
+            }
+            byte[] body = new byte[contentLength];
+            int read = 0;
+            while (read < contentLength) {
+                int n = in.read(body, read, contentLength - read);
+                if (n < 0) break;
+                read += n;
+            }
+            return new String[]{parts[0], parts[1], new String(body, 0, read, java.nio.charset.StandardCharsets.UTF_8)};
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 路由分发 (同步阻塞; doDetail/doPlayerContent 由调用方决定是否投递 detailExecutor) */
+    String routeRequest(String method, String path, String body) {
+        if ("/health".equals(path)) {
+            return json(200, "ok", "{\"initialized\":" + initialized + "}");
+        }
+        if ("/init".equals(path) && "POST".equalsIgnoreCase(method)) return doInit(body);
+        if ("/search".equals(path) && "POST".equalsIgnoreCase(method)) return doSearch(body);
+        if ("/playerContent".equals(path) && "POST".equalsIgnoreCase(method)) return doPlayerContent(body);
+        if ("/detail".equals(path) && "POST".equalsIgnoreCase(method)) return doDetail(body);
+        if ("/home".equals(path) && "POST".equalsIgnoreCase(method)) return doHome(body);
+        if ("/category".equals(path) && "POST".equalsIgnoreCase(method)) return doCategory(body);
+        if ("/setCookie".equals(path) && "POST".equalsIgnoreCase(method)) return doSetCookie(body);
+        return json(404, "not_found", null);
     }
 
     private void handle(Socket s) {
@@ -165,7 +209,7 @@ public class BridgeService extends Service {
                 Log.i(TAG, method + " " + path + " body=" + bodyStr);
                 java.net.Socket sock = s;
                 detailExecutor.submit(() -> {
-                    String r = doDetail(bodyStr);
+                    String r = routeRequest(method, path, bodyStr);
                     try { writeHttp(sock, r); sock.close(); } catch (Exception e) { Log.e(TAG, "detail write: " + e); }
                 });
                 return;
@@ -173,33 +217,17 @@ public class BridgeService extends Service {
 
             Log.i(TAG, method + " " + path + " body=" + bodyStr);
 
-            String resp;
-            if ("/health".equals(path)) {
-                resp = json(200, "ok", "{\"initialized\":" + initialized + "}");
-            } else if ("/init".equals(path) && "POST".equalsIgnoreCase(method)) {
-                resp = doInit(bodyStr);
-            } else if ("/search".equals(path) && "POST".equalsIgnoreCase(method)) {
-                resp = doSearch(bodyStr);
-            } else if ("/playerContent".equals(path) && "POST".equalsIgnoreCase(method)) {
-                // 播放二次解析: detailContent 的网盘资源 id → 真实直链 (走 detail 优先通道)
-                Log.i(TAG, method + " " + path + " body=" + bodyStr);
+            // /playerContent 同走优先通道
+            if ("/playerContent".equals(path) && "POST".equalsIgnoreCase(method)) {
                 java.net.Socket sock = s;
                 detailExecutor.submit(() -> {
-                    String r = doPlayerContent(bodyStr);
+                    String r = routeRequest(method, path, bodyStr);
                     try { writeHttp(sock, r); sock.close(); } catch (Exception e) { Log.e(TAG, "playerContent write: " + e); }
                 });
                 return;
-            } else if ("/detail".equals(path) && "POST".equalsIgnoreCase(method)) {
-                resp = doDetail(bodyStr);
-            } else if ("/home".equals(path) && "POST".equalsIgnoreCase(method)) {
-                resp = doHome(bodyStr);
-            } else if ("/category".equals(path) && "POST".equalsIgnoreCase(method)) {
-                resp = doCategory(bodyStr);
-            } else if ("/setCookie".equals(path) && "POST".equalsIgnoreCase(method)) {
-                resp = doSetCookie(bodyStr);
-            } else {
-                resp = json(404, "not_found", null);
             }
+
+            String resp = routeRequest(method, path, bodyStr);
             writeHttp(s, resp);
             s.close();
         } catch (Exception e) {
