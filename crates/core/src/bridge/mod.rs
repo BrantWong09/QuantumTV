@@ -220,15 +220,26 @@ pub fn emulator_path(sdk_root: &Path) -> PathBuf {
     sdk_root.join("emulator").join("emulator.exe")
 }
 
+/// 模拟器 DNS: 默认公共 DNS (国内 CDN 多节点, ISP DNS 可能轮询到死 IP 导致
+/// wex spider 运行时配置 api.txt 拉取超时 → detail/category 连锁 NPE)。
+/// env QUANTUMTV_EMU_DNS 覆盖; 设为 "off"/"0" 跳过该参数。
 pub fn emulator_args(avd: &str) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "-avd".to_string(),
         avd.to_string(),
         "-no-snapshot-save".to_string(),
         "-no-boot-anim".to_string(),
         "-gpu".to_string(),
         "auto".to_string(),
-    ]
+    ];
+    let dns = std::env::var("QUANTUMTV_EMU_DNS").unwrap_or_default();
+    let dns = dns.trim();
+    if dns.is_empty() {
+        args.extend(["-dns-server".to_string(), "223.5.5.5,119.29.29.29".to_string()]);
+    } else if dns != "off" && dns != "0" {
+        args.extend(["-dns-server".to_string(), dns.to_string()]);
+    }
+    args
 }
 
 pub fn forward_args(host_port: u16, device_port: u16) -> Vec<String> {
@@ -858,18 +869,36 @@ mod tests {
         let sdk = Path::new("D:/Android/Sdk");
         assert_eq!(adb_path(sdk), PathBuf::from("D:/Android/Sdk/platform-tools/adb.exe"));
         assert_eq!(emulator_path(sdk), PathBuf::from("D:/Android/Sdk/emulator/emulator.exe"));
-        assert_eq!(
-            emulator_args("wexbridge"),
-            vec![
-                "-avd".to_string(),
-                "wexbridge".to_string(),
-                "-no-snapshot-save".to_string(),
-                "-no-boot-anim".to_string(),
-                "-gpu".to_string(),
-                "auto".to_string(),
-            ]
-        );
+        // 默认注入公共 DNS (ISP DNS 轮询到死 CDN IP 的规避)
+        let args = emulator_args("wexbridge");
+        assert!(args.starts_with(&[
+            "-avd".to_string(),
+            "wexbridge".to_string(),
+            "-no-snapshot-save".to_string(),
+            "-no-boot-anim".to_string(),
+            "-gpu".to_string(),
+            "auto".to_string(),
+        ]));
+        let di = args.iter().position(|a| a == "-dns-server").expect("dns-server missing");
+        assert_eq!(args[di + 1], "223.5.5.5,119.29.29.29");
         assert_eq!(forward_args(18080, 8080), vec!["tcp:18080".to_string(), "tcp:8080".to_string()]);
+    }
+
+    #[test]
+    fn emulator_args_dns_env_override() {
+        // SAFETY: 单测串行场景下临时改 env; 改回避免影响其他用例
+        std::env::set_var("QUANTUMTV_EMU_DNS", "8.8.8.8");
+        let args = emulator_args("wexbridge");
+        let di = args.iter().position(|a| a == "-dns-server").expect("dns missing");
+        assert_eq!(args[di + 1], "8.8.8.8");
+
+        std::env::set_var("QUANTUMTV_EMU_DNS", "off");
+        let args = emulator_args("wexbridge");
+        assert!(!args.contains(&"-dns-server".to_string()));
+
+        std::env::remove_var("QUANTUMTV_EMU_DNS");
+        let args = emulator_args("wexbridge");
+        assert!(args.contains(&"-dns-server".to_string()));
     }
 
     #[test]
