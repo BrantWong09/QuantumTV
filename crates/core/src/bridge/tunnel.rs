@@ -161,6 +161,7 @@ async fn tunnel_accept_loop(listener: TcpListener, bridge_url: String) {
                     tokio::spawn(writer_task(wr, rx));
                     tokio::spawn(reader_task(rd));
                     super::set_effective(&bridge_url, super::EFFECTIVE_TUNNEL);
+                    // Starting→Ready 由 ensure_ready_with 收尾; Failed/Idle 时隧道拨入即自愈
                     if super::status() != super::BridgeStatus::Starting {
                         super::set_status(super::BridgeStatus::Ready);
                     }
