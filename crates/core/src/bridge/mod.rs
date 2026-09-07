@@ -137,6 +137,7 @@ pub const EFFECTIVE_NONE: u8 = 0;
 pub const EFFECTIVE_REMOTE: u8 = 1;
 pub const EFFECTIVE_EMULATOR: u8 = 2;
 pub const EFFECTIVE_AVD: u8 = 3;
+pub const EFFECTIVE_TUNNEL: u8 = 4;
 
 /// 网盘 cookie 变更时由 Tauri 层调用: 置脏标记 + 更新载荷
 pub fn set_ext_payload(ext: Option<String>) {
