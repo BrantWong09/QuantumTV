@@ -15,6 +15,12 @@ pub async fn resolve_spider_episode(
     id: &str,
     bridge_url: &str,
 ) -> Result<(String, Value), String> {
+    log::info!(
+        "[播放解析] playerContent class={} flag={:?} id={}",
+        class_name,
+        flag,
+        super::trunc(id, 80)
+    );
     let body = serde_json::json!({
         "class": class_name,
         "flag": flag,
@@ -23,6 +29,7 @@ pub async fn resolve_spider_episode(
     let data = match bridge_post_with(bridge_url, "/playerContent", &body, false, 120).await {
         Ok(d) => d,
         Err(e) => {
+            log::warn!("[播放解析] playerContent 失败: {}", super::trunc(&e, 300));
             // 桥接透传的 Java 异常(如 InvocationTargetException)几乎都是
             // spider 内部调网盘 API 失败(未登录对应网盘/cookie 失效) → 给可操作的提示
             if e.contains("InvocationTargetException")
@@ -38,9 +45,139 @@ pub async fn resolve_spider_episode(
         .map_err(|e| format!("playerContent 响应解析失败: {e}, body: {}", &data[..data.len().min(120)]))?;
     let url = obj["url"].as_str().unwrap_or("").trim().to_string();
     if url.is_empty() {
+        log::warn!("[播放解析] playerContent 返回空 url (可能未登录对应网盘): header={}", obj["header"]);
         return Err(netdisk_login_hint(class_name));
     }
+    // 直链可能带敏感签名, 只打印前缀和长度
+    log::info!(
+        "[播放解析] 解析成功: url={} ({} bytes) header={}",
+        super::trunc(&url, 100),
+        url.len(),
+        obj["header"]
+    );
     Ok((url, obj["header"].clone()))
+}
+
+/// 识别 spider 返回的"本地代理包装"直链 (wex 系 kaiser: http://127.0.0.1:8096/kaiser?url=<内层>)
+/// 解出内层真实直链。播放器在桌面端无法访问手机/模拟器本机的代理端口,
+/// 但 MuMu 模拟器与宿主同出口 IP, 百度 PCS 的 dlink 又按 IP 绑定 → 内层直链桌面可直接用。
+pub fn unwrap_local_proxy_url(url: &str) -> Option<String> {
+    let lower = url.to_lowercase();
+    if !(lower.starts_with("http://127.0.0.1") || lower.starts_with("http://localhost")) {
+        return None;
+    }
+    // kaiser 形态: /kaiser?url=<urlencoded 内层直链>
+    let inner = url
+        .split_once("url=")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split(['&', '#']).next())
+        .filter(|s| !s.is_empty())?;
+    match urldecode(inner) {
+        decoded if decoded.starts_with("http://") || decoded.starts_with("https://") => {
+            log::info!("[播放解析] 本地代理包装识别: 内层直链 host={}", host_of(&decoded));
+            Some(decoded)
+        }
+        _ => None,
+    }
+}
+
+/// 提取 spider 返回 header 中的 User-Agent (百度 PCS 校验严格, 必须原样携带)
+pub fn header_user_agent(header: &Value) -> Option<String> {
+    // wex 系 playerContent 的 header 字段有两种形态:
+    //   对象: {"User-Agent": "..."}
+    //   字符串: "{\"User-Agent\": \"...\"}"  (日志实证 wex 返回的是这种, serde 原样透传)
+    let obj = match header {
+        Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+        other => other.clone(),
+    };
+    obj.as_object()?
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("User-Agent"))
+        .and_then(|(_, v)| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn host_of(url: &str) -> String {
+    url.split("//")
+        .nth(1)
+        .and_then(|rest| rest.split(['/', ':']).next())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 最小 percent-decoding (kaiser 的 url= 参数只含 %XX 转义; 大小写十六进制都接受)
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unwrap_kaiser_url() {
+        let inner = "https://d.pcs.baidu.com/file/abc?fid=1&rt=sh";
+        let wrapped = format!(
+            "http://127.0.0.1:8096/kaiser?url={}",
+            "https%3A%2F%2Fd.pcs.baidu.com%2Ffile%2Fabc%3Ffid%3D1%26rt%3Dsh"
+        );
+        assert_eq!(unwrap_local_proxy_url(&wrapped).as_deref(), Some(inner));
+    }
+
+    #[test]
+    fn unwrap_rejects_direct_urls() {
+        assert!(unwrap_local_proxy_url("https://d.pcs.baidu.com/file/x").is_none());
+        assert!(unwrap_local_proxy_url("http://127.0.0.1:8096/kaiser?url=").is_none());
+        assert!(unwrap_local_proxy_url("").is_none());
+    }
+
+    #[test]
+    fn unwrap_accepts_localhost_form() {
+        let wrapped = "http://localhost:8096/kaiser?url=http%3A%2F%2Fx.com%2Fa.mp4";
+        assert_eq!(
+            unwrap_local_proxy_url(wrapped).as_deref(),
+            Some("http://x.com/a.mp4")
+        );
+    }
+
+    #[test]
+    fn user_agent_extracted_case_insensitive() {
+        assert_eq!(
+            header_user_agent(&json!({"User-Agent": "  ExoPlayer "})).as_deref(),
+            Some("ExoPlayer")
+        );
+        assert_eq!(
+            header_user_agent(&json!({"user-agent": "abc"})).as_deref(),
+            Some("abc")
+        );
+        assert!(header_user_agent(&json!({"Referer": "x"})).is_none());
+        assert!(header_user_agent(&Value::Null).is_none());
+        // wex 实际形态: header 是 JSON 字符串(转义), 而非对象
+        let string_form = json!(r#"{"User-Agent":"com.android.chrome/131.0.6778.200"}"#);
+        assert_eq!(
+            header_user_agent(&string_form).as_deref(),
+            Some("com.android.chrome/131.0.6778.200")
+        );
+        assert!(header_user_agent(&json!("not json")).is_none());
+    }
 }
 
 /// 依据 spider 类名推断需要登录的网盘, 生成用户提示
@@ -89,12 +226,12 @@ pub fn netdisk_login_hint_for(class_name: &str, flag: &str) -> String {
 fn short_err(e: &str) -> String {
     let trimmed = e.trim();
     let end = trimmed.char_indices().nth(120).map(|(i, _)| i).unwrap_or(trimmed.len());
-    trimmed[..end].to_string()
+    format!("{}…", &trimmed[..end])
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod hint_tests {
+    use super::{netdisk_login_hint, netdisk_login_hint_for};
 
     #[test]
     fn login_hint_by_class_name() {

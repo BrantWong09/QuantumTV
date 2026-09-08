@@ -202,6 +202,9 @@ pub fn run() {
             commands::netdisk::netdisk_launch_login,
             commands::netdisk::cloud_login_start,
             commands::netdisk::cloud_login_poll,
+            // 外部 mpv 播放 (WebView2 无 HEVC 扩展时网盘源的黑屏兜底)
+            commands::mpv_player::launch_mpv,
+            commands::mpv_player::mpv_available,
             commands::settings::get_settings_bootstrap,
             commands::config::is_adult_source,
             // 跳过片头片尾

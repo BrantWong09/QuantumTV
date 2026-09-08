@@ -4,8 +4,7 @@ use std::time::Duration;
 const SPIDER_RUNNER_SOURCE: &str = include_str!("SpiderRunner.java");
 
 pub mod player;
-
-pub use player::{netdisk_login_hint, resolve_spider_episode};
+pub use player::{header_user_agent, netdisk_login_hint, resolve_spider_episode, unwrap_local_proxy_url};
 
 pub fn calculate_md5(data: &[u8]) -> String {
     format!("{:x}", md5::compute(data))
@@ -368,6 +367,18 @@ static BRIDGE_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 /// 最近一次 /init 携带的 ext (网盘 cookie 载荷)
 static INIT_EXT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// 日志用的字符边界安全截断(直接按字节切中文会 panic)
+pub fn trunc(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut n = max;
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    format!("{}…", &s[..n])
+}
+
 async fn bridge_post(bridge_url: &str, path: &str, body: &serde_json::Value) -> Result<String, String> {
     bridge_post_with(bridge_url, path, body, true, 60).await
 }
@@ -379,6 +390,8 @@ async fn bridge_post_with(
     gated: bool,
     timeout_secs: u64,
 ) -> Result<String, String> {
+    let started = std::time::Instant::now();
+    log::info!("[bridge] → {} body={}", path, body);
     let _gate = if gated {
         Some(BRIDGE_GATE.acquire().await.map_err(|e| format!("bridge gate: {}", e))?)
     } else {
@@ -411,8 +424,11 @@ async fn bridge_post_with(
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) if resp.status().is_success() => {
+                log::info!("[bridge] /init ok ({}ms)", started.elapsed().as_millis());
+            }
             _ => {
+                log::warn!("[bridge] /init 失败");
                 BRIDGE_INITED.store(false, std::sync::atomic::Ordering::SeqCst);
                 return Err("bridge /init 失败".to_string());
             }
@@ -427,15 +443,25 @@ async fn bridge_post_with(
         .map_err(|e| {
             // 桥接进程/模拟器重启后连接会失败; 复位 init 标记, 下次成功调用自动补发 /init(携 ext)
             BRIDGE_INITED.store(false, std::sync::atomic::Ordering::SeqCst);
+            log::warn!("[bridge] {} 请求失败 ({}ms): {}", path, started.elapsed().as_millis(), e);
             format!("bridge {}: {}", path, e)
         })?;
 
-    let text = resp.text().await.map_err(|e| format!("bridge body: {}", e))?;
+    let text = resp.text().await.map_err(|e| {
+        log::warn!("[bridge] {} 响应读取失败: {}", path, e);
+        format!("bridge body: {}", e)
+    })?;
     // 响应格式: {"code":200,"data":"<spider json string>"} 或 {"code":4xx,"err":"..."}
     let env: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| format!("bridge response not JSON: {} body={}", e, &text[..text.len().min(200)]))?;
     if env["code"] != serde_json::json!(200) {
         let raw = env["err"].as_str().unwrap_or("unknown");
+        log::warn!(
+            "[bridge] {} 业务错误 ({}ms): {}",
+            path,
+            started.elapsed().as_millis(),
+            trunc(raw, 300)
+        );
         // spider 内部异常统一是 InvocationTargetException (站点挂了/域名池失效/配置拉取失败等),
         // 对用户只暴露可读文案; 桥接已有实例重建重试, 仍失败说明站点当前确实不可用
         let msg = if raw.contains("InvocationTargetException") {
@@ -449,6 +475,12 @@ async fn bridge_post_with(
         .as_str()
         .ok_or_else(|| format!("bridge data not string: {}", text))?
         .to_string();
+    log::info!(
+        "[bridge] ← {} ok ({}ms, {} bytes)",
+        path,
+        started.elapsed().as_millis(),
+        data.len()
+    );
     Ok(data)
 }
 

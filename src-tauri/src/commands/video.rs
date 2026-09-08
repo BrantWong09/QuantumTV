@@ -1908,7 +1908,7 @@ pub async fn fetch_binary(
     let method_str = method.unwrap_or_else(|| "GET".to_string());
     let is_get = method_str.to_uppercase() == "GET";
 
-    // 1. 尝试从缓存获取
+    // 1. 尝试从缓存获取 (仅无 Range 的整片请求; 带 Range 的网盘直链每次区段不同, 不走缓存)
     if is_get {
         if let Some(cached_data) = cache_manager.get(&url).await {
             return Ok(FetchBinaryResponse {
@@ -1939,19 +1939,46 @@ pub async fn fetch_binary(
         // 添加 Range 头
         final_headers.insert(RANGE, HeaderValue::from_static("bytes=0-"));
     }
+    // 网盘直链 (百度 PCS 等): UA 校验严格, headers_opt 显式传入的 UA 优先
+    // (上面已合并 headers_opt; 此处仅兜底补一个 Android 播放器形态的 UA)
+    let is_netdisk_direct = url.contains("baidupcs.com")
+        || url.contains(".pcs.baidu.com")
+        || url.contains("pcsdata.baidu.com");
+    if is_netdisk_direct && !final_headers.contains_key(USER_AGENT) {
+        final_headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static(
+                "com.android.chrome/131.0.6778.200 (Linux;Android 10) AndroidXMedia3/1.5.1",
+            ),
+        );
+    }
     let req_method = match method_str.to_uppercase().as_str() {
         "POST" => reqwest::Method::POST,
         "HEAD" => reqwest::Method::HEAD,
         _ => reqwest::Method::GET,
     };
-    // 3. 执行带重试的网络请求
-    let resp = fetch_with_retry(&url, req_method, final_headers).await?;
+    // 网盘直链是 Range 分段请求, fetch_with_retry 的 20s 超时对 4MB 分块偏紧且
+    // 403 (签名过期) 重试无意义 → 网盘直链单独走一次性请求
+    let resp = if is_netdisk_direct {
+        let client = get_video_client();
+        client
+            .request(reqwest::Method::GET, &url)
+            .headers(final_headers)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| format!("netdisk fetch error: {} - {}", e, url))?
+    } else {
+        // 3. 执行带重试的网络请求
+        fetch_with_retry(&url, req_method, final_headers).await?
+    };
     let status = resp.status().as_u16();
     let body_bytes = resp.bytes().await.map_err(|e| e.to_string())?;
     let body = body_bytes.to_vec();
 
     // 4. 只有成功的 GET 请求才存入缓存并触发预取
-    if is_get && status == 200 {
+    // (网盘直链 206 部分响应不入缓存; 403/416 是签名过期, 直接把状态透传给前端换链)
+    if is_get && status == 200 && !is_netdisk_direct {
         cache_manager.set(url.clone(), body.clone()).await;
 
         if url.contains(".ts") {
@@ -1965,7 +1992,10 @@ pub async fn fetch_binary(
         }
     }
 
-    Ok(FetchBinaryResponse { status, body })
+    Ok(FetchBinaryResponse {
+        status,
+        body,
+    })
 }
 
 /// 获取 M3U8 内容并可选地进行去广告处理
@@ -2641,6 +2671,12 @@ pub async fn resolve_spider_episode(
     storage: State<'_, StorageManager>,
     db: State<'_, crate::db::db_client::Db>,
 ) -> Result<ResolveEpisodeResponse, String> {
+    log::info!(
+        "[播放解析] 前端请求 resolve_spider_episode: source={} flag={:?} episode_id={}",
+        source,
+        flag,
+        quantumtv_core::spider::trunc(&episode_id, 80)
+    );
     let config = get_config_with_db_sources(&storage, &db)?;
     let site = resolve_enabled_source(&config, &source)
         .ok_or_else(|| format!("Source not found or disabled: {}", source))?;
@@ -2654,9 +2690,37 @@ pub async fn resolve_spider_episode(
     let (url, header) =
         quantumtv_core::spider::resolve_spider_episode(class_name, &flag, &episode_id, &bridge_url)
             .await?;
+    // wex 系会把直链包装成本地代理地址(127.0.0.1:8096/kaiser?url=...)。桌面/播放器
+    // 无法访问手机本机端口, 但 MuMu 与宿主同出口 IP、百度 dlink 按 IP 绑定 → 解出内层
+    // 直链, 经本地网盘代理(补 UA + Range 透传)流式播放。
+    let (inner_url, play_header) = match quantumtv_core::spider::unwrap_local_proxy_url(&url) {
+        Some(inner) => (inner, header),
+        None => (url, header),
+    };
+    let ua = quantumtv_core::spider::header_user_agent(&play_header);
+    if let Some(ua) = &ua {
+        // 代理转发兜底数据源: 百度校验完整 UA, 参数链路任何一环丢失都会 403
+        quantumtv_core::netdisk_proxy::remember_user_agent(ua);
+    }
+    // 内层直链也做同样包装: 播放器无法带 UA, 全部走本地代理
+    let play_url = match quantumtv_core::netdisk_proxy::ensure_started().await {
+        Ok(port) => quantumtv_core::netdisk_proxy::wrap_proxy_url(
+            &inner_url,
+            ua.as_deref(),
+            port,
+        ),
+        Err(e) => {
+            log::warn!("[播放解析] 网盘代理启动失败, 回退原始直链: {}", e);
+            inner_url
+        }
+    };
+    log::info!(
+        "[播放解析] 下发播放地址: {}",
+        quantumtv_core::spider::trunc(&play_url, 120)
+    );
     Ok(ResolveEpisodeResponse {
-        url,
-        header,
+        url: play_url,
+        header: play_header,
         source_site_type: 3,
     })
 }
@@ -2683,14 +2747,35 @@ async fn enrich_first_episode_direct(result: &mut SearchResult, site: &ApiSite) 
     match quantumtv_core::spider::resolve_spider_episode(class_name, &flag, &first_raw, &bridge_url)
         .await
     {
-        Ok((url, _)) => {
+        Ok((url, header)) => {
+            let _header = header;
+            // kaiser 本地代理包装 → 解出内层直链, 再经本地网盘代理包装(补 UA)
+            let final_url = match quantumtv_core::spider::unwrap_local_proxy_url(&url) {
+                Some(inner) => match quantumtv_core::netdisk_proxy::ensure_started().await {
+                    Ok(port) => {
+                        let ua = quantumtv_core::spider::header_user_agent(&_header);
+                        if let Some(ua) = &ua {
+                            quantumtv_core::netdisk_proxy::remember_user_agent(ua);
+                        }
+                        quantumtv_core::netdisk_proxy::wrap_proxy_url(&inner, ua.as_deref(), port)
+                    }
+                    Err(_) => inner,
+                },
+                None => url,
+            };
+            log::info!(
+                "[播放解析] 首集直链化成功 ({}): url={}",
+                site.key,
+                quantumtv_core::spider::trunc(&final_url, 100)
+            );
             if !result.episodes.is_empty() {
-                result.episodes[0] = url; // 第 1 集已是真实直链
+                result.episodes[0] = final_url; // 第 1 集已是可播地址
             }
             // 其余集保持 raw id, 前端切集时逐集解析
         }
         Err(hint) => {
             // 解析失败: 保留 raw id(前端会再试), 并置提示
+            log::warn!("[播放解析] 首集直链化失败 ({}): {}", site.key, quantumtv_core::spider::trunc(&hint, 200));
             result.login_hint = Some(hint);
         }
     }

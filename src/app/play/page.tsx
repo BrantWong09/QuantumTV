@@ -364,7 +364,8 @@ function PlayPageClient() {
   // 工具函数（Utils）
 
   // 更新视频地址
-  // 是否为可直接播放的 http(s) 视频/m3u8 地址 (非网盘 raw id)
+  // 是否为可直接播放的 http(s) 视频/m3u8 地址 (非网盘 raw id)。
+  // 注意: 本地网盘代理地址(/netdisk/file.mp4?url=..)扩展名伪装成 mp4, 命中 mp4 分支。
   const isDirectPlayableUrl = (url: string): boolean =>
     /^https?:\/\//i.test(url) && /\.(m3u8|m3u|mp4|flv|mpd)(\?.*)?$/i.test(url);
 
@@ -380,18 +381,26 @@ function PlayPageClient() {
     // flag 取当前活跃组; 无组信息时退化为空串
     const group = detailData.play_groups?.[activeGroupIndex];
     const flag = group?.flag ?? '';
+    console.log(
+      `[播放解析] 请求解析: source=${detailData.source} flag=${flag} episodeIndex=${episodeIndex} rawId=${rawId.slice(0, 80)}`,
+    );
     try {
       const resp = await invoke<ResolveEpisodeResponse>(
         'resolve_spider_episode',
         { source: detailData.source, flag, episodeId: rawId },
       );
       if (resp && resp.url) {
+        console.log(
+          `[播放解析] 解析成功: url=${resp.url.slice(0, 120)}… header=${JSON.stringify(resp.header)}`,
+        );
         return resp.url;
       }
+      console.warn('[播放解析] 解析返回空 url');
       return null;
     } catch (err) {
       const msg =
         (err as { toString?: () => string })?.toString?.() || '解析视频源失败';
+      console.error('[播放解析] 解析失败:', err);
       showToast(msg, 'error');
       return null;
     }
@@ -416,6 +425,9 @@ function PlayPageClient() {
 
     // 非 spider, 或已是可直接播放地址, 或首集已由后端直链化 → 直接用
     if (!isSpider || isDirectPlayableUrl(candidate)) {
+      console.log(
+        `[播放] 直接播放: episodeIndex=${episodeIndex} isSpider=${isSpider} url=${candidate.slice(0, 120)}`,
+      );
       if (candidate !== videoUrl) {
         setVideoUrl(candidate);
       }
@@ -429,11 +441,48 @@ function PlayPageClient() {
       return; // 集数/详情已切换, 丢弃过期结果
     }
     if (resolved) {
+      // 换链成功(与失败链不同) → 重置重试计数, 新链仍可重试 1 次
+      if (
+        directRetryRef.current.url &&
+        directRetryRef.current.url !== resolved
+      ) {
+        directRetryRef.current = { url: '', count: 0 };
+      }
       setVideoUrl(resolved);
     } else {
       // 解析失败(网盘未登录/接口异常): 清空地址让播放器退出加载态
       setVideoUrl('');
       setIsVideoLoading(false);
+    }
+  };
+
+  // mp4 直链加载失败后的重试状态: 网盘 dlink 签名有效期短(实测分钟级),
+  // 播放器报错时重新解析当前集换新链, 最多 1 次防止死循环
+  const directRetryRef = useRef<{ url: string; count: number }>({
+    url: '',
+    count: 0,
+  });
+
+  // 网盘源 HEVC-MKV: WebView2 无 HEVC 扩展时黑屏有声 → 自动切换外部 mpv 播放。
+  // 判定: 视频加载成功但长时间无画面(readyState>=2 却 videoWidth===0), 或用户手动点按钮。
+  const mpvLaunchedUrlRef = useRef<string>('');
+  const launchMpvExternal = async (url: string, epTitle: string) => {
+    if (mpvLaunchedUrlRef.current === url) return; // 同一地址只拉起一次
+    mpvLaunchedUrlRef.current = url;
+    try {
+      const startTime = videoElementRef.current?.currentTime || 0;
+      await invoke('launch_mpv', {
+        url,
+        title: epTitle,
+        startAt: startTime > 3 ? startTime : null,
+      });
+      showToast('已切换到 mpv 播放(系统缺 HEVC 解码)', 'info');
+      // 暂停 webview 内的播放器, 避免双声
+      videoElementRef.current?.pause();
+    } catch (err) {
+      console.error('[播放] mpv 拉起失败:', err);
+      showToast(String(err), 'error');
+      mpvLaunchedUrlRef.current = '';
     }
   };
 
@@ -2234,6 +2283,9 @@ function PlayPageClient() {
         });
 
         hls.on(Hls.Events.ERROR, function (_event: any, data: any) {
+          console.warn(
+            `[播放] hls 错误: fatal=${data?.fatal} type=${data?.type} details=${data?.details} url=${String(data?.url ?? '').slice(0, 120)}`,
+          );
           if (!data?.fatal) return;
           switch (data.type) {
             case Hls.ErrorTypes.NETWORK_ERROR:
@@ -2250,6 +2302,7 @@ function PlayPageClient() {
       } else {
         video.src = url;
         // mp4 直链: 无 HLS 分片统计; webkitVideoDecodedByteCount 是累计值, 取窗口增量
+        console.log(`[播放] mp4/直链模式加载: url=${url.slice(0, 120)}`);
         let lastDecoded = Number(
           (video as any).webkitVideoDecodedByteCount ?? 0,
         );
@@ -2268,6 +2321,56 @@ function PlayPageClient() {
 
       ensureVideoSource(video, url);
       video.load();
+      video.onerror = () => {
+        console.error(
+          `[播放] video 元素错误: code=${(video.error as MediaError | null)?.code} message=${(video.error as MediaError | null)?.message} url=${url.slice(0, 120)}`,
+        );
+        // 本地网盘代理地址失败: 大概率 dlink 签名过期(403) → 重新解析换新链, 限 1 次
+        if (url.includes('/netdisk/file.mp4?')) {
+          const retry = directRetryRef.current;
+          if (retry.url === url || retry.count >= 1) {
+            console.warn('[播放] 网盘直链重试已用尽或同链重试, 放弃');
+            return;
+          }
+          directRetryRef.current = { url, count: retry.count + 1 };
+          console.log('[播放] 网盘直链失败, 重新解析换链…');
+          const detailData = detailRef.current;
+          const idx = currentEpisodeIndexRef.current;
+          if (detailData) {
+            void (async () => {
+              setIsVideoLoading(true);
+              const fresh = await resolveEpisodeUrl(detailData, idx);
+              if (fresh) {
+                setVideoUrl(fresh);
+              } else {
+                setIsVideoLoading(false);
+              }
+            })();
+          }
+        }
+      };
+      // HEVC 黑屏检测: 数据能加载(loadeddata)但视频轨解不出来(videoWidth===0),
+      // 典型于 WebView2 无 HEVC 扩展播放网盘 HEVC-MKV → 自动换 mpv
+      const hevcFallback = () => {
+        if (!url.includes('/netdisk/file.mp4?')) return;
+        if (video.videoWidth > 0) return; // 有画面, 不是解码问题
+        if (video.readyState < 2) return; // 数据还没到, 不判断
+        console.warn(
+          `[播放] 检测到黑屏有声(readyState=${video.readyState} videoWidth=0) → HEVC 兜底切 mpv`,
+        );
+        const detailData = detailRef.current;
+        const idx = currentEpisodeIndexRef.current;
+        const epName =
+          detailData?.episodes_titles?.[idx] ||
+          `${detailData?.title || '视频'} 第${idx + 1}集`;
+        void launchMpvExternal(url, epName);
+      };
+      video.addEventListener('loadeddata', hevcFallback, { once: true });
+      // loadeddata 后再给 2s 窗口确认 videoWidth 仍为 0 (部分容器元数据晚到)
+      const hevcTimer = window.setTimeout(() => hevcFallback(), 2000);
+      video.addEventListener('loadedmetadata', () => {
+        if (video.videoWidth > 0) window.clearTimeout(hevcTimer);
+      }, { once: true });
 
       // Plyr 的 autoplay 仅在播放器实例创建时生效一次，后续选集换源后
       // 需要重新在 canplay 时触发一次播放

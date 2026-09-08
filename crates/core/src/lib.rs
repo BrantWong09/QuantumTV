@@ -2,6 +2,7 @@ pub mod admin_config;
 pub mod adult;
 pub mod bridge;
 pub mod netdisk;
+pub mod netdisk_proxy;
 pub mod playback;
 pub mod qrcodelogin;
 pub mod search_aggregation;

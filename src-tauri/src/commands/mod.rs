@@ -6,6 +6,7 @@ pub mod content_analyzer;
 pub mod data_fusion;
 pub mod douban_client;
 pub mod home;
+pub mod mpv_player;
 pub mod netdisk;
 pub mod preload;
 pub mod recommendation;
