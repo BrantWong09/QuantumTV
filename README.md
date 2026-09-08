@@ -56,6 +56,9 @@
 
 - 🔍 **多源聚合搜索** —— 一次查询同时命中所有已配置的资源站,自动去重合并
 - ▶️ **完整播放体验** —— 基于 Plyr + HLS.js,支持倍速、画质切换、记忆进度、上次播放位置一键继续
+- ☁️ **网盘直连播放** —— 网盘资源源(玩偶/Wex 系等)桌面直接播放: playerContent 解析 → 内层直链还原 → 本地流式代理补 UA/Range,支持进度拖动
+- 🎬 **mpv 解码兜底** —— 系统缺 HEVC 扩展时自动切换 mpv 外部窗口播放,4K HEVC-MKV 硬解无忧,支持进度续播与换集复用窗口
+- 📱 **Android 桥接引擎** —— wex 加固 Spider 在模拟器/真机 APK 内执行,桌面经隧道帧协议调用搜索/详情/播放解析,无需 adb 常驻
 - ⏭️ **片头片尾跳过** —— 单剧/全局两级配置,按集精确到秒
 - 💾 **观看历史 & 收藏夹** —— 全本地,跨剧集自动汇聚
 - 🎯 **个性化推荐** —— 基于本地播放历史的离线推荐引擎,数据不出本机
@@ -69,6 +72,27 @@
 - 🔄 **配置订阅** —— 支持远程订阅 URL,后台 24h 自动拉取更新
 - 📺 **TVBox 兼容** —— 内置 `/api/tvbox` 端点,直接当 TVBox 后端用
 - 🛡️ **CMS 全量代理** —— 桌面端原生网络栈,彻底告别 CORS 和 Mixed Content
+
+### 网盘播放架构(进阶)
+
+网盘类 Spider(玩偶/Wex 系)的播放链路:
+
+```
+搜索/详情 ──隧道──▶ Android 桥接 APK (wex Spider, JRE 跑不动)
+                        │ playerContent 返回手机本机代理地址
+                        ▼
+            ┌── 127.0.0.1:8096/kaiser?url=<网盘直链> ──┐
+            │  桌面端还原内层直链, 经本地流式代理播放:    │
+            │  127.0.0.1:<随机>/netdisk/file.mp4?url=…  │
+            │  · UA 兜底(百度严格校验, 差一字符即 403)    │
+            │  · Range 透传 → 拖动秒切                   │
+            └───────────────────────────────────────────┘
+                        ▼  检测到黑屏有声(HEVC 解码缺失)
+                    外部 mpv 窗口硬解播放
+```
+
+- **mpv 获取**: 下载 [mpv 便携版](https://sourceforge.net/projects/mpv-player-windows/files/64bit/) 的 `mpv.exe` 放到 `<应用数据目录>/mpv/mpv.exe` (Windows 为 `%APPDATA%\com.geon.quantumtv\mpv\mpv.exe`),或放入 PATH。
+- 播放器路径: WebView2 可解码的格式直接内嵌播放;遇到 HEVC 等不支持编码(黑屏有声)时自动切换 mpv,并把 webview 内已播进度带入 mpv。
 
 <div align="center">
   <img src="public/photo.jpg" alt="rust" width="100%" max-width="150" height="auto">
@@ -173,7 +197,7 @@ services:
 | 后端语言 | [Rust 1.90](https://www.rust-lang.org/) + [Axum](https://github.com/tokio-rs/axum) + [SQLite](https://www.sqlite.org/)  |
 | 前端框架 | [Next.js 16](https://nextjs.org/) + [React 19](https://react.dev/) + [TypeScript 5](https://www.typescriptlang.org/)　  |
 | 样式　　 | [Tailwind CSS 4](https://tailwindcss.com/)　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　  |
-| 播放器　 | [Plyr](https://github.com/sampotts/plyr) + [HLS.js](https://github.com/video-dev/hls.js)　　　　　　　　　　　　　　　  |
+| 播放器　 | [Plyr](https://github.com/sampotts/plyr) + [HLS.js](https://github.com/video-dev/hls.js) + [mpv](https://mpv.io/)(HEVC 兜底) |
 
 ## 🏛️ 架构一览
 
