@@ -113,6 +113,9 @@ pub async fn mpv_embed_sync(
         );
         app.run_on_main_thread(move || {
             let _ = sync_window_raw(raw, fx, fy, fw, fh, first_show);
+            if first_show {
+                ensure_layered_opacity(raw);
+            }
         })
         .map_err(|e| format!("调度主线程失败: {e}"))?;
         return Ok(());
@@ -270,22 +273,28 @@ async fn embed_launch(
 
 /// 系统预注册的 STATIC 类 + SS_BLACKRECT: 免自注册窗口类/消息循环,
 /// 黑底避免 mpv 启动前的白闪。仅在主线程调用。
+///
+/// 输入路由关键: mpv --wid 会**自己**在宿主窗口内创建内层渲染窗口, 该
+/// 内层窗口截获全部鼠标事件 (键盘已被 --input-* 关掉)。鼠标事件落到
+/// mpv 内层窗口后既不前进也不后退 —— 整个页面表现为"锁死"。
+/// 解法: 宿主 STATIC 加 WS_EX_TRANSPARENT(点击穿透) + WS_EX_LAYERED。
+/// 穿透后鼠标命中测试越过宿主, 但 mpv 的内层窗口仍会截获
+/// (它在宿主之下不可命中)——实际上 mpv 拿不到鼠标, 输入全部落到
+/// WebView2, 控制完全经 DOM/IPC。这正是本集成想要的输入模型。
 #[cfg(windows)]
 unsafe fn create_static_child(parent: *mut std::ffi::c_void) -> Result<isize, String> {
     use windows::core::w;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, WINDOW_STYLE, WS_CHILD, WS_EX_NOACTIVATE,
+        CreateWindowExW, WINDOW_STYLE, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TRANSPARENT,
     };
 
     // SS_BLACKRECT (= 0x4, 系统类 STATIC 的黑底填充样式) 位于
     // Win32::System::SystemServices, 为省一个 feature 直接写数值。
-    // WS_EX_NOACTIVATE: 点击 mpv 画面不抢键盘焦点, 避免页面交互"卡死"体感。
-    // 创建时隐藏 (不带 WS_VISIBLE, 且 SWP_HIDEWINDOW): 此刻前端还没同步过
-    // 视频区 rect, 若直接 16x9 或整客户区可见, 会挡住 WebView2 的鼠标事件
-    // —— 页面除视频区外全部点不了。首次 mpv_embed_sync 到位后才显示。
+    // 创建时隐藏: 前端首次 mpv_embed_sync 定位到视频区后才显示。
     let hwnd = CreateWindowExW(
-        WS_EX_NOACTIVATE,
+        WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE,
         w!("STATIC"),
         w!("QuantumTVMpvHost"),
         WS_CHILD | WINDOW_STYLE(4),
@@ -300,6 +309,25 @@ unsafe fn create_static_child(parent: *mut std::ffi::c_void) -> Result<isize, St
     )
     .map_err(|e| format!("创建 mpv 宿主窗口失败: {e}"))?;
     Ok(hwnd.0 as isize)
+}
+
+/// 每次显示宿主窗口后必须补一刀 SetLayeredWindowAttributes: WS_EX_LAYERED
+/// 窗口在未设置 alpha 前不渲染 (系统按全透明处理) —— mpv 的画面绘制不
+/// 经过 GDI, 不会触发分层窗口的更新, 必须显式设为不透明才能看见。
+#[cfg(windows)]
+fn ensure_layered_opacity(raw: isize) {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetLayeredWindowAttributes, LWA_ALPHA,
+    };
+    unsafe {
+        let _ = SetLayeredWindowAttributes(
+            windows::Win32::Foundation::HWND(raw as *mut std::ffi::c_void),
+            COLORREF(0),
+            255,
+            LWA_ALPHA,
+        );
+    }
 }
 
 #[cfg(windows)]
