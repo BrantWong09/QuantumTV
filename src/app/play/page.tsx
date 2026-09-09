@@ -515,6 +515,10 @@ function PlayPageClient() {
       const startTime = sameUrl
         ? null
         : videoElementRef.current?.currentTime || 0;
+      // 彻底卸掉 webview 内的 Plyr/hls/<video>: 否则旧播放器的控制条
+      // (双进度条)仍显示、音频继续播、直接源黑屏检测还会反复触发
+      cleanupPlayer();
+      lastStartedUrlRef.current = '';
       await invoke('mpv_embed_launch', { url });
       if (!sameUrl) {
         const startOpts =
