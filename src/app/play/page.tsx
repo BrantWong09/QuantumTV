@@ -569,6 +569,8 @@ function PlayPageClient() {
       /* mpv 可能已自行退出, 忽略 */
     }
     if (backToPlyr) {
+      // 先卸掉 mpv 模式遗留 (无), 再重建 Plyr: reloadTick 驱动
+      // 主加载 effect 重跑, 前端 UI 不依赖 mpv 进程状态
       setPlyrReloadTick((t) => t + 1);
     }
   };

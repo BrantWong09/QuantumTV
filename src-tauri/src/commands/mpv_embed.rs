@@ -28,6 +28,8 @@ pub struct MpvEmbedState {
     child: StdMutex<Option<std::process::Child>>,
     /// STATIC 宿主子窗口句柄 (原始 isize, 进程内创建一次复用)
     hwnd: StdMutex<Option<isize>>,
+    /// 宿主窗口当前是否已显示 (首次 sync 时定位+置顶+显示, 之后 sync 只改几何)
+    shown: StdMutex<bool>,
     /// IPC 命令发送端 (mpv 就绪后由管道任务填充)
     writer: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
     /// 管道连接前的待发命令
@@ -89,14 +91,19 @@ pub async fn mpv_embed_sync(
     #[cfg(windows)]
     {
         let _ = &state;
-        let hwnd = app
-            .state::<MpvEmbedState>()
-            .hwnd
-            .lock()
-            .unwrap()
-            .clone();
+        let st = app.state::<MpvEmbedState>();
+        let hwnd = st.hwnd.lock().unwrap().clone();
         let Some(raw) = hwnd else {
             return Err("mpv 宿主窗口未创建".into());
+        };
+        // 隐藏→显示的跃迁 (首次 sync 或重新进入) 允许一次 z 序提升:
+        // STATIC 创建后默认垫底, 不提升则画面被 WebView2 盖住 (有声无画面)。
+        // 已显示状态下 sync 绝不碰 z 序 (拖拽模态循环里高频重设 z 序会卡死 UI)。
+        let first_show = {
+            let mut shown = st.shown.lock().unwrap();
+            let was = *shown;
+            *shown = true;
+            !was
         };
         let (fx, fy, fw, fh) = (
             (x * scale).round() as i32,
@@ -105,7 +112,7 @@ pub async fn mpv_embed_sync(
             (h * scale).round() as i32,
         );
         app.run_on_main_thread(move || {
-            let _ = sync_window_raw(raw, fx, fy, fw, fh);
+            let _ = sync_window_raw(raw, fx, fy, fw, fh, first_show);
         })
         .map_err(|e| format!("调度主线程失败: {e}"))?;
         return Ok(());
@@ -133,24 +140,14 @@ pub async fn mpv_embed_command(
     }
 }
 
-/// 退出 mpv 嵌入播放: 优雅 quit → 超时 kill, 隐藏宿主窗口。
+/// 退出 mpv 嵌入播放: 先隐藏宿主窗口 (窗口操作绝不能发生在 kill 之后——
+/// mpv 死亡瞬间其内层渲染窗口会短暂悬空, 阻塞主线程消息处理), 再优雅
+/// quit → 超时 kill, 最后重置 shown 状态。
 #[tauri::command]
 pub async fn mpv_embed_close(
     app: tauri::AppHandle,
     state: tauri::State<'_, MpvEmbedState>,
 ) -> Result<(), String> {
-    if let Some(tx) = state.writer.lock().unwrap().clone() {
-        let _ = tx.send(serde_json::json!({ "command": ["quit"] }).to_string());
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    if let Some(mut child) = state.child.lock().unwrap().take() {
-        let exited = child.try_wait().map(|s| s.is_some()).unwrap_or(false);
-        if !exited {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-    state.pending.lock().unwrap().clear();
     #[cfg(windows)]
     {
         let hwnd = state.hwnd.lock().unwrap().clone();
@@ -159,7 +156,20 @@ pub async fn mpv_embed_close(
                 let _ = show_host_window_raw(raw, false);
             });
         }
+        *state.shown.lock().unwrap() = false;
     }
+    if let Some(tx) = state.writer.lock().unwrap().clone() {
+        let _ = tx.send(serde_json::json!({ "command": ["quit"] }).to_string());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    if let Some(mut child) = state.child.lock().unwrap().take() {
+        let exited = child.try_wait().map(|s| s.is_some()).unwrap_or(false);
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    state.pending.lock().unwrap().clear();
     Ok(())
 }
 
@@ -328,24 +338,33 @@ fn sync_window_raw(
     y: i32,
     w: i32,
     h: i32,
+    raise: bool,
 ) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
+        SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
     };
     unsafe {
-        // 移动/缩放只改几何 (SWP_NOZORDER)。z 序仅在显示时用 HWND_TOP 提升
-        // 一次: 拖拽窗口期间每次 sync 都重设 z 序, SetWindowPos 会同步遍历
-        // 同层兄弟 (含 WebView2 跨进程窗口) 的 WM_WINDOWPOSCHANGING, 高频
-        // 调用会把模态拖拽循环卡死 —— 表现为窗口不能拖动/最大化。
+        // 几何变更一律 NOZORDER; 仅在隐藏→显示跃迁 (raise=true) 时用 HWND_TOP
+        // 提到同层兄弟 (WebView2) 之上一次 —— 创建后默认垫底, 不提升则画面
+        // 被网页盖住。已显示状态下绝不能重设 z 序: 拖拽模态循环里高频
+        // 遍历兄弟窗口 (含 WebView2 跨进程) 的 WM_WINDOWPOSCHANGING 会卡死 UI。
+        let (after, mut flags) = if raise {
+            (HWND_TOP, SWP_NOACTIVATE | SWP_SHOWWINDOW)
+        } else {
+            (HWND::default(), SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+        };
+        if w <= 0 || h <= 0 {
+            flags |= SWP_NOZORDER; // 无效尺寸只改位置, 避免异常几何放大
+        }
         SetWindowPos(
             HWND(raw as *mut std::ffi::c_void),
-            HWND::default(),
+            after,
             x,
             y,
             w,
             h,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            flags,
         )
         .map_err(|e| format!("同步 mpv 宿主窗口位置失败: {e}"))?;
     }
