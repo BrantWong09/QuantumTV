@@ -2,8 +2,18 @@
 
 'use client';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import Hls from 'hls.js';
-import { FastForward, Heart, Rewind, Volume2 } from 'lucide-react';
+import {
+  FastForward,
+  Heart,
+  Pause,
+  Play,
+  Rewind,
+  SkipBack,
+  SkipForward,
+  Volume2,
+} from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import * as Plyr from 'plyr';
 import { Suspense, useEffect, useRef, useState } from 'react';
@@ -88,6 +98,10 @@ const videoCanBoost = (video: HTMLVideoElement | null | undefined): boolean => {
 // 该地址是否会走 hls.js → MSE(WebView2 中 m3u8 均走此路径)
 const isMsePlayableUrl = (url: string): boolean =>
   /\.m3u8($|\?)/i.test(url) && Hls.isSupported();
+
+// mpv 嵌入模式(方案 B): 视频画面由原生子窗口渲染, 底部预留一条 DOM 控制条
+const MPV_CONTROL_BAR_H = 48;
+const MPV_SPEEDS = [1, 1.25, 1.5, 2, 3, 0.75, 0.5];
 
 function PlayPageClient() {
   const router = useRouter();
@@ -463,26 +477,95 @@ function PlayPageClient() {
     count: 0,
   });
 
-  // 网盘源 HEVC-MKV: WebView2 无 HEVC 扩展时黑屏有声 → 自动切换外部 mpv 播放。
-  // 判定: 视频加载成功但长时间无画面(readyState>=2 却 videoWidth===0), 或用户手动点按钮。
-  const mpvLaunchedUrlRef = useRef<string>('');
+  // mpv 嵌入播放(方案 B): mpv --wid 渲染进主窗口子窗口, 控制走 JSON IPC。
+  // 换源/切集 = Rust 侧复用进程 + loadfile replace; 状态经 mpv-embed-event 回传。
+  const [mpvState, setMpvState] = useState<{
+    active: boolean;
+    time: number;
+    duration: number;
+    paused: boolean;
+    eof: boolean;
+  }>({ active: false, time: 0, duration: 0, paused: false, eof: false });
+  const mpvStateRef = useRef(mpvState);
+  useEffect(() => {
+    mpvStateRef.current = mpvState;
+  }, [mpvState]);
+  const mpvActiveRef = useRef(false);
+  useEffect(() => {
+    mpvActiveRef.current = mpvState.active;
+  }, [mpvState.active]);
+  // 已通过 loadfile 播放的地址 (同集不重复下发)
+  const mpvLoadedUrlRef = useRef('');
+  // 退出 mpv 模式后 +1, 驱动 Plyr 重新加载
+  const [plyrReloadTick, setPlyrReloadTick] = useState(0);
+  // 嵌入模式本地控制状态
+  const [mpvSpeedIdx, setMpvSpeedIdx] = useState(0);
+  const [mpvVolume, setMpvVolume] = useState(70);
+
+  const currentEpisodeTitle = () => {
+    const d = detailRef.current;
+    const idx = currentEpisodeIndexRef.current;
+    return d?.episodes_titles?.[idx] || `${d?.title || '视频'} 第${idx + 1}集`;
+  };
+
+  // 拉起/换源 mpv 嵌入播放。进程与管道由 Rust 复用管理。
   const launchMpvExternal = async (url: string, epTitle: string) => {
-    if (mpvLaunchedUrlRef.current === url) return; // 同一地址只拉起一次
-    mpvLaunchedUrlRef.current = url;
     try {
-      const startTime = videoElementRef.current?.currentTime || 0;
-      await invoke('launch_mpv', {
-        url,
-        title: epTitle,
-        startAt: startTime > 3 ? startTime : null,
-      });
-      showToast('已切换到 mpv 播放(系统缺 HEVC 解码)', 'info');
+      const sameUrl = mpvLoadedUrlRef.current === url;
+      const startTime = sameUrl
+        ? null
+        : videoElementRef.current?.currentTime || 0;
+      await invoke('mpv_embed_launch', { url });
+      if (!sameUrl) {
+        const startOpts =
+          startTime && startTime > 3
+            ? ['loadfile', url, 'replace', `start=${startTime}`]
+            : ['loadfile', url, 'replace'];
+        await invoke('mpv_embed_command', { cmd: startOpts });
+        await invoke('mpv_embed_command', {
+          cmd: ['set_property', 'force-media-title', epTitle],
+        });
+        mpvLoadedUrlRef.current = url;
+      }
       // 暂停 webview 内的播放器, 避免双声
       videoElementRef.current?.pause();
+      setIsVideoLoading(false);
+      setMpvState((s) => {
+        if (s.active) return s;
+        showToast('已切换到 mpv 嵌入播放', 'info');
+        return {
+          active: true,
+          time: startTime || 0,
+          duration: 0,
+          paused: false,
+          eof: false,
+        };
+      });
     } catch (err) {
-      console.error('[播放] mpv 拉起失败:', err);
+      console.error('[播放] mpv 嵌入拉起失败:', err);
       showToast(String(err), 'error');
-      mpvLaunchedUrlRef.current = '';
+    }
+  };
+
+  // 退出 mpv 嵌入模式; backToPlyr=true 时重载内置播放器
+  const exitMpvMode = async (backToPlyr = true) => {
+    if (mpvActiveRef.current) {
+      setMpvState({
+        active: false,
+        time: 0,
+        duration: 0,
+        paused: false,
+        eof: false,
+      });
+    }
+    mpvLoadedUrlRef.current = '';
+    try {
+      await invoke('mpv_embed_close');
+    } catch {
+      /* mpv 可能已自行退出, 忽略 */
+    }
+    if (backToPlyr) {
+      setPlyrReloadTick((t) => t + 1);
     }
   };
 
@@ -1954,6 +2037,35 @@ function PlayPageClient() {
       return;
     }
 
+    // mpv 嵌入模式: 播放控制经 IPC 下发
+    if (mpvActiveRef.current) {
+      const mpvKey = (cmd: (string | number)[]) => {
+        void invoke('mpv_embed_command', { cmd }).catch(() => {
+          /* IPC 未就绪时忽略 */
+        });
+      };
+      if (e.key === ' ') {
+        mpvKey(['cycle', 'pause']);
+        e.preventDefault();
+      } else if (e.key === 'ArrowLeft' && !e.altKey) {
+        mpvKey(['seek', -10]);
+        e.preventDefault();
+      } else if (e.key === 'ArrowRight' && !e.altKey) {
+        mpvKey(['seek', 10]);
+        e.preventDefault();
+      } else if (e.key === 'ArrowUp') {
+        mpvKey(['add', 'volume', 5]);
+        e.preventDefault();
+      } else if (e.key === 'ArrowDown') {
+        mpvKey(['add', 'volume', -5]);
+        e.preventDefault();
+      } else if (e.key === 'f' || e.key === 'F') {
+        togglePageFullscreen();
+        e.preventDefault();
+      }
+      return;
+    }
+
     // Alt + 左箭头 = 上一集
     if (e.altKey && e.key === 'ArrowLeft') {
       if (detailRef.current && currentEpisodeIndexRef.current > 0) {
@@ -2027,19 +2139,21 @@ function PlayPageClient() {
   // ---------------------------------------------------------------------------
   // 播放记录相关
   // ---------------------------------------------------------------------------
-  // 保存播放进度
-  const saveCurrentPlayProgress = async () => {
-    if (
-      !plyrRef.current ||
-      !currentSourceRef.current ||
-      !currentIdRef.current
-    ) {
+  // 保存播放进度; mpv 嵌入模式下传入 mpv 的时间/时长 (Plyr 未接管)
+  const saveCurrentPlayProgress = async (mpv?: {
+    time: number;
+    duration: number;
+  }) => {
+    if (!currentSourceRef.current || !currentIdRef.current) {
+      return;
+    }
+    if (!mpv && !plyrRef.current) {
       return;
     }
 
     const player = plyrRef.current;
-    const currentTime = player.currentTime || 0;
-    const duration = player.duration || 0;
+    const currentTime = mpv ? mpv.time : player?.currentTime || 0;
+    const duration = mpv ? mpv.duration : player?.duration || 0;
 
     try {
       const saved = await invoke<boolean>('save_play_progress', {
@@ -2107,6 +2221,159 @@ function PlayPageClient() {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [currentEpisodeIndex, detail, plyrRef.current]);
+
+  // ---------------------------------------------------------------------------
+  // mpv 嵌入模式: 事件回传 / 子窗口 rect 同步 / 播完连播 / 进度与跳过
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!mpvState.active) return;
+    let disposed = false;
+    const unlisten = listen<{
+      kind: 'time' | 'duration' | 'pause' | 'eof' | 'file-loaded' | 'dead';
+      time?: number;
+      duration?: number;
+      value?: boolean;
+    }>('mpv-embed-event', (e) => {
+      if (disposed) return;
+      const p = e.payload;
+      if (p.kind === 'time') {
+        setMpvState((s) =>
+          s.active
+            ? {
+                ...s,
+                time: p.time ?? s.time,
+                duration: p.duration || s.duration,
+              }
+            : s,
+        );
+      } else if (p.kind === 'duration') {
+        setMpvState((s) => ({ ...s, duration: p.duration || s.duration }));
+      } else if (p.kind === 'pause') {
+        setMpvState((s) => ({ ...s, paused: Boolean(p.value) }));
+      } else if (p.kind === 'eof') {
+        setMpvState((s) => ({ ...s, eof: true }));
+      } else if (p.kind === 'file-loaded') {
+        setIsVideoLoading(false);
+      } else if (p.kind === 'dead') {
+        // 主动退出(close → quit)也会触发 dead, 此时 mpvActiveRef 已为 false
+        if (!mpvActiveRef.current) return;
+        showToast('mpv 播放器已退出', 'info');
+        void exitMpvMode(true);
+      }
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((f) => f());
+    };
+  }, [mpvState.active]);
+
+  // mpv 子窗口 rect 同步: 视频区 rect 扣除底部控制条高度, CSS 坐标 × DPR
+  useEffect(() => {
+    if (!mpvState.active) return;
+    const sync = () => {
+      const el = playerContainerRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      void invoke('mpv_embed_sync', {
+        x: r.left,
+        y: r.top,
+        w: r.width,
+        h: Math.max(0, r.height - MPV_CONTROL_BAR_H),
+        scale: window.devicePixelRatio || 1,
+      }).catch(() => {});
+    };
+    sync();
+    const el = playerContainerRef.current;
+    const ro = new ResizeObserver(sync);
+    if (el) ro.observe(el);
+    window.addEventListener('resize', sync);
+    window.addEventListener('scroll', sync, true);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', sync);
+      window.removeEventListener('scroll', sync, true);
+    };
+  }, [mpvState.active, isPageFullscreen]);
+
+  // 播完连播: eof-reached → 下一集 / 提示最后一集
+  useEffect(() => {
+    if (!mpvState.active || !mpvState.eof) return;
+    const d = detailRef.current;
+    const idx = currentEpisodeIndexRef.current;
+    if (d && d.episodes && idx < d.episodes.length - 1) {
+      setMpvState((s) => ({ ...s, eof: false }));
+      setTimeout(() => setCurrentEpisodeIndex(idx + 1), 500);
+    } else {
+      showToast('已是最后一集', 'info');
+    }
+  }, [mpvState.eof, mpvState.active]);
+
+  // 进度保存 + 跳过片头片尾: 复用 player_tick 的节流决策, 控制经 IPC 下发
+  useEffect(() => {
+    if (!mpvState.active || mpvState.paused) return;
+    const timer = setInterval(async () => {
+      const st = mpvStateRef.current;
+      if (!st.active || st.paused || st.duration <= 0) return;
+      const detailData = detailRef.current;
+      const idx = currentEpisodeIndexRef.current;
+      try {
+        const tickDecision = await invoke<PlayerTickDecision>('player_tick', {
+          request: {
+            currentTime: st.time,
+            totalDuration: st.duration,
+            nowMs: Date.now(),
+            lastSaveAtMs: lastSaveTimeRef.current,
+            saveIntervalMs: 5000,
+            lastSkipCheckAtMs: lastSkipCheckRef.current,
+            skipEnabled: skipConfigRef.current.enable,
+            introTime: skipConfigRef.current.intro_time,
+            outroTime: Math.abs(skipConfigRef.current.outro_time),
+            source: detailData?.source || null,
+            id: detailData?.id || null,
+            currentEpisode: detailData?.episodes ? idx : null,
+            totalEpisodes: detailData?.episodes?.length || null,
+          },
+        });
+        lastSaveTimeRef.current = tickDecision.nextLastSaveAtMs;
+        lastSkipCheckRef.current = tickDecision.nextLastSkipCheckAtMs;
+        if (tickDecision.shouldSaveProgress) {
+          void saveCurrentPlayProgress({
+            time: st.time,
+            duration: st.duration,
+          });
+        }
+        const skipAction = tickDecision.skipAction;
+        if (
+          skipAction &&
+          typeof skipAction === 'object' &&
+          'SkipIntro' in skipAction &&
+          st.time > 0.5
+        ) {
+          const targetTime = skipAction.SkipIntro;
+          await invoke('mpv_embed_command', {
+            cmd: ['seek', targetTime, 'absolute'],
+          });
+          showToast(`跳过片头，跳转到 ${formatTime(targetTime)}`, 'success');
+        } else if (skipAction === 'SkipOutro' && st.time < st.duration - 1) {
+          if (
+            currentEpisodeIndexRef.current <
+            (detailRef.current?.episodes?.length || 1) - 1
+          ) {
+            showToast('跳过片尾，跳转到下一集', 'info');
+            setTimeout(() => handleNextEpisode(), 500);
+          } else {
+            await invoke('mpv_embed_command', {
+              cmd: ['set_property', 'pause', true],
+            });
+            showToast('跳过片尾，但当前已是最后一集', 'info');
+          }
+        }
+      } catch {
+        /* player_tick 失败静默: 下一轮重试 */
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [mpvState.active, mpvState.paused]);
 
   // 清理定时器
   useEffect(() => {
@@ -2209,6 +2476,17 @@ function PlayPageClient() {
       currentEpisodeIndex < 0
     ) {
       setError(`选集索引无效，当前共 ${totalEpisodes} 集`);
+      return;
+    }
+
+    // mpv 嵌入模式: 视频由原生子窗口接管, Plyr 不加载。
+    // m3u8 源 WebView2 能放 → 自动切回内置播放器。
+    if (mpvActiveRef.current) {
+      if (isMsePlayableUrl(videoUrl)) {
+        void exitMpvMode(true);
+      } else {
+        void launchMpvExternal(videoUrl, currentEpisodeTitle());
+      }
       return;
     }
 
@@ -2368,9 +2646,13 @@ function PlayPageClient() {
       video.addEventListener('loadeddata', hevcFallback, { once: true });
       // loadeddata 后再给 2s 窗口确认 videoWidth 仍为 0 (部分容器元数据晚到)
       const hevcTimer = window.setTimeout(() => hevcFallback(), 2000);
-      video.addEventListener('loadedmetadata', () => {
-        if (video.videoWidth > 0) window.clearTimeout(hevcTimer);
-      }, { once: true });
+      video.addEventListener(
+        'loadedmetadata',
+        () => {
+          if (video.videoWidth > 0) window.clearTimeout(hevcTimer);
+        },
+        { once: true },
+      );
 
       // Plyr 的 autoplay 仅在播放器实例创建时生效一次，后续选集换源后
       // 需要重新在 canplay 时触发一次播放
@@ -2715,6 +2997,7 @@ function PlayPageClient() {
     totalEpisodes,
     videoCover,
     blockAdEnabled,
+    plyrReloadTick,
   ]);
 
   // 当组件卸载时清理定时器、Wake Lock 和播放器资源
@@ -3089,14 +3372,113 @@ function PlayPageClient() {
                 </div>
               )}
 
-              {/* 加载中的提示 */}
-              {isVideoLoading && (
+              {/* 加载中的提示 (mpv 嵌入模式时画面由原生子窗口负责, 不盖遮罩) */}
+              {isVideoLoading && !mpvState.active && (
                 <div className='absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm'>
                   <div className='flex flex-col items-center gap-3'>
                     <span className='text-white/80 text-sm'>
                       正在加载视频...
                     </span>
                   </div>
+                </div>
+              )}
+
+              {/* mpv 嵌入模式控制条: 画面由原生子窗口渲染(占满上方),
+                  此条恰好占据 mpv rect 扣除的底部预留高度 */}
+              {mpvState.active && (
+                <div className='absolute inset-x-0 bottom-0 z-30 flex h-12 items-center gap-2 bg-black/95 px-3 text-white'>
+                  <button
+                    type='button'
+                    aria-label={mpvState.paused ? '播放' : '暂停'}
+                    className='tap-target shrink-0 p-1 transition-opacity hover:opacity-80'
+                    onClick={() => {
+                      void invoke('mpv_embed_command', {
+                        cmd: ['cycle', 'pause'],
+                      }).catch(() => {});
+                    }}
+                  >
+                    {mpvState.paused ? (
+                      <Play className='h-5 w-5' />
+                    ) : (
+                      <Pause className='h-5 w-5' />
+                    )}
+                  </button>
+                  <button
+                    type='button'
+                    aria-label='播放上一集'
+                    className='tap-target shrink-0 p-1 transition-opacity hover:opacity-80'
+                    onClick={() => handlePreviousEpisode()}
+                  >
+                    <SkipBack className='h-4 w-4' />
+                  </button>
+                  <span className='shrink-0 text-xs tabular-nums text-white/90'>
+                    {formatTime(mpvState.time)} /{' '}
+                    {formatTime(mpvState.duration)}
+                  </span>
+                  <input
+                    type='range'
+                    min={0}
+                    max={mpvState.duration || 0}
+                    step={0.1}
+                    value={Math.min(mpvState.time, mpvState.duration || 0)}
+                    aria-label='播放进度'
+                    onChange={(e) => {
+                      const t = Number(e.target.value);
+                      setMpvState((s) => ({ ...s, time: t }));
+                      void invoke('mpv_embed_command', {
+                        cmd: ['seek', t, 'absolute'],
+                      }).catch(() => {});
+                    }}
+                    className='h-1 min-w-0 flex-1 accent-emerald-500'
+                  />
+                  <button
+                    type='button'
+                    className='shrink-0 rounded px-1.5 py-0.5 text-xs tabular-nums text-white/90 ring-1 ring-white/25 transition-colors hover:bg-white/10'
+                    title='播放速度'
+                    onClick={() => {
+                      const nextIdx = (mpvSpeedIdx + 1) % MPV_SPEEDS.length;
+                      setMpvSpeedIdx(nextIdx);
+                      void invoke('mpv_embed_command', {
+                        cmd: ['set_property', 'speed', MPV_SPEEDS[nextIdx]],
+                      }).catch(() => {});
+                    }}
+                  >
+                    {MPV_SPEEDS[mpvSpeedIdx]}x
+                  </button>
+                  <input
+                    type='range'
+                    min={0}
+                    max={100}
+                    step={5}
+                    value={mpvVolume}
+                    title='音量'
+                    aria-label='音量'
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setMpvVolume(v);
+                      void invoke('mpv_embed_command', {
+                        cmd: ['set_property', 'volume', v],
+                      }).catch(() => {});
+                    }}
+                    className='hidden h-1 w-16 shrink-0 accent-emerald-500 sm:block'
+                  />
+                  <button
+                    type='button'
+                    aria-label='播放下一集'
+                    className='tap-target shrink-0 p-1 transition-opacity hover:opacity-80'
+                    onClick={() => handleNextEpisode()}
+                  >
+                    <SkipForward className='h-4 w-4' />
+                  </button>
+                  <button
+                    type='button'
+                    className='shrink-0 rounded px-2 py-0.5 text-xs text-white/80 ring-1 ring-white/25 transition-colors hover:bg-white/10'
+                    onClick={() => {
+                      void exitMpvMode(true);
+                    }}
+                  >
+                    切回内置
+                  </button>
                 </div>
               )}
 

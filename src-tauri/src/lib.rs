@@ -96,6 +96,7 @@ pub fn run() {
                 app.global_shortcut().register(boss_key_shortcut)?;
             }
             app.manage(StorageManager::new(app.handle()));
+            app.manage(commands::mpv_embed::MpvEmbedState::default());
             app.manage(commands::video::VideoCacheManager::new());
             app.manage(commands::video::SearchCacheManager::new());
             app.manage(commands::search::SearchResultCache::new());
@@ -205,6 +206,11 @@ pub fn run() {
             // 外部 mpv 播放 (WebView2 无 HEVC 扩展时网盘源的黑屏兜底)
             commands::mpv_player::launch_mpv,
             commands::mpv_player::mpv_available,
+            // mpv --wid 嵌入播放 (方案 B: 原生子窗口渲染 + JSON IPC 受控)
+            commands::mpv_embed::mpv_embed_launch,
+            commands::mpv_embed::mpv_embed_sync,
+            commands::mpv_embed::mpv_embed_command,
+            commands::mpv_embed::mpv_embed_close,
             commands::settings::get_settings_bootstrap,
             commands::config::is_adult_source,
             // 跳过片头片尾
@@ -317,6 +323,7 @@ pub fn run() {
         .run(|_app, event| {
             if let tauri::RunEvent::Exit = event {
                 tauri::async_runtime::block_on(quantumtv_core::bridge::shutdown());
+                _app.state::<commands::mpv_embed::MpvEmbedState>().shutdown();
             }
         });
 }
