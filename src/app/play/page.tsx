@@ -99,8 +99,7 @@ const videoCanBoost = (video: HTMLVideoElement | null | undefined): boolean => {
 const isMsePlayableUrl = (url: string): boolean =>
   /\.m3u8($|\?)/i.test(url) && Hls.isSupported();
 
-// mpv 嵌入模式(方案 B): 视频画面由原生子窗口渲染, 底部预留一条 DOM 控制条
-const MPV_CONTROL_BAR_H = 48;
+// mpv 播放模式(方案 C): mpv 以独立窗口渲染, 页面内是"遥控面板"状态卡
 const MPV_SPEEDS = [1, 1.25, 1.5, 2, 3, 0.75, 0.5];
 
 function PlayPageClient() {
@@ -536,7 +535,7 @@ function PlayPageClient() {
       setIsVideoLoading(false);
       setMpvState((s) => {
         if (s.active) return s;
-        showToast('已切换到 mpv 嵌入播放', 'info');
+        showToast('已切换到 mpv 播放 (独立窗口, 已置顶)', 'info');
         return {
           active: true,
           time: startTime || 0,
@@ -2273,50 +2272,7 @@ function PlayPageClient() {
     };
   }, [mpvState.active]);
 
-  // mpv 子窗口 rect 同步: 视频区 rect 扣除底部控制条高度, CSS 坐标 × DPR。
-  // resize/scroll 会高频触发, 拖拽窗口时每帧一次; 同步走 rAF 合帧 +
-  // 尺寸去重, 避免 IPC 风暴拖累主线程。
-  useEffect(() => {
-    if (!mpvState.active) return;
-    let raf = 0;
-    let last = '';
-    const sync = () => {
-      const el = playerContainerRef.current;
-      if (!el) return;
-      const r = el.getBoundingClientRect();
-      const key = `${r.left},${r.top},${r.width},${r.height},${
-        window.devicePixelRatio || 1
-      }`;
-      if (key === last) return;
-      last = key;
-      void invoke('mpv_embed_sync', {
-        x: r.left,
-        y: r.top,
-        w: r.width,
-        h: Math.max(0, r.height - MPV_CONTROL_BAR_H),
-        scale: window.devicePixelRatio || 1,
-      }).catch(() => {});
-    };
-    const scheduleSync = () => {
-      if (raf) return;
-      raf = requestAnimationFrame(() => {
-        raf = 0;
-        sync();
-      });
-    };
-    scheduleSync();
-    const el = playerContainerRef.current;
-    const ro = new ResizeObserver(scheduleSync);
-    if (el) ro.observe(el);
-    window.addEventListener('resize', scheduleSync);
-    window.addEventListener('scroll', scheduleSync, true);
-    return () => {
-      if (raf) cancelAnimationFrame(raf);
-      ro.disconnect();
-      window.removeEventListener('resize', scheduleSync);
-      window.removeEventListener('scroll', scheduleSync, true);
-    };
-  }, [mpvState.active, isPageFullscreen]);
+  // mpv 子窗口 rect 同步: 已随方案 B 弃用 (C 为独立窗口, 无需几何同步)
 
   // 播完连播: eof-reached → 下一集 / 提示最后一集
   useEffect(() => {
@@ -3395,7 +3351,7 @@ function PlayPageClient() {
                 </div>
               )}
 
-              {/* 加载中的提示 (mpv 嵌入模式时画面由原生子窗口负责, 不盖遮罩) */}
+              {/* 加载中的提示 (mpv 模式画面在独立窗口, 不盖遮罩) */}
               {isVideoLoading && !mpvState.active && (
                 <div className='absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm'>
                   <div className='flex flex-col items-center gap-3'>
@@ -3406,102 +3362,115 @@ function PlayPageClient() {
                 </div>
               )}
 
-              {/* mpv 嵌入模式控制条: 画面由原生子窗口渲染(占满上方),
-                  此条恰好占据 mpv rect 扣除的底部预留高度 */}
+              {/* mpv 模式: 画面在独立 mpv 窗口, 这里是遥控面板 */}
               {mpvState.active && (
-                <div className='absolute inset-x-0 bottom-0 z-30 flex h-12 items-center gap-2 bg-black/95 px-3 text-white'>
-                  <button
-                    type='button'
-                    aria-label={mpvState.paused ? '播放' : '暂停'}
-                    className='tap-target shrink-0 p-1 transition-opacity hover:opacity-80'
-                    onClick={() => {
-                      void invoke('mpv_embed_command', {
-                        cmd: ['cycle', 'pause'],
-                      }).catch(() => {});
-                    }}
-                  >
-                    {mpvState.paused ? (
-                      <Play className='h-5 w-5' />
-                    ) : (
-                      <Pause className='h-5 w-5' />
-                    )}
-                  </button>
-                  <button
-                    type='button'
-                    aria-label='播放上一集'
-                    className='tap-target shrink-0 p-1 transition-opacity hover:opacity-80'
-                    onClick={() => handlePreviousEpisode()}
-                  >
-                    <SkipBack className='h-4 w-4' />
-                  </button>
-                  <span className='shrink-0 text-xs tabular-nums text-white/90'>
+                <div className='absolute inset-0 z-30 flex flex-col items-center justify-center gap-4 bg-black px-4 text-white'>
+                  <div className='flex items-center gap-2 text-sm text-white/70'>
+                    <span className='inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-400' />
+                    正在通过 mpv 播放 · {currentEpisodeTitle()}
+                  </div>
+                  <div className='text-2xl font-semibold tabular-nums'>
                     {formatTime(mpvState.time)} /{' '}
                     {formatTime(mpvState.duration)}
-                  </span>
-                  <input
-                    type='range'
-                    min={0}
-                    max={mpvState.duration || 0}
-                    step={0.1}
-                    value={Math.min(mpvState.time, mpvState.duration || 0)}
-                    aria-label='播放进度'
-                    onChange={(e) => {
-                      const t = Number(e.target.value);
-                      setMpvState((s) => ({ ...s, time: t }));
-                      void invoke('mpv_embed_command', {
-                        cmd: ['seek', t, 'absolute'],
-                      }).catch(() => {});
-                    }}
-                    className='h-1 min-w-0 flex-1 accent-emerald-500'
-                  />
-                  <button
-                    type='button'
-                    className='shrink-0 rounded px-1.5 py-0.5 text-xs tabular-nums text-white/90 ring-1 ring-white/25 transition-colors hover:bg-white/10'
-                    title='播放速度'
-                    onClick={() => {
-                      const nextIdx = (mpvSpeedIdx + 1) % MPV_SPEEDS.length;
-                      setMpvSpeedIdx(nextIdx);
-                      void invoke('mpv_embed_command', {
-                        cmd: ['set_property', 'speed', MPV_SPEEDS[nextIdx]],
-                      }).catch(() => {});
-                    }}
-                  >
-                    {MPV_SPEEDS[mpvSpeedIdx]}x
-                  </button>
-                  <input
-                    type='range'
-                    min={0}
-                    max={100}
-                    step={5}
-                    value={mpvVolume}
-                    title='音量'
-                    aria-label='音量'
-                    onChange={(e) => {
-                      const v = Number(e.target.value);
-                      setMpvVolume(v);
-                      void invoke('mpv_embed_command', {
-                        cmd: ['set_property', 'volume', v],
-                      }).catch(() => {});
-                    }}
-                    className='hidden h-1 w-16 shrink-0 accent-emerald-500 sm:block'
-                  />
-                  <button
-                    type='button'
-                    aria-label='播放下一集'
-                    className='tap-target shrink-0 p-1 transition-opacity hover:opacity-80'
-                    onClick={() => handleNextEpisode()}
-                  >
-                    <SkipForward className='h-4 w-4' />
-                  </button>
-                  <button
-                    type='button'
-                    className='shrink-0 rounded px-2 py-0.5 text-xs text-white/80 ring-1 ring-white/25 transition-colors hover:bg-white/10'
-                    onClick={() => {
-                      void exitMpvMode(true);
-                    }}
-                  >
-                    切回内置
-                  </button>
+                  </div>
+                  <div className='w-full max-w-md px-2'>
+                    <input
+                      type='range'
+                      min={0}
+                      max={mpvState.duration || 0}
+                      step={0.1}
+                      value={Math.min(mpvState.time, mpvState.duration || 0)}
+                      aria-label='播放进度'
+                      onChange={(e) => {
+                        const t = Number(e.target.value);
+                        setMpvState((s) => ({ ...s, time: t }));
+                        void invoke('mpv_embed_command', {
+                          cmd: ['seek', t, 'absolute'],
+                        }).catch(() => {});
+                      }}
+                      className='h-1.5 w-full accent-emerald-500'
+                    />
+                  </div>
+                  <div className='flex items-center gap-4'>
+                    <button
+                      type='button'
+                      aria-label='播放上一集'
+                      className='tap-target p-2 transition-opacity hover:opacity-80'
+                      onClick={() => handlePreviousEpisode()}
+                    >
+                      <SkipBack className='h-5 w-5' />
+                    </button>
+                    <button
+                      type='button'
+                      aria-label={mpvState.paused ? '播放' : '暂停'}
+                      className='flex h-12 w-12 items-center justify-center rounded-full bg-white/10 ring-1 ring-white/25 transition-colors hover:bg-white/20'
+                      onClick={() => {
+                        void invoke('mpv_embed_command', {
+                          cmd: ['cycle', 'pause'],
+                        }).catch(() => {});
+                      }}
+                    >
+                      {mpvState.paused ? (
+                        <Play className='h-6 w-6' />
+                      ) : (
+                        <Pause className='h-6 w-6' />
+                      )}
+                    </button>
+                    <button
+                      type='button'
+                      aria-label='播放下一集'
+                      className='tap-target p-2 transition-opacity hover:opacity-80'
+                      onClick={() => handleNextEpisode()}
+                    >
+                      <SkipForward className='h-5 w-5' />
+                    </button>
+                  </div>
+                  <div className='flex items-center gap-3 text-sm'>
+                    <button
+                      type='button'
+                      className='rounded px-2 py-1 tabular-nums ring-1 ring-white/25 transition-colors hover:bg-white/10'
+                      title='播放速度'
+                      onClick={() => {
+                        const nextIdx = (mpvSpeedIdx + 1) % MPV_SPEEDS.length;
+                        setMpvSpeedIdx(nextIdx);
+                        void invoke('mpv_embed_command', {
+                          cmd: ['set_property', 'speed', MPV_SPEEDS[nextIdx]],
+                        }).catch(() => {});
+                      }}
+                    >
+                      {MPV_SPEEDS[mpvSpeedIdx]}x
+                    </button>
+                    <input
+                      type='range'
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={mpvVolume}
+                      title='音量'
+                      aria-label='音量'
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        setMpvVolume(v);
+                        void invoke('mpv_embed_command', {
+                          cmd: ['set_property', 'volume', v],
+                        }).catch(() => {});
+                      }}
+                      className='h-1 w-24 accent-emerald-500'
+                    />
+                    <button
+                      type='button'
+                      className='rounded px-2 py-1 text-white/80 ring-1 ring-white/25 transition-colors hover:bg-white/10'
+                      onClick={() => {
+                        void exitMpvMode(true);
+                      }}
+                    >
+                      切回内置
+                    </button>
+                  </div>
+                  <p className='max-w-sm text-center text-xs text-white/50'>
+                    mpv 播放窗口已置顶打开, 可拖动/全屏;
+                    关闭该窗口将自动切回内置播放器
+                  </p>
                 </div>
               )}
 
