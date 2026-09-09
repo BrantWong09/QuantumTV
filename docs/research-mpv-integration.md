@@ -329,6 +329,22 @@ mpv 侧**没有等价的 manifest 重写钩子**：
 
 ## 8. 对 QuantumTV 的落地建议
 
+> **落地状态（2026-09-09）**：已按 **方案 B + IPC 受控（B+C 组合）** 实现，
+> commit `307eed5`（分支 `feat/player-optimize`）：
+> - Rust `commands/mpv_embed.rs`：主窗口内 STATIC 黑底子窗口作 mpv 渲染宿主
+>   （`--wid`），JSON IPC 命名管道（`\\.\pipe\quantumtv-mpv-embed`）下发
+>   loadfile/seek/pause/speed/volume；`observe_property` 回传
+>   playback-time（200ms 节流）/duration/pause/eof-reached → Tauri 事件
+>   `mpv-embed-event`；退出链路 quit → kill → 宿主窗口隐藏，进程退出兜底。
+> - 前端 `play/page.tsx`：mpv 模式下视频 rect（扣除底部 48px DOM 控制条）
+>   经 `mpv_embed_sync` 按 DPR 同步；控制条含播放/上下集/进度/倍速/音量/
+>   切回内置；快捷键经 IPC 转发；`player_tick` 复用实现进度保存与
+>   跳片头片尾；eof 自动连播；切到 m3u8 源自动回退内置播放器。
+> - 非 Windows 平台命令返回明确错误，行为不变。旧 `launch_mpv`（独立
+>   窗口）保留未删，前端已不再调用。
+> - 待真机验证项：WebView2 与子窗口的 z-order 表现（窗口缩放/最小化恢复/
+>   页面全屏切换时的遮挡关系）、mpv 管道就绪时序、老机器 HEVC 软解帧率。
+
 **推荐路线 C：受控外部 mpv（IPC 深度集成），分三步**：
 
 1. **修正确性（必做）**：`mpv_player.rs` 重写为管道受控模型——
