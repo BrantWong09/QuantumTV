@@ -72,8 +72,11 @@ pub async fn mpv_embed_launch(
 }
 
 /// 同步 mpv 宿主子窗口的位置/尺寸 (前端 CSS 坐标 × devicePixelRatio)。
+/// 必须在主线程执行 SetWindowPos: 跨线程对别的线程所属窗口调用会撞上
+/// 该线程阻塞的窗口过程 (mpv 渲染循环), 表现为整个应用未响应。
 #[tauri::command]
 pub async fn mpv_embed_sync(
+    app: tauri::AppHandle,
     state: tauri::State<'_, MpvEmbedState>,
     x: f64,
     y: f64,
@@ -83,11 +86,31 @@ pub async fn mpv_embed_sync(
 ) -> Result<(), String> {
     #[cfg(windows)]
     {
-        return sync_window(&state, x, y, w, h, scale);
+        let _ = &state;
+        let hwnd = app
+            .state::<MpvEmbedState>()
+            .hwnd
+            .lock()
+            .unwrap()
+            .clone();
+        let Some(raw) = hwnd else {
+            return Err("mpv 宿主窗口未创建".into());
+        };
+        let (fx, fy, fw, fh) = (
+            (x * scale).round() as i32,
+            (y * scale).round() as i32,
+            (w * scale).round() as i32,
+            (h * scale).round() as i32,
+        );
+        app.run_on_main_thread(move || {
+            let _ = sync_window_raw(raw, fx, fy, fw, fh);
+        })
+        .map_err(|e| format!("调度主线程失败: {e}"))?;
+        return Ok(());
     }
     #[cfg(not(windows))]
     {
-        let _ = (&state, &x, &y, &w, &h, &scale);
+        let _ = (&app, &state, &x, &y, &w, &h, &scale);
         Err("mpv 嵌入播放仅支持 Windows".into())
     }
 }
@@ -110,7 +133,10 @@ pub async fn mpv_embed_command(
 
 /// 退出 mpv 嵌入播放: 优雅 quit → 超时 kill, 隐藏宿主窗口。
 #[tauri::command]
-pub async fn mpv_embed_close(state: tauri::State<'_, MpvEmbedState>) -> Result<(), String> {
+pub async fn mpv_embed_close(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MpvEmbedState>,
+) -> Result<(), String> {
     if let Some(tx) = state.writer.lock().unwrap().clone() {
         let _ = tx.send(serde_json::json!({ "command": ["quit"] }).to_string());
     }
@@ -125,7 +151,12 @@ pub async fn mpv_embed_close(state: tauri::State<'_, MpvEmbedState>) -> Result<(
     state.pending.lock().unwrap().clear();
     #[cfg(windows)]
     {
-        let _ = show_host_window(&state, false);
+        let hwnd = state.hwnd.lock().unwrap().clone();
+        if let Some(raw) = hwnd {
+            let _ = app.run_on_main_thread(move || {
+                let _ = show_host_window_raw(raw, false);
+            });
+        }
     }
     Ok(())
 }
@@ -145,7 +176,10 @@ async fn embed_launch(
     })?;
 
     let hwnd_raw = ensure_host_window(app, state)?;
-    let _ = show_host_window(state, true);
+    // STATIC 子窗口在主线程创建后默认贴底; 拉起时提到 WebView2 之上
+    let _ = app.run_on_main_thread(move || {
+        let _ = show_host_window_raw(hwnd_raw, true);
+    });
 
     // 进程活着 → 前端直接经 IPC loadfile 换源, 不重复 spawn
     {
@@ -221,14 +255,15 @@ unsafe fn create_static_child(parent: *mut std::ffi::c_void) -> Result<isize, St
     use windows::core::w;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW, WINDOW_EX_STYLE,
-        WINDOW_STYLE, WS_CHILD, WS_VISIBLE,
+        CreateWindowExW, SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW, WINDOW_STYLE,
+        WS_CHILD, WS_EX_NOACTIVATE, WS_VISIBLE,
     };
 
     // SS_BLACKRECT (= 0x4, 系统类 STATIC 的黑底填充样式) 位于
-    // Win32::System::SystemServices, 为省一个 feature 直接写数值
+    // Win32::System::SystemServices, 为省一个 feature 直接写数值。
+    // WS_EX_NOACTIVATE: 点击 mpv 画面不抢键盘焦点, 避免页面交互"卡死"体感。
     let hwnd = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
+        WS_EX_NOACTIVATE,
         w!("STATIC"),
         w!("QuantumTVMpvHost"),
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(4),
@@ -248,18 +283,16 @@ unsafe fn create_static_child(parent: *mut std::ffi::c_void) -> Result<isize, St
 }
 
 #[cfg(windows)]
-fn show_host_window(state: &MpvEmbedState, show: bool) -> Result<(), String> {
+fn show_host_window_raw(raw: isize, show: bool) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    };
-    let Some(raw) = *state.hwnd.lock().unwrap() else {
-        return Ok(());
+        SetWindowPos, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SWP_SHOWWINDOW,
     };
     let flags = if show {
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW
     } else {
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_HIDEWINDOW
     };
     unsafe {
         SetWindowPos(
@@ -277,30 +310,26 @@ fn show_host_window(state: &MpvEmbedState, show: bool) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn sync_window(
-    state: &tauri::State<'_, MpvEmbedState>,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    scale: f64,
+fn sync_window_raw(
+    raw: isize,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
 ) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    };
-    let Some(raw) = *state.hwnd.lock().unwrap() else {
-        return Err("mpv 宿主窗口未创建".into());
+        SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
     };
     unsafe {
         SetWindowPos(
             HWND(raw as *mut std::ffi::c_void),
             HWND::default(),
-            (x * scale).round() as i32,
-            (y * scale).round() as i32,
-            (w * scale).round() as i32,
-            (h * scale).round() as i32,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            x,
+            y,
+            w,
+            h,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )
         .map_err(|e| format!("同步 mpv 宿主窗口位置失败: {e}"))?;
     }

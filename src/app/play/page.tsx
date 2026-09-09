@@ -2267,13 +2267,22 @@ function PlayPageClient() {
     };
   }, [mpvState.active]);
 
-  // mpv 子窗口 rect 同步: 视频区 rect 扣除底部控制条高度, CSS 坐标 × DPR
+  // mpv 子窗口 rect 同步: 视频区 rect 扣除底部控制条高度, CSS 坐标 × DPR。
+  // resize/scroll 会高频触发, 拖拽窗口时每帧一次; 同步走 rAF 合帧 +
+  // 尺寸去重, 避免 IPC 风暴拖累主线程。
   useEffect(() => {
     if (!mpvState.active) return;
+    let raf = 0;
+    let last = '';
     const sync = () => {
       const el = playerContainerRef.current;
       if (!el) return;
       const r = el.getBoundingClientRect();
+      const key = `${r.left},${r.top},${r.width},${r.height},${
+        window.devicePixelRatio || 1
+      }`;
+      if (key === last) return;
+      last = key;
       void invoke('mpv_embed_sync', {
         x: r.left,
         y: r.top,
@@ -2282,16 +2291,24 @@ function PlayPageClient() {
         scale: window.devicePixelRatio || 1,
       }).catch(() => {});
     };
-    sync();
+    const scheduleSync = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        sync();
+      });
+    };
+    scheduleSync();
     const el = playerContainerRef.current;
-    const ro = new ResizeObserver(sync);
+    const ro = new ResizeObserver(scheduleSync);
     if (el) ro.observe(el);
-    window.addEventListener('resize', sync);
-    window.addEventListener('scroll', sync, true);
+    window.addEventListener('resize', scheduleSync);
+    window.addEventListener('scroll', scheduleSync, true);
     return () => {
+      if (raf) cancelAnimationFrame(raf);
       ro.disconnect();
-      window.removeEventListener('resize', sync);
-      window.removeEventListener('scroll', sync, true);
+      window.removeEventListener('resize', scheduleSync);
+      window.removeEventListener('scroll', scheduleSync, true);
     };
   }, [mpvState.active, isPageFullscreen]);
 
