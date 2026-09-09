@@ -296,10 +296,12 @@ unsafe fn create_static_child(parent: *mut std::ffi::c_void) -> Result<isize, St
 fn show_host_window_raw(raw: isize, show: bool) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SetWindowPos, HWND_TOP, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
         SWP_SHOWWINDOW,
     };
     let flags = if show {
+        // 显示时提到同层兄弟 (WebView2) 之上, 一次性 (hinsertafter=TOP);
+        // 之后 sync 只改几何, 避免拖拽期间高频 z 序遍历卡死模态循环
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
     } else {
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW
@@ -307,7 +309,7 @@ fn show_host_window_raw(raw: isize, show: bool) -> Result<(), String> {
     unsafe {
         SetWindowPos(
             HWND(raw as *mut std::ffi::c_void),
-            HWND::default(),
+            if show { HWND_TOP } else { HWND::default() },
             0,
             0,
             0,
@@ -329,21 +331,21 @@ fn sync_window_raw(
 ) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+        SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
     };
     unsafe {
-        // 每次同步都把子窗口提到同层兄弟 (WebView2) 之上: WebView2 运行时
-        // 可能会在布局变化时把自己的 HWND 重新置顶, 不主动提升的话
-        // mpv 画面会被网页内容盖住 (用户实测"视频本身看不到")。
-        // 只提一层 (HWND_TOP), 不用 TOPMOST 避免盖过应用外的置顶窗口。
+        // 移动/缩放只改几何 (SWP_NOZORDER)。z 序仅在显示时用 HWND_TOP 提升
+        // 一次: 拖拽窗口期间每次 sync 都重设 z 序, SetWindowPos 会同步遍历
+        // 同层兄弟 (含 WebView2 跨进程窗口) 的 WM_WINDOWPOSCHANGING, 高频
+        // 调用会把模态拖拽循环卡死 —— 表现为窗口不能拖动/最大化。
         SetWindowPos(
             HWND(raw as *mut std::ffi::c_void),
-            HWND_TOP,
+            HWND::default(),
             x,
             y,
             w,
             h,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )
         .map_err(|e| format!("同步 mpv 宿主窗口位置失败: {e}"))?;
     }
