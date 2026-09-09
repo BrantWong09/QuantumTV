@@ -257,7 +257,77 @@ mpv 侧**没有等价的 manifest 重写钩子**：
 | 工作量估计 | 大（3-5 人周级，风险高） | 中（2-3 人周级，合成未知数） | 小（2-4 天级） |
 | 许可 | GPL dll 随包分发需附源码声明 | 同左 | 同左（且用户自备） |
 
-## 7. 对 QuantumTV 的落地建议
+## 7. Web 原生解码播放器横向对比（2026-09-09 补充）
+
+除了 mpv，还有没有"web 原生、解码能力强大"的播放器可以替代现有 Plyr+hls.js 栈？
+按解码能力来源分两类查证。
+
+### 7.1 前提事实：WebView2 的 HEVC 支持边界
+
+- Chromium 自 **107**（2022-10）起原生支持 HEVC 硬解播放："Chrome 107, which
+  supports HEVC hardware decoding for all platforms 'out of the box', if the
+  hardware is supported"；Windows 7+ 仅限"devices with supported hardware"。
+  （Wikipedia HEVC → Software support，转引 Chrome 107 发布说明：
+  https://en.wikipedia.org/wiki/High_Efficiency_Video_Coding#Software_support ）
+- Microsoft Edge 更早（77 起）在 Windows 10 1709+ 依赖系统 HEVC Video Extensions
+  + 受支持硬件提供支持（同上来源）。
+- Chromium **没有 HEVC 软解回退**：文档通篇限定 hardware decoding。
+- 推论：QuantumTV 在无 HEVC 硬解的机器（老 CPU/老显卡/缺扩展）上黑屏有声，
+  是**机器级缺解码器**，不是 WebView2 缺能力。任何走系统硬解通道的 Web 播放器
+  （WebCodecs 系）在该机器上同样无解。
+
+### 7.2 WebCodecs 硬解路线（与 `<video>` 同源，救不了无硬解机器）
+
+| 项目 | 许可 | 现状 | 与 hls.js 栈的关系 |
+|---|---|---|---|
+| **xgplayer**（bytedance） | MIT | v3.0.26 活跃；自研 FLV/HLS/DASH 解析器（"A HTML5 video player with a parser that saves traffic"）；v2 生态有 h264/h265/aac **解析**工具（xgplayer-helper-codec），未见独立 wasm 软解 HEVC 内核 | 协议/容器层与 hls.js 重叠，无解码增益 |
+| **flv-h265.js / flv-h265** | 各异 | 独立 npm 包，HEVC-FLV + MSE 方案 | 只补 FLV+HEVC 这一窄场景 |
+
+结论：这一类播放器的解码通道就是系统硬解（WebCodecs / MSE 直通），
+**HEVC 黑屏问题上一分钱增益都没有**；对 QuantumTV 的潜在价值仅在协议层
+（FLV/增强 MP4/DASH），而当前源以 m3u8 为主，hls.js + 自定义 loader 已覆盖，
+不值得替换。
+
+### 7.3 WASM 软解路线（自带解码器，不挑机器）
+
+**libmedia**（zhaohappy/libmedia，LGPL-3.0，372 star，npm `@libmedia/avplayer`
+0.2.0，repo 最后 push 2026-06-27）是唯一真正"web 原生 + 全量解码"的候选：
+
+- 架构：TS 做 demux（可脱 SharedArrayBuffer/Worker 运行），解码用从 FFmpeg
+  libavcodec 编译的 **WASM**，有 WebCodecs 时切硬解。API 仿 FFmpeg。
+  （https://github.com/zhaohappy/libmedia README）
+- 软解覆盖：hevc、av1、vvc、vp8/9、mpeg1/2/4、wmv；音频 ac3/eac3、dts、wma、
+  flac 等。硬解（WebCodecs）仅 h264/hevc/av1/vp8/9 + aac/mp3/opus/flac，其中
+  hevc "只支持硬解"。
+- 容器：matroska/webm、mpegts、mp4、flv、ogg…（输入）；协议：hls、dash、rtmp、
+  rtsp（仅输入）。
+- 体积策略：每个编解码器单独编译 wasm，按需加载；分 baseline/atomic/simd/64
+  四档，"simd … 性能最高"，但"目前只有 h264 的 simd 解码器是手动优化的"。
+- 许可风险：本体 LGPL-3.0，"某些依赖库是 GPL 协议，如果你使用了这些依赖库则
+  libmedia 将被传染为 GPL 协议"（dist/encoder 下 x264/x265）。
+- 未列任何生产案例（README 无采用方信息，标注为风险项）。
+
+**对 QuantumTV 的适配代价**：
+- 4K HEVC wasm 软解性能存疑：simd 手动优化只做了 h264，HEVC 走编译器自动
+  向量化；多线程软解依赖 SharedArrayBuffer（COOP/COEP 响应头），Tauri 静态
+  服务需自行加头。目标机器恰是无硬解的老机器 → CPU 也弱，软解 4K 大概率卡。
+- QuantumTV 的去广告 manifest 重写、TauriHlsJsLoader 缓存/预取/测速全部要
+  在 libmedia 的 IO 层重新实现一遍。
+- 播放器壳（Plyr UI、手势层、快捷键、跳片头片尾 tick 集成）全部重接。
+
+### 7.4 横向结论
+
+| 方案 | HEVC 无硬解机器 | 去广告 m3u8 | 改造成本 | 定位 |
+|---|---|---|---|---|
+| 现有 Plyr+hls.js | ✗（黑屏兜 mpv） | ✓ | 0 | 默认播放器 |
+| WebCodecs 系（xgplayer 等） | ✗（同源硬解） | 需重写 | 中 | 无增益，不采纳 |
+| libmedia（wasm 软解） | ✓ 理论可行，性能存疑 | 需重写 | 大 | 1080p 级备选，先 demo 验证帧率再评估 |
+| mpv 兜底（路线 C） | ✓ 原生硬解 | ✗（可代理层补） | 小 | 解码兜底正解 |
+
+维持 §7 之前的推荐不变：hls.js 栈 + 受控 mpv 兜底。libmedia 若要跟进，先做一个
+独立 demo 页在目标低配机器上实测 1080p/4K HEVC 软解帧率，数据说话。
+
+## 8. 对 QuantumTV 的落地建议
 
 **推荐路线 C：受控外部 mpv（IPC 深度集成），分三步**：
 
@@ -291,5 +361,9 @@ libmpv2 crate 成熟出 D3D11 支持再评估。
 - libmpv2 crate：https://crates.io/crates/libmpv2 / https://github.com/kohsine/libmpv-rs
 - shinchiro 预编译（mpv-dev 31.4MB 7z）：https://sourceforge.net/projects/mpv-player-windows/files/libmpv/
 - mpv 官方 CI 构建（仅 mpv.exe，无 mpv-dev）：https://github.com/mpv-player/mpv/releases/tag/git-release
+- Chromium HEVC 硬解起始版本与条件：https://en.wikipedia.org/wiki/High_Efficiency_Video_Coding#Software_support （转引 Chrome 107 发布说明，2026-09-09 查证）
+- xgplayer：https://github.com/bytedance/xgplayer （README 自研解析器描述、MIT 许可，2026-09-09 查证）
+- libmedia：https://github.com/zhaohappy/libmedia （README 软解覆盖/体积策略/许可声明，2026-09-09 查证）；npm https://registry.npmjs.org/@libmedia/avplayer
 
-（除注明"无一手来源"外，以上结论均有一手文档/源码支撑；查证时间 2026-09-08。）
+（除注明"无一手来源"外，以上结论均有一手文档/源码支撑；查证时间 2026-09-08，
+§7 补充部分查证于 2026-09-09。）
