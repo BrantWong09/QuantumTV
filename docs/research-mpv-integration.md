@@ -329,21 +329,23 @@ mpv 侧**没有等价的 manifest 重写钩子**：
 
 ## 8. 对 QuantumTV 的落地建议
 
-> **落地状态（2026-09-09）**：已按 **方案 B + IPC 受控（B+C 组合）** 实现，
-> commit `307eed5`（分支 `feat/player-optimize`）：
-> - Rust `commands/mpv_embed.rs`：主窗口内 STATIC 黑底子窗口作 mpv 渲染宿主
->   （`--wid`），JSON IPC 命名管道（`\\.\pipe\quantumtv-mpv-embed`）下发
->   loadfile/seek/pause/speed/volume；`observe_property` 回传
->   playback-time（200ms 节流）/duration/pause/eof-reached → Tauri 事件
->   `mpv-embed-event`；退出链路 quit → kill → 宿主窗口隐藏，进程退出兜底。
-> - 前端 `play/page.tsx`：mpv 模式下视频 rect（扣除底部 48px DOM 控制条）
->   经 `mpv_embed_sync` 按 DPR 同步；控制条含播放/上下集/进度/倍速/音量/
->   切回内置；快捷键经 IPC 转发；`player_tick` 复用实现进度保存与
->   跳片头片尾；eof 自动连播；切到 m3u8 源自动回退内置播放器。
-> - 非 Windows 平台命令返回明确错误，行为不变。旧 `launch_mpv`（独立
->   窗口）保留未删，前端已不再调用。
-> - 待真机验证项：WebView2 与子窗口的 z-order 表现（窗口缩放/最小化恢复/
->   页面全屏切换时的遮挡关系）、mpv 管道就绪时序、老机器 HEVC 软解帧率。
+> **落地状态（2026-09-09）**：
+>
+> **方案 B（--wid 嵌入）实测否决。** 按嵌入路线实现并迭代七轮
+> （commit `307eed5`..`83be32b`），依次修复：跨线程 SetWindowPos/
+> CreateWindowExW 撞消息循环（整页未响应）→ 子窗口遮挡整页 → 双进度条
+> → WebView2 重排盖住子窗口 → 拖拽期间高频 z 序重设卡死模态循环 →
+> mpv 内层渲染窗口截获鼠标事件（整页锁死的总根因）→ 尝试
+> WS_EX_TRANSPARENT 穿透 + WS_EX_LAYERED 后 STATIC+layered 组合在
+> WebView2 环境创建直接失败（"操作成功完成 0x00000000"）。结论：
+> **Win32 airspace 下 mpv 内层自建窗口与 WebView2 的输入/z 序/合成
+> 冲突不可在同一 HWND 树内彻底解决**，与调研时"无社区先例"的判断一致。
+>
+> **已切换方案 C（独立窗口 + JSON IPC 受控）**：mpv.exe 独立窗口
+> （--ontop 置顶），宿主零窗口操作；IPC 层（命名管道 + observe_property
+> 回传 + loadfile 换源 + 单实例复用）完整复用 B 的成果；前端视频区
+> 渲染"遥控面板"（进度/暂停/上下集/倍速/音量/切回内置）。此路线下
+> airspace/焦点/z 序三类问题从结构上不存在。
 
 **推荐路线 C：受控外部 mpv（IPC 深度集成），分三步**：
 
