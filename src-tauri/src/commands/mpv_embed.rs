@@ -175,11 +175,46 @@ async fn embed_launch(
         "未找到 mpv 播放器。请把 mpv.exe 放到应用数据目录 mpv/ 下".to_string()
     })?;
 
-    let hwnd_raw = ensure_host_window(app, state)?;
-    // STATIC 子窗口在主线程创建后默认贴底; 拉起时提到 WebView2 之上
-    let _ = app.run_on_main_thread(move || {
-        let _ = show_host_window_raw(hwnd_raw, true);
-    });
+    // 子窗口的创建/显示/定位必须全部在主线程执行: CreateWindowExW 会同步
+    // 发消息给父窗口 (主线程), 在 async 命令线程调用同样会互撞消息循环;
+    // 且 CreateWindowExW 是阻塞调用, 不能放进 run_on_main_thread 后同步等
+    // 结果 —— 先在当前线程创建好"占位计划", 由主线程闭包完成创建并回填句柄。
+    // 用 channel 等待创建完成 (限 5s), 失败即报错。
+    let app2 = app.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<isize, String>>();
+    let hwnd_exists = state.hwnd.lock().unwrap().is_some();
+    if hwnd_exists {
+        // 已有宿主窗口: 仅显示
+        let raw = *state.hwnd.lock().unwrap();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(raw) = raw {
+                let _ = show_host_window_raw(raw, true);
+            }
+        });
+    } else {
+        let parent_hwnd = {
+            let win = app
+                .get_webview_window("main")
+                .ok_or("找不到主窗口")?;
+            win.hwnd().map_err(|e| format!("获取主窗口句柄失败: {e}"))?
+        };
+        let parent_raw = parent_hwnd.0 as isize;
+        let _ = app2.run_on_main_thread(move || {
+            let r = unsafe { create_static_child(parent_raw as *mut std::ffi::c_void) };
+            let _ = tx.send(r);
+        });
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| "创建 mpv 宿主窗口超时".to_string())
+            .and_then(|r| r.map_err(|e| format!("创建任务失败: {e}")))?;
+        let hwnd = created?;
+        *state.hwnd.lock().unwrap() = Some(hwnd);
+    }
+    let hwnd_raw = state
+        .hwnd
+        .lock()
+        .unwrap()
+        .ok_or("mpv 宿主窗口句柄缺失")?;
 
     // 进程活着 → 前端直接经 IPC loadfile 换源, 不重复 spawn
     {
@@ -228,28 +263,8 @@ async fn embed_launch(
     })
 }
 
-/// 取主窗口 HWND 并创建 (一次) STATIC 黑底子窗口作为 mpv 宿主。
-#[cfg(windows)]
-fn ensure_host_window(
-    app: &tauri::AppHandle,
-    state: &MpvEmbedState,
-) -> Result<isize, String> {
-    if let Some(h) = *state.hwnd.lock().unwrap() {
-        return Ok(h);
-    }
-    let win = app
-        .get_webview_window("main")
-        .ok_or("找不到主窗口")?;
-    let parent_hwnd = win.hwnd().map_err(|e| format!("获取主窗口句柄失败: {e}"))?;
-    // tauri/wry 的 HWND 与本地 windows crate 版本可能不同, 经原始指针转换
-    let parent_ptr = parent_hwnd.0 as *mut std::ffi::c_void;
-    let child = unsafe { create_static_child(parent_ptr) }?;
-    *state.hwnd.lock().unwrap() = Some(child);
-    Ok(child)
-}
-
 /// 系统预注册的 STATIC 类 + SS_BLACKRECT: 免自注册窗口类/消息循环,
-/// 黑底避免 mpv 启动前的白闪。
+/// 黑底避免 mpv 启动前的白闪。仅在主线程调用。
 #[cfg(windows)]
 unsafe fn create_static_child(parent: *mut std::ffi::c_void) -> Result<isize, String> {
     use windows::core::w;
