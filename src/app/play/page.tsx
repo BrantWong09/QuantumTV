@@ -495,6 +495,8 @@ function PlayPageClient() {
   }, [mpvState.active]);
   // 已通过 loadfile 播放的地址 (同集不重复下发)
   const mpvLoadedUrlRef = useRef('');
+  // 用户手动关闭 mpv 窗口的地址: 抑制 HEVC 兜底对该地址再次自动拉起 (防循环)
+  const suppressAutoMpvRef = useRef('');
   // 退出 mpv 模式后 +1, 驱动 Plyr 重新加载
   const [plyrReloadTick, setPlyrReloadTick] = useState(0);
   // 嵌入模式本地控制状态
@@ -1066,8 +1068,9 @@ function PlayPageClient() {
       }
     }
   }
-  // 当集数索引变化时自动更新视频地址
+  // 当集数索引变化时自动更新视频地址; 换集解除 mpv 手动关闭抑制
   useEffect(() => {
+    suppressAutoMpvRef.current = '';
     void updateVideoUrl(detail, currentEpisodeIndex);
   }, [detail, currentEpisodeIndex]);
 
@@ -2262,7 +2265,10 @@ function PlayPageClient() {
       } else if (p.kind === 'dead') {
         // 主动退出(close → quit)也会触发 dead, 此时 mpvActiveRef 已为 false
         if (!mpvActiveRef.current) return;
-        showToast('mpv 播放器已退出', 'info');
+        // 用户手动关掉 mpv 窗口: 记住这个地址, 抑制 HEVC 兜底再次自动拉起
+        // —— 否则 兜底→mpv→用户关窗→dead→切回内置→兜底… 死循环
+        suppressAutoMpvRef.current = mpvLoadedUrlRef.current;
+        showToast('mpv 播放器已关闭，已切回内置播放器', 'info');
         void exitMpvMode(true);
       }
     });
@@ -2612,6 +2618,12 @@ function PlayPageClient() {
         if (!url.includes('/netdisk/file.mp4?')) return;
         if (video.videoWidth > 0) return; // 有画面, 不是解码问题
         if (video.readyState < 2) return; // 数据还没到, 不判断
+        // 用户刚手动关掉了这个地址的 mpv 窗口: 尊重选择, 不再自动拉起
+        // (否则 兜底→关窗→切回内置→再兜底 死循环); 换集后自动解除
+        if (suppressAutoMpvRef.current === url) {
+          console.log('[播放] 用户已手动关闭该源的 mpv 窗口, 跳过自动兜底');
+          return;
+        }
         console.warn(
           `[播放] 检测到黑屏有声(readyState=${video.readyState} videoWidth=0) → HEVC 兜底切 mpv`,
         );
