@@ -433,9 +433,11 @@ fn spawn_pipe_task(app: tauri::AppHandle) {
                     match name {
                         "playback-time" => {
                             if let Some(t) = v.get("data").and_then(|d| d.as_f64()) {
-                                // playback-time 逐帧变化, 节流到 200ms
+                                // playback-time 逐条事件推送, 节流到 500ms:
+                                // 每条都 emit → 前端 setMpvState → 播放页
+                                // (3000+ 行组件树) 全量重渲, 是卡顿主因之一
                                 if last_time_emit.elapsed()
-                                    >= std::time::Duration::from_millis(200)
+                                    >= std::time::Duration::from_millis(500)
                                 {
                                     last_time_emit = std::time::Instant::now();
                                     let _ = app2.emit(
