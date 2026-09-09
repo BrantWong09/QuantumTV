@@ -74,6 +74,8 @@ pub async fn mpv_embed_launch(
 /// 同步 mpv 宿主子窗口的位置/尺寸 (前端 CSS 坐标 × devicePixelRatio)。
 /// 必须在主线程执行 SetWindowPos: 跨线程对别的线程所属窗口调用会撞上
 /// 该线程阻塞的窗口过程 (mpv 渲染循环), 表现为整个应用未响应。
+/// 首次同步会把创建时隐藏的子窗口定位到视频区并显示 —— rect 之外的页面
+/// 区域从此可正常点击 (窗口只盖住视频区, 不挡整页)。
 #[tauri::command]
 pub async fn mpv_embed_sync(
     app: tauri::AppHandle,
@@ -182,16 +184,7 @@ async fn embed_launch(
     // 用 channel 等待创建完成 (限 5s), 失败即报错。
     let app2 = app.clone();
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<isize, String>>();
-    let hwnd_exists = state.hwnd.lock().unwrap().is_some();
-    if hwnd_exists {
-        // 已有宿主窗口: 仅显示
-        let raw = *state.hwnd.lock().unwrap();
-        let _ = app.run_on_main_thread(move || {
-            if let Some(raw) = raw {
-                let _ = show_host_window_raw(raw, true);
-            }
-        });
-    } else {
+    if state.hwnd.lock().unwrap().is_none() {
         let parent_hwnd = {
             let win = app
                 .get_webview_window("main")
@@ -210,6 +203,8 @@ async fn embed_launch(
         let hwnd = created?;
         *state.hwnd.lock().unwrap() = Some(hwnd);
     }
+    // 复用路径不主动 show: 窗口保持上次的可见状态 (visible 时本来就在
+    // 视频区 rect 上, 不可见时等前端下一次 sync 显示), 避免整客户区遮挡。
     let hwnd_raw = state
         .hwnd
         .lock()
@@ -270,30 +265,30 @@ unsafe fn create_static_child(parent: *mut std::ffi::c_void) -> Result<isize, St
     use windows::core::w;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW, WINDOW_STYLE,
-        WS_CHILD, WS_EX_NOACTIVATE, WS_VISIBLE,
+        CreateWindowExW, WINDOW_STYLE, WS_CHILD, WS_EX_NOACTIVATE,
     };
 
     // SS_BLACKRECT (= 0x4, 系统类 STATIC 的黑底填充样式) 位于
     // Win32::System::SystemServices, 为省一个 feature 直接写数值。
     // WS_EX_NOACTIVATE: 点击 mpv 画面不抢键盘焦点, 避免页面交互"卡死"体感。
+    // 创建时隐藏 (不带 WS_VISIBLE, 且 SWP_HIDEWINDOW): 此刻前端还没同步过
+    // 视频区 rect, 若直接 16x9 或整客户区可见, 会挡住 WebView2 的鼠标事件
+    // —— 页面除视频区外全部点不了。首次 mpv_embed_sync 到位后才显示。
     let hwnd = CreateWindowExW(
         WS_EX_NOACTIVATE,
         w!("STATIC"),
         w!("QuantumTVMpvHost"),
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(4),
+        WS_CHILD | WINDOW_STYLE(4),
         0,
         0,
-        16,
-        9,
+        0,
+        0,
         HWND(parent),
         None,
         None,
         None,
     )
     .map_err(|e| format!("创建 mpv 宿主窗口失败: {e}"))?;
-    // 置于同层兄弟 (WebView2) 之上
-    let _ = SetWindowPos(hwnd, HWND::default(), 0, 0, 16, 9, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     Ok(hwnd.0 as isize)
 }
 
@@ -350,7 +345,6 @@ fn sync_window_raw(
     }
     Ok(())
 }
-
 /// 连接 mpv 的命名管道: 先发 observe_property 订阅播放状态, 再起独立写任务
 /// 消费命令通道 (含连接前积压命令)。管道关闭 = mpv 退出 → 通知前端。
 #[cfg(windows)]
