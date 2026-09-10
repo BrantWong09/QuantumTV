@@ -11,15 +11,15 @@
 
 ## Phase 1: MediaResource
 
-- [ ] 新增 `MediaResource`
-- [ ] 新增 `ResourceType`
-- [ ] 新增 `SubtitleResource`
-- [ ] 新增 `MediaMetadata`
-- [ ] 增加 TypeScript 类型
-- [ ] 普通 MP4 转换测试
-- [ ] HLS 转换测试
-- [ ] Header/Cookie 测试
-- [ ] 网盘结果转换测试
+- [x] 新增 `MediaResource`（crates/core/src/media.rs）
+- [x] 新增 `ResourceType`（含 URL 特征推断 detect）
+- [x] 新增 `SubtitleResource`
+- [x] 新增 `MediaMetadata`
+- [x] 增加 TypeScript 类型（src/lib/types.ts，未接线）
+- [x] 普通 MP4 转换测试
+- [x] HLS 转换测试
+- [x] Header/Cookie 测试
+- [x] 网盘结果转换测试（含本地代理伪装形态 + 百度 UA 场景）
 
 ## Phase 2: Resolver
 

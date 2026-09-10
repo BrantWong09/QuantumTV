@@ -130,6 +130,46 @@ export interface ResolveEpisodeResponse {
   source_site_type: number;
 }
 
+// ---------------------------------------------------------------------------
+// MediaResource (V2 Phase 1, 对应 crates/core/src/media.rs, 仅类型定义暂未接线)
+// ---------------------------------------------------------------------------
+
+/** 资源类型: 与 Rust ResourceType 的 snake_case 序列化保持一致 */
+export type ResourceType =
+  | 'file'
+  | 'http'
+  | 'hls'
+  | 'dash'
+  | 'local_file'
+  | 'unknown';
+
+export interface SubtitleResource {
+  url: string;
+  language?: string;
+  format?: string;
+}
+
+export interface MediaMetadata {
+  title?: string;
+  episode?: string;
+  duration?: number;
+}
+
+/** 所有播放入口的统一资源描述 (docs/architecture/01-core-model.md) */
+export interface MediaResource {
+  id: string;
+  url: string;
+  resourceType: ResourceType;
+  headers: Record<string, string>;
+  cookies: Record<string, string>;
+  userAgent?: string;
+  referer?: string;
+  /** 是否必须经本地 PlaybackGateway 播放 */
+  proxyRequired: boolean;
+  subtitles: SubtitleResource[];
+  metadata: MediaMetadata;
+}
+
 // 收藏数据结构
 export interface Favorite {
   source_name: string;

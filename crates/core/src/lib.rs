@@ -1,6 +1,7 @@
 pub mod admin_config;
 pub mod adult;
 pub mod bridge;
+pub mod media;
 pub mod netdisk;
 pub mod netdisk_proxy;
 pub mod playback;
@@ -15,6 +16,9 @@ pub use admin_config::merge_admin_config_with_defaults;
 pub use admin_config::normalize_source_config;
 pub use admin_config::parse_admin_config;
 pub use adult::{filter_adult_sources, is_adult_source};
+pub use media::{
+    parse_cookie_header, MediaMetadata, MediaResource, ResourceType, SubtitleResource,
+};
 pub use playback::{filter_ads_from_m3_u8, SkipAction, SkipDetection};
 pub use search_aggregation::{
     aggregate_search_results, apply_filter, compute_group_stats, sort_by_year, AggregatedGroup,
