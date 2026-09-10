@@ -1,42 +1,50 @@
-# QuantumTV AI Development Rules
+# QuantumTV AI Coding Rules
 
-This document outlines the technical stack and development guidelines for the QuantumTV application.
+本文件是 QuantumTV AI Coding Agent 的最高级项目级约束之一。
 
-## 🛠 Tech Stack
+## Before coding
 
-- **Next.js 16 (App Router)**: Used as the frontend framework, configured for static export (`output: 'export'`) to integrate with Tauri.
-- **Tauri 2.0**: The cross-platform bridge providing access to the system (Rust core), window management, and native APIs.
-- **React 19**: Modern UI component library using Functional Components and Hooks.
-- **Tailwind CSS 4**: Primary styling utility for all components, utilizing the "Cinematic Aurora" design system.
-- **TypeScript**: Strictly used for type safety across the frontend.
-- **Rust**: Used for the backend core, handling data fusion, network requests (bypassing CORS), and performance-critical logic.
-- **Plyr & HLS.js**: The core video playback engine supporting M3U8 streaming and custom player controls.
-- **SQLite**: Local-first database managed via Rust for storing history, favorites, and settings.
-- **Lucide React**: The standard library for all iconography.
+必须阅读：
 
-## 📐 Development Rules
+```text
+docs/architecture/README.md
+docs/architecture/00-current-state.md
+docs/architecture/08-ai-implementation.md
+```
 
-### 1. Component Structure
-- **Location**: All UI components go into `src/components/`. Pages go into `src/app/`.
-- **Granularity**: Keep components small and focused (ideally under 150 lines).
-- **Client Directives**: Use `'use client';` at the top of files that utilize React hooks or browser APIs.
+## Architecture rules
 
-### 2. Styling Guidelines
-- **Utility First**: Always use Tailwind CSS classes. Avoid custom CSS unless implementing complex keyframe animations in `globals.css`.
-- **Theming**: Support both Light and Dark modes using `next-themes`. Use the `dark:` prefix for dark mode overrides.
-- **Responsiveness**: Always build with a mobile-first approach. Ensure layouts work on 375px (Phone), 834px (Tablet), and 1440px+ (Desktop).
+- Source 不调用 Player。
+- Resolver 不调用 Player。
+- UI 不直接操作 mpv。
+- 所有播放资源统一为 MediaResource。
+- mpv 是唯一正式播放器。
+- Gateway 与 Resolver/Player 保持职责分离。
+- 不增加第二套播放状态。
+- 不为了修复局部问题扩大模块职责。
 
-### 3. Library Usage Rules
-- **Icons**: Exclusively use `lucide-react`. Do not add other icon libraries.
-- **Navigation**: Use the custom `FastLink` component instead of native `next/link` for performance-critical navigation (especially in the sidebar/navbar).
-- **Data Fetching**: Use `invoke` from `@tauri-apps/api/core` for backend calls. Do not use standard `fetch` for resources that might have CORS restrictions; let the Rust core handle them.
-- **Images**: Use the `useProxyImage` hook for movie posters to handle image proxying and SQLite caching automatically.
-- **State**: Use React state/hooks for local UI state. Use the Tauri event system (`listen`, `emit`) for cross-window or backend-to-frontend synchronization.
+## Change rules
 
-### 4. Code Quality
-- **Simplicity**: Favor simple, readable code over complex abstractions.
-- **No Placeholders**: Never output TODOs or partial implementations.
-- **Error Handling**: Allow errors to bubble up to the `GlobalErrorIndicator` unless local recovery is specifically required.
+- 先搜索，再修改。
+- 先理解调用链，再改接口。
+- 最小改动优先。
+- 一个阶段完成后编译/测试。
+- 不要顺手重写无关代码。
+- 如果代码和文档冲突，先报告差异。
 
-### 5. Deployment Context
-- Remember that this app is a **static export**. Features relying on Node.js server-side runtimes (like Middleware or Server Actions) will not work. All "server" logic must reside in the Rust `src-tauri` directory.
+## Refactor rule
+
+禁止一次性进行“大重构”。
+
+必须按：
+
+```text
+MediaResource
+→ Resolver
+→ Gateway
+→ PlaybackManager
+→ UI migration
+→ cleanup
+```
+
+逐阶段执行。
