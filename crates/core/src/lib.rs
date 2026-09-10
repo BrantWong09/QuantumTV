@@ -1,6 +1,7 @@
 pub mod admin_config;
 pub mod adult;
 pub mod bridge;
+pub mod gateway;
 pub mod media;
 pub mod netdisk;
 pub mod netdisk_proxy;
@@ -17,6 +18,9 @@ pub use admin_config::merge_admin_config_with_defaults;
 pub use admin_config::normalize_source_config;
 pub use admin_config::parse_admin_config;
 pub use adult::{filter_adult_sources, is_adult_source};
+pub use gateway::{
+    create_session, drop_session, session_count, session_url, wrap_resource, ResourceSession,
+};
 pub use media::{
     parse_cookie_header, MediaMetadata, MediaResource, ResourceType, SubtitleResource,
 };

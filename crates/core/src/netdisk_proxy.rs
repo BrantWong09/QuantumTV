@@ -86,7 +86,8 @@ fn effective_ua(param_ua: Option<String>) -> Option<String> {
     }
 }
 
-fn client() -> &'static reqwest::Client {
+/// 供 PlaybackGateway (gateway.rs) 复用同一连接池
+pub(crate) fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             // 流式透传不能设总超时(整个 3GB 响应都走这一个请求), 只限连接建立
@@ -121,6 +122,12 @@ async fn handle_conn(mut stream: TcpStream) {
     let first_line = text.lines().next().unwrap_or("");
     log::info!("[网盘代理] 请求: {}", trunc(first_line, 160));
     let path = first_line.split_whitespace().nth(1).unwrap_or("");
+    // V2 Phase 3: /media/<token> 走 PlaybackGateway (opaque token session);
+    // 旧 /netdisk/file.mp4?url=..&ua=.. 路径保持兼容, Phase 5 UI 切换后删除
+    if path.starts_with("/media/") && crate::gateway::handle_media_request(&mut stream, &head).await
+    {
+        return;
+    }
     let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
     let mut inner_url: Option<String> = None;
     let mut ua: Option<String> = None;

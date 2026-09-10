@@ -34,16 +34,16 @@
 
 ## Phase 3: Gateway
 
-- [ ] 重构 netdisk proxy 为 PlaybackGateway
-- [ ] ResourceSession
-- [ ] opaque token
-- [ ] Range
-- [ ] HEAD
-- [ ] Redirect
-- [ ] Header/Cookie
-- [ ] TTL
-- [ ] localhost-only
-- [ ] SSRF 防护
+- [x] 重构 netdisk proxy 为 PlaybackGateway（新增 crates/core/src/gateway.rs，与旧 netdisk_proxy 共用监听；旧 /netdisk 路径兼容并存）
+- [x] ResourceSession
+- [x] opaque token（uuid v4 simple，32 位不可枚举）
+- [x] Range（透传 Content-Range/206/Accept-Ranges）
+- [x] HEAD
+- [ ] Redirect（沿用 reqwest 默认跟随策略，显式策略配置留待 Phase 6 稳定性）
+- [x] Header/Cookie（UA/Referer/Cookie/自定义头注入，CRLF 防注入）
+- [x] TTL（120s 空闲过期 + 访问续期 + 过期计数）
+- [x] localhost-only（沿用 127.0.0.1 随机端口绑定）
+- [x] SSRF 防护（仅公网 http(s)，禁环回/私网/链路本地/元数据端点/本地文件）
 
 ## Phase 4: Playback
 

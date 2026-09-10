@@ -2702,21 +2702,22 @@ pub async fn resolve_spider_episode(
         ))
         .await
         .map_err(|e| e.to_string())?;
-    // 网盘直链带 UA 校验: 播放器无法带请求头 → 本地网盘代理包装 (补 UA + Range 透传)
-    let ua = resource.user_agent.clone();
-    if let Some(ua) = &ua {
-        // 代理转发兜底数据源: 百度校验完整 UA, 参数链路任何一环丢失都会 403
-        quantumtv_core::netdisk_proxy::remember_user_agent(ua);
-    }
-    let play_url = match quantumtv_core::netdisk_proxy::ensure_started().await {
-        Ok(port) => quantumtv_core::netdisk_proxy::wrap_proxy_url(
-            &resource.url,
-            ua.as_deref(),
-            port,
-        ),
+    // V2 Phase 3: 网盘直链经 PlaybackGateway 包装 (opaque token)
+    let play_url = match quantumtv_core::gateway::wrap_resource(&resource).await {
+        Ok(url) => url,
         Err(e) => {
-            log::warn!("[播放解析] 网盘代理启动失败, 回退原始直链: {}", e);
-            resource.url.clone()
+            log::warn!(
+                "[播放解析] Gateway 包装失败, 回退旧网盘代理路径: {}",
+                quantumtv_core::spider::trunc(&e, 120)
+            );
+            match quantumtv_core::netdisk_proxy::ensure_started().await {
+                Ok(port) => quantumtv_core::netdisk_proxy::wrap_proxy_url(
+                    &resource.url,
+                    resource.user_agent.as_deref(),
+                    port,
+                ),
+                Err(_) => resource.url.clone(),
+            }
         }
     };
     log::info!(
@@ -2763,20 +2764,23 @@ async fn enrich_first_episode_direct(result: &mut SearchResult, site: &ApiSite) 
     );
     match manager.resolve(&input).await {
         Ok(resource) => {
-            // 网盘直链: 播放器无法带 UA → 本地网盘代理包装 (补 UA)
-            let final_url = match quantumtv_core::netdisk_proxy::ensure_started().await {
-                Ok(port) => {
-                    let ua = resource.user_agent.clone();
-                    if let Some(ua) = &ua {
-                        quantumtv_core::netdisk_proxy::remember_user_agent(ua);
+            // V2 Phase 3: 网盘直链经 PlaybackGateway 包装 (opaque token)
+            let final_url = match quantumtv_core::gateway::wrap_resource(&resource).await {
+                Ok(url) => url,
+                Err(e) => {
+                    log::warn!(
+                        "[播放解析] 首集 Gateway 包装失败, 回退旧代理路径: {}",
+                        quantumtv_core::spider::trunc(&e, 120)
+                    );
+                    match quantumtv_core::netdisk_proxy::ensure_started().await {
+                        Ok(port) => quantumtv_core::netdisk_proxy::wrap_proxy_url(
+                            &resource.url,
+                            resource.user_agent.as_deref(),
+                            port,
+                        ),
+                        Err(_) => resource.url.clone(),
                     }
-                    quantumtv_core::netdisk_proxy::wrap_proxy_url(
-                        &resource.url,
-                        ua.as_deref(),
-                        port,
-                    )
                 }
-                Err(_) => resource.url.clone(),
             };
             log::info!(
                 "[播放解析] 首集直链化成功 ({}): url={}",
