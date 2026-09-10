@@ -2687,31 +2687,36 @@ pub async fn resolve_spider_episode(
     let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
         return Err("桥接未就绪".into());
     };
-    let (url, header) =
-        quantumtv_core::spider::resolve_spider_episode(class_name, &flag, &episode_id, &bridge_url)
-            .await?;
-    // wex 系会把直链包装成本地代理地址(127.0.0.1:8096/kaiser?url=...)。桌面/播放器
-    // 无法访问手机本机端口, 但 MuMu 与宿主同出口 IP、百度 dlink 按 IP 绑定 → 解出内层
-    // 直链, 经本地网盘代理(补 UA + Range 透传)流式播放。
-    let (inner_url, play_header) = match quantumtv_core::spider::unwrap_local_proxy_url(&url) {
-        Some(inner) => (inner, header),
-        None => (url, header),
-    };
-    let ua = quantumtv_core::spider::header_user_agent(&play_header);
+    // V2 Phase 2: 解析链委托 ResolverManager (SpiderResolver + BridgeSpiderPlayFetcher)
+    let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
+        quantumtv_core::spider::BridgeSpiderPlayFetcher {
+            bridge_url: bridge_url.clone(),
+        },
+    ));
+    let resource = manager
+        .resolve(&quantumtv_core::resolver::ResolveInput::spider(
+            source.clone(),
+            flag.clone(),
+            episode_id.clone(),
+            class_name,
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    // 网盘直链带 UA 校验: 播放器无法带请求头 → 本地网盘代理包装 (补 UA + Range 透传)
+    let ua = resource.user_agent.clone();
     if let Some(ua) = &ua {
         // 代理转发兜底数据源: 百度校验完整 UA, 参数链路任何一环丢失都会 403
         quantumtv_core::netdisk_proxy::remember_user_agent(ua);
     }
-    // 内层直链也做同样包装: 播放器无法带 UA, 全部走本地代理
     let play_url = match quantumtv_core::netdisk_proxy::ensure_started().await {
         Ok(port) => quantumtv_core::netdisk_proxy::wrap_proxy_url(
-            &inner_url,
+            &resource.url,
             ua.as_deref(),
             port,
         ),
         Err(e) => {
             log::warn!("[播放解析] 网盘代理启动失败, 回退原始直链: {}", e);
-            inner_url
+            resource.url.clone()
         }
     };
     log::info!(
@@ -2720,7 +2725,7 @@ pub async fn resolve_spider_episode(
     );
     Ok(ResolveEpisodeResponse {
         url: play_url,
-        header: play_header,
+        header: serde_json::Value::Null,
         source_site_type: 3,
     })
 }
@@ -2744,24 +2749,34 @@ async fn enrich_first_episode_direct(result: &mut SearchResult, site: &ApiSite) 
         return;
     };
     let flag = String::new(); // wex 系 playerContent 的 flag 对网盘组不敏感(组序已在 id 内编码)
-    match quantumtv_core::spider::resolve_spider_episode(class_name, &flag, &first_raw, &bridge_url)
-        .await
-    {
-        Ok((url, header)) => {
-            let _header = header;
-            // kaiser 本地代理包装 → 解出内层直链, 再经本地网盘代理包装(补 UA)
-            let final_url = match quantumtv_core::spider::unwrap_local_proxy_url(&url) {
-                Some(inner) => match quantumtv_core::netdisk_proxy::ensure_started().await {
-                    Ok(port) => {
-                        let ua = quantumtv_core::spider::header_user_agent(&_header);
-                        if let Some(ua) = &ua {
-                            quantumtv_core::netdisk_proxy::remember_user_agent(ua);
-                        }
-                        quantumtv_core::netdisk_proxy::wrap_proxy_url(&inner, ua.as_deref(), port)
+    // V2 Phase 2: 首集直链化同走 ResolverManager (与 resolve_spider_episode 同一解析链)
+    let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
+        quantumtv_core::spider::BridgeSpiderPlayFetcher {
+            bridge_url: bridge_url.clone(),
+        },
+    ));
+    let input = quantumtv_core::resolver::ResolveInput::spider(
+        site.key.clone(),
+        flag,
+        first_raw,
+        class_name,
+    );
+    match manager.resolve(&input).await {
+        Ok(resource) => {
+            // 网盘直链: 播放器无法带 UA → 本地网盘代理包装 (补 UA)
+            let final_url = match quantumtv_core::netdisk_proxy::ensure_started().await {
+                Ok(port) => {
+                    let ua = resource.user_agent.clone();
+                    if let Some(ua) = &ua {
+                        quantumtv_core::netdisk_proxy::remember_user_agent(ua);
                     }
-                    Err(_) => inner,
-                },
-                None => url,
+                    quantumtv_core::netdisk_proxy::wrap_proxy_url(
+                        &resource.url,
+                        ua.as_deref(),
+                        port,
+                    )
+                }
+                Err(_) => resource.url.clone(),
             };
             log::info!(
                 "[播放解析] 首集直链化成功 ({}): url={}",
@@ -2773,10 +2788,10 @@ async fn enrich_first_episode_direct(result: &mut SearchResult, site: &ApiSite) 
             }
             // 其余集保持 raw id, 前端切集时逐集解析
         }
-        Err(hint) => {
+        Err(err) => {
             // 解析失败: 保留 raw id(前端会再试), 并置提示
-            log::warn!("[播放解析] 首集直链化失败 ({}): {}", site.key, quantumtv_core::spider::trunc(&hint, 200));
-            result.login_hint = Some(hint);
+            log::warn!("[播放解析] 首集直链化失败 ({}): {}", site.key, quantumtv_core::spider::trunc(&err.to_string(), 200));
+            result.login_hint = Some(err.to_string());
         }
     }
 }

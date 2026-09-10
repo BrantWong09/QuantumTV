@@ -7,14 +7,65 @@ use serde_json::Value;
 
 use super::bridge_post_with;
 
-/// 解析单集: 返回 (直链, header 对象)
-/// Err 携带用户可读原因(如"需要登录夸克网盘")
-pub async fn resolve_spider_episode(
+use crate::resolver::{RawPlayResult, ResolveError, SpiderPlayFetcher};
+
+/// 把 spider 错误字符串归类为 Resolver 错误模型。
+/// 桥接透传的 Java 异常 (InvocationTargetException/JSONException/bridge error)
+/// 几乎都是 spider 内部调网盘 API 失败 (未登录网盘/cookie 失效) → 认证类。
+pub(crate) fn classify_spider_error(class_name: &str, flag: &str, err: &str) -> ResolveError {
+    let source = "spider".to_string();
+    let short = short_err(err);
+    if err.contains("InvocationTargetException")
+        || err.contains("JSONException")
+        || err.contains("bridge error")
+    {
+        return ResolveError::AuthenticationRequired {
+            source,
+            message: format!(
+                "{} (原因: {})",
+                netdisk_login_hint_for(class_name, flag),
+                short
+            ),
+        };
+    }
+    if err.contains("timed out") || err.contains("timeout") || err.contains("超时") {
+        return ResolveError::Timeout {
+            source,
+            message: short,
+        };
+    }
+    ResolveError::NetworkError {
+        source,
+        message: short,
+    }
+}
+
+/// [`SpiderPlayFetcher`] 的桥接实现: 经 Android Bridge /playerContent 拉取播放结果。
+/// 这是 SpiderResolver 在生产环境的执行器 (test 用桩注入)。
+pub struct BridgeSpiderPlayFetcher {
+    pub bridge_url: String,
+}
+
+#[async_trait::async_trait]
+impl SpiderPlayFetcher for BridgeSpiderPlayFetcher {
+    async fn player_content(
+        &self,
+        class_name: &str,
+        flag: &str,
+        episode_id: &str,
+    ) -> Result<RawPlayResult, ResolveError> {
+        resolve_spider_episode_raw(class_name, flag, episode_id, &self.bridge_url).await
+    }
+}
+
+/// 原始形态解析: 返回 (url, header), 不做登录提示包装 (错误归类为 ResolveError)。
+/// [`resolve_spider_episode`] 是它的用户可读文案包装, 两者共用同一 bridge 调用。
+async fn resolve_spider_episode_raw(
     class_name: &str,
     flag: &str,
     id: &str,
     bridge_url: &str,
-) -> Result<(String, Value), String> {
+) -> Result<RawPlayResult, ResolveError> {
     log::info!(
         "[播放解析] playerContent class={} flag={:?} id={}",
         class_name,
@@ -26,27 +77,29 @@ pub async fn resolve_spider_episode(
         "flag": flag,
         "id": id,
     });
-    let data = match bridge_post_with(bridge_url, "/playerContent", &body, false, 120).await {
-        Ok(d) => d,
-        Err(e) => {
+    let data = bridge_post_with(bridge_url, "/playerContent", &body, false, 120)
+        .await
+        .map_err(|e| {
             log::warn!("[播放解析] playerContent 失败: {}", super::trunc(&e, 300));
-            // 桥接透传的 Java 异常(如 InvocationTargetException)几乎都是
-            // spider 内部调网盘 API 失败(未登录对应网盘/cookie 失效) → 给可操作的提示
-            if e.contains("InvocationTargetException")
-                || e.contains("JSONException")
-                || e.contains("bridge error")
-            {
-                return Err(format!("{} (原因: {})", netdisk_login_hint_for(class_name, flag), short_err(&e)));
-            }
-            return Err(e);
-        }
-    };
-    let obj: Value = serde_json::from_str(&data)
-        .map_err(|e| format!("playerContent 响应解析失败: {e}, body: {}", &data[..data.len().min(120)]))?;
+            classify_spider_error(class_name, flag, &e)
+        })?;
+    let obj: Value = serde_json::from_str(&data).map_err(|e| ResolveError::ParseError {
+        source: "spider".into(),
+        message: format!(
+            "playerContent 响应解析失败: {e}, body: {}",
+            &data[..data.len().min(120)]
+        ),
+    })?;
     let url = obj["url"].as_str().unwrap_or("").trim().to_string();
     if url.is_empty() {
-        log::warn!("[播放解析] playerContent 返回空 url (可能未登录对应网盘): header={}", obj["header"]);
-        return Err(netdisk_login_hint(class_name));
+        log::warn!(
+            "[播放解析] playerContent 返回空 url (可能未登录对应网盘): header={}",
+            obj["header"]
+        );
+        return Err(ResolveError::AuthenticationRequired {
+            source: "spider".into(),
+            message: netdisk_login_hint(class_name),
+        });
     }
     // 直链可能带敏感签名, 只打印前缀和长度
     log::info!(
@@ -55,7 +108,24 @@ pub async fn resolve_spider_episode(
         url.len(),
         obj["header"]
     );
-    Ok((url, obj["header"].clone()))
+    Ok(RawPlayResult {
+        url,
+        header: obj["header"].clone(),
+    })
+}
+
+/// 解析单集: 返回 (直链, header 对象)
+/// Err 携带用户可读原因(如"需要登录夸克网盘")
+pub async fn resolve_spider_episode(
+    class_name: &str,
+    flag: &str,
+    id: &str,
+    bridge_url: &str,
+) -> Result<(String, Value), String> {
+    let raw = resolve_spider_episode_raw(class_name, flag, id, bridge_url)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((raw.url, raw.header))
 }
 
 /// 识别 spider 返回的"本地代理包装"直链 (wex 系 kaiser: http://127.0.0.1:8096/kaiser?url=<内层>)

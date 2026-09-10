@@ -23,14 +23,14 @@
 
 ## Phase 2: Resolver
 
-- [ ] 新增 `ResolveInput`
-- [ ] 新增 `Resolver` trait
-- [ ] 新增 `ResolverManager`
-- [ ] DirectResolver
-- [ ] SpiderResolver
-- [ ] AndroidSpiderResolver
-- [ ] NetdiskResolver
-- [ ] 统一错误模型
+- [x] 新增 `ResolveInput`（crates/core/src/resolver.rs）
+- [x] 新增 `Resolver` trait（async_trait）
+- [x] 新增 `ResolverManager`（按注册顺序派发）
+- [x] DirectResolver（吃掉前端 isDirectPlayableUrl 判定）
+- [x] SpiderResolver（吃掉 resolve_spider_episode 的 unwrap+wrap 序列；bridge 细节经 SpiderPlayFetcher 注入）
+- [ ] AndroidSpiderResolver（当前由 SpiderResolver + BridgeSpiderPlayFetcher 承担同一职责，bridge 直连形态留待需要时拆分）
+- [x] NetdiskResolver（扩展位，can_resolve=false 待 Phase 3+ 直连网盘 API）
+- [x] 统一错误模型（八类 ResolveError + Display）
 
 ## Phase 3: Gateway
 

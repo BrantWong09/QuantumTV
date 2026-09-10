@@ -4,7 +4,10 @@ use std::time::Duration;
 const SPIDER_RUNNER_SOURCE: &str = include_str!("SpiderRunner.java");
 
 pub mod player;
-pub use player::{header_user_agent, netdisk_login_hint, resolve_spider_episode, unwrap_local_proxy_url};
+pub use player::{
+    header_user_agent, netdisk_login_hint, resolve_spider_episode, unwrap_local_proxy_url,
+    BridgeSpiderPlayFetcher,
+};
 
 pub fn calculate_md5(data: &[u8]) -> String {
     format!("{:x}", md5::compute(data))
