@@ -69,17 +69,28 @@
 
 ## Phase 5 兼容期残留 (Phase 6 删除)
 
-- [ ] mpv_embed_launch/command/close 委托命令 (speed/volume 面板仍在用 → Phase 6 换成 set_property 命令族后删)
-- [ ] mpv-embed-event 兼容翻译 (emit_playback_event 内)
-- [ ] src-tauri/src/commands/mpv_embed.rs 旧实现文件
-- [ ] resolve_spider_episode 命令 (播放编排已迁 playback_play_episode, 命令暂留)
-- [ ] mpv_player.rs launch_mpv HEVC 兜底路径 (fire-and-forget 语义, 是否并入 PlaybackManager 待决策)
+- [x] mpv_embed_launch/command/close 委托命令 (speed/volume 已换 playback_set_speed/playback_set_volume)
+- [x] mpv-embed-event 兼容翻译 (emit_playback_event 内)
+- [x] src-tauri/src/commands/mpv_embed.rs 旧实现文件
+- [x] resolve_spider_episode 命令 (播放编排已迁 playback_play_episode)
+- [x] mpv_player.rs launch_mpv HEVC 兜底路径 (mpv 为唯一播放器, 兜底无意义)
 
 ## Phase 6: Cleanup
 
-- [ ] 删除旧播放器路径
-- [ ] 删除重复 command
-- [ ] 删除无用依赖
-- [ ] 更新文档
-- [ ] 更新测试
-- [ ] 架构依赖检查
+- [x] 删除旧播放器路径 (mpv_embed.rs / mpv_player.rs / 前端 mpv_embed_command 直传)
+- [x] 删除重复 command (mpv_embed_launch/command/close, resolve_spider_episode)
+- [x] 删除无用依赖 (hls.js, plyr + globals.css Plyr 样式段 ~620 行)
+- [x] 更新文档 (本清单 + 模块级注释; playback.rs 头注释去兼容期说明)
+- [x] 更新测试 (crash recovery 改为纯同步判定 consume_crash_restart, 不再依赖 mpv 环境; 新增片尾不续播用例; core 122 tests 全绿)
+- [x] 架构依赖检查 (quantumtv-core 无 tauri 依赖, grep 验证)
+- [x] 修复存量 bug: crash recovery 读已被 ProcessDead 重置的 state → 活跃态判定永假。改为 pre_dead 死亡前快照判定
+- [x] 清理 dead code: commands/playback.rs app_data_dir / tauri::Manager unused import
+
+### Phase 6 备注
+
+- 已知存量问题 (非本次引入): src-tauri `cargo test --lib` 测试二进制启动失败
+  (STATUS_ENTRYPOINT_NOT_FOUND), 因 windows-gnu 工具链下 tauri-build 嵌入
+  manifest 与 rustc 默认 manifest 冲突 (链接期 ".rsrc merge failure: multiple
+  non-default manifests")。与 Phase 6 改动无关 (HEAD 同样复现), 待单独处理。
+- 前端 jest 无测试文件 (No tests found, 存量状态)。
+- lint:strict 45 warnings 全部为存量 (改动文件 0 warning, 0 error)。

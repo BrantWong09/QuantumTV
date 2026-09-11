@@ -354,7 +354,6 @@ pub async fn proxy_upstream_with_range(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn test_resource(url: &str, ua: Option<&str>) -> crate::media::MediaResource {
         let mut r = crate::media::from_direct_url("test+ep1", url);

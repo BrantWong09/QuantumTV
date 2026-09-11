@@ -1298,8 +1298,8 @@ function PlayPageClient() {
                       onClick={() => {
                         const nextIdx = (mpvSpeedIdx + 1) % MPV_SPEEDS.length;
                         setMpvSpeedIdx(nextIdx);
-                        void invoke('mpv_embed_command', {
-                          cmd: ['set_property', 'speed', MPV_SPEEDS[nextIdx]],
+                        void invoke('playback_set_speed', {
+                          speed: MPV_SPEEDS[nextIdx],
                         }).catch(() => {});
                       }}
                     >
@@ -1316,9 +1316,9 @@ function PlayPageClient() {
                       onChange={(e) => {
                         const v = Number(e.target.value);
                         setMpvVolume(v);
-                        void invoke('mpv_embed_command', {
-                          cmd: ['set_property', 'volume', v],
-                        }).catch(() => {});
+                        void invoke('playback_set_volume', { volume: v }).catch(
+                          () => {},
+                        );
                       }}
                       className='h-1 w-24 accent-emerald-500'
                     />

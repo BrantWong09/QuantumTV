@@ -3,14 +3,12 @@
 //!
 //! 职责边界 (03-playback.md §2 + 06-project-structure.md 依赖方向):
 //! - 本层只做参数转换与事件 emit, 不持有播放状态 (单一真相在 PlaybackManager)
-//! - 新事件 playback_state / playback_time / playback_duration / playback_error
-//! - 兼容期 (Phase 5 UI 切换前) 同步翻译旧 mpv-embed-event,
-//!   使 play/page.tsx 现有监听不变; mpv_embed_* 命令委托到同一 manager
+//! - 事件: playback_state / playback_time / playback_duration / playback_error
+//!   (旧 mpv-embed-event 兼容翻译已在 Phase 6 删除)
 
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::Emitter;
-use tauri::Manager;
 
 use quantumtv_core::playback::manager::PlaybackManager;
 use quantumtv_core::playback::state::{MpvEvent, PlaybackState};
@@ -38,7 +36,7 @@ impl From<&PlaybackState> for PlaybackStateDto {
     }
 }
 
-/// 共享 PlaybackManager (mpv_embed 兼容命令与 playback_* 命令指向同一实例)
+/// 共享 PlaybackManager (playback_* 命令指向同一实例)
 pub struct PlaybackManagerState {
     pub manager: Arc<PlaybackManager>,
 }
@@ -57,47 +55,25 @@ impl Default for PlaybackManagerState {
     }
 }
 
-/// Rust 侧单一事件出口: 状态快照 + 原始事件 → 新 playback_* 事件
-/// + 兼容旧 mpv-embed-event (Phase 5 UI 切换后删除翻译段)。
+/// Rust 侧单一事件出口: 状态快照 + 原始事件 → playback_* 事件
 pub fn emit_playback_event(app: &tauri::AppHandle, state: &PlaybackState, ev: &MpvEvent) {
     let dto = PlaybackStateDto::from(state);
     let _ = app.emit("playback_state", &dto);
     match ev {
         MpvEvent::Time(t) => {
             let _ = app.emit("playback_time", serde_json::json!({ "time": t }));
-            let _ = app.emit(
-                "mpv-embed-event",
-                serde_json::json!({ "kind": "time", "time": t, "duration": state.duration }),
-            );
         }
         MpvEvent::Duration(d) => {
             let _ = app.emit(
                 "playback_duration",
                 serde_json::json!({ "duration": d }),
             );
-            let _ = app.emit(
-                "mpv-embed-event",
-                serde_json::json!({ "kind": "duration", "duration": d }),
-            );
         }
-        MpvEvent::Pause(paused) => {
-            let _ = app.emit(
-                "mpv-embed-event",
-                serde_json::json!({ "kind": "pause", "value": paused }),
-            );
-        }
-        MpvEvent::EofReached => {
-            let _ = app.emit("mpv-embed-event", serde_json::json!({ "kind": "eof" }));
-        }
-        MpvEvent::FileLoaded => {
-            let _ = app.emit("mpv-embed-event", serde_json::json!({ "kind": "file-loaded" }));
-        }
+        MpvEvent::Pause(_) | MpvEvent::EofReached | MpvEvent::FileLoaded => {}
         MpvEvent::PlaybackError(msg) => {
             let _ = app.emit("playback_error", serde_json::json!({ "error": msg }));
         }
-        MpvEvent::ProcessDead => {
-            let _ = app.emit("mpv-embed-event", serde_json::json!({ "kind": "dead" }));
-        }
+        MpvEvent::ProcessDead => {}
         MpvEvent::LoadStarted | MpvEvent::StoppedByUser => {}
     }
 }
@@ -115,6 +91,7 @@ pub async fn playback_play(
     resource: quantumtv_core::media::MediaResource,
     start_at: Option<f64>,
 ) -> Result<serde_json::Value, String> {
+    state.manager.reset_crash_restarts();
     let manager = state.manager.clone();
     let app_cb = app.clone();
     let result = manager
@@ -163,6 +140,22 @@ pub async fn playback_add_volume(
 }
 
 #[tauri::command]
+pub async fn playback_set_volume(
+    state: tauri::State<'_, PlaybackManagerState>,
+    volume: f64,
+) -> Result<(), String> {
+    state.manager.set_volume(volume)
+}
+
+#[tauri::command]
+pub async fn playback_set_speed(
+    state: tauri::State<'_, PlaybackManagerState>,
+    speed: f64,
+) -> Result<(), String> {
+    state.manager.set_speed(speed)
+}
+
+#[tauri::command]
 pub async fn playback_stop(state: tauri::State<'_, PlaybackManagerState>) -> Result<(), String> {
     state.manager.stop()
 }
@@ -205,7 +198,7 @@ pub async fn playback_play_episode(
         .ok_or_else(|| format!("Source not found or disabled: {}", source))?;
     let site_type = site.site_type.unwrap_or(1);
 
-    // ResolverManager 组装 (与 resolve_spider_episode 同一解析链)
+    // ResolverManager 组装 (spider raw id 解析 / 直链直通统一解析链)
     let resource = if site_type == 3 {
         let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
         let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
@@ -266,6 +259,7 @@ pub async fn playback_play_episode(
     }
 
     let manager = state.manager.clone();
+    manager.reset_crash_restarts();
     let app_cb = app.clone();
     let result = manager
         .play_resource(&resource, start_at, move |s, e| {
@@ -292,59 +286,4 @@ fn quantum_core_resolve_input_spider(
     class_name: &str,
 ) -> quantumtv_core::resolver::ResolveInput {
     quantumtv_core::resolver::ResolveInput::spider(source, flag, episode_id, class_name)
-}
-
-// ---------------------------------------------------------------------------
-// 旧 mpv_embed_* 命令 → 委托 PlaybackManager (兼容期, Phase 5 删除)
-//
-// 注意: tauri::command 以命令名注册宏符号, 不能与 mpv_embed.rs 的同名命令
-// 同时存在。旧 mpv_embed.rs 实现已不再注册 (lib.rs 引用本模块版本),
-// 其文件保留到 Phase 5 一并删除。
-// ---------------------------------------------------------------------------
-
-/// 旧 mpv_embed_launch: 委托 manager 拉起/复用 mpv; 实际 loadfile 由前端
-/// mpv_embed_command 下发 (旧行为保持)。
-#[tauri::command]
-pub async fn mpv_embed_launch(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, PlaybackManagerState>,
-) -> Result<serde_json::Value, String> {
-    let manager = state.manager.clone();
-    let app_cb = app.clone();
-    // 旧行为: spawn 时空载 (--idle=yes), url 由前端 loadfile 下发。
-    // 复用 launch 的进程管理, 保持旧接口语义 (loadfile 由调用方负责)。
-    let result = manager
-        .backend()
-        .launch(
-            crate::commands::playback::app_data_dir(&app).as_deref(),
-            move |ev: MpvEvent| {
-                let snapshot = manager.state();
-                emit_playback_event(&app_cb, &snapshot, &ev);
-            },
-        )
-        .await?;
-    Ok(serde_json::json!({
-        "launched": result.launched,
-        "reused": result.reused,
-        "mpv_path": result.mpv_path,
-    }))
-}
-
-/// 旧 mpv_embed_command: 透传 mpv JSON IPC 命令 (前端 Phase 5 前继续使用)
-#[tauri::command]
-pub async fn mpv_embed_command(
-    state: tauri::State<'_, PlaybackManagerState>,
-    cmd: Vec<serde_json::Value>,
-) -> Result<(), String> {
-    state.manager.backend().send_command(&cmd)
-}
-
-/// 旧 mpv_embed_close: 委托 manager stop (状态复位 + crash recovery 抑制)
-#[tauri::command]
-pub async fn mpv_embed_close(state: tauri::State<'_, PlaybackManagerState>) -> Result<(), String> {
-    state.manager.stop()
-}
-
-pub fn app_data_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
-    app.path().app_data_dir().ok()
 }

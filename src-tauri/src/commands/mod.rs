@@ -6,9 +6,8 @@ pub mod content_analyzer;
 pub mod data_fusion;
 pub mod douban_client;
 pub mod home;
-// V2 Phase 4: mpv_embed 实现已迁至 playback.rs (PlaybackManager 委托), 旧文件待 Phase 5 删除
-// pub mod mpv_embed;
-pub mod mpv_player;
+// V2 Phase 6: mpv_embed.rs / mpv_player.rs 旧播放器路径已删,
+// mpv 唯一入口在 playback.rs (PlaybackManager)
 pub mod netdisk;
 pub mod playback;
 pub mod preload;

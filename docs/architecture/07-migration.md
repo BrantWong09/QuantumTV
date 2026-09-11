@@ -111,6 +111,20 @@ Phase 5 落地记录 (v0.9.0):
 - 播放错误分类
 - 日志
 
+Phase 6 落地记录 (v0.9.0, 详见 11-refactor-checklist.md):
+
+- 进程异常退出检测 + mpv 自动重启: Phase 4 已引入 (ProcessDead 事件 +
+  recover_after_crash), Phase 6 修复判定 bug — 原实现读已被 ProcessDead
+  重置回 Idle 的 state, 活跃态条件永假导致 recovery 实际不触发; 现改为
+  pre_dead 死亡前快照判定, 断点续播位置同样取自快照。
+- 播放错误分类: ResolverError 八类 (Phase 2) + end-file reason=error →
+  PlaybackError → playback_error 事件 (Phase 4)。
+- resource session 清理: Gateway TTL 120s 空闲过期 + 访问续期 (Phase 3)。
+- 超时 (mpv IPC 命令级) 未实现, 留待 Phase 7/按需补充。
+- 同步完成 Cleanup 清单: 旧播放器路径 (mpv_embed.rs / mpv_player.rs)、
+  重复命令 (mpv_embed_* / resolve_spider_episode)、无用依赖 (hls.js /
+  plyr) 删除; mpv-embed-event 兼容翻译移除。
+
 ## Phase 7: 可选优化
 
 只有在独立 mpv 窗口已经稳定后，再评估 libmpv embedding。

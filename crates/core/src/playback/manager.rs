@@ -21,10 +21,13 @@ pub struct PlaybackManager {
     state: Arc<Mutex<PlaybackState>>,
     /// 进程被用户手动关闭 (区别于 crash) → 不自动重拉, 由上层抑制兜底
     closed_by_user: Arc<Mutex<bool>>,
-    /// 连续 crash 重拉次数 (launch 成功后清零)
+    /// 连续 crash 重拉次数 (用户主动发起新播放时清零)
     crash_restarts: Mutex<u32>,
     /// crash recovery 重拉上限 (07-migration Phase 6: 自动重启)
     pub max_crash_restarts: u32,
+    /// 进程死亡前的最后快照: ProcessDead 事件会把 state 重置为 Idle,
+    /// crash 判定 (是否活跃/断点位置) 只能看这份快照
+    pre_dead: Arc<Mutex<Option<PlaybackState>>>,
     /// 进度保存节流: 上次保存时刻 (Rust 侧驱动, 前端不再节流编排)
     last_save: Mutex<std::time::Instant>,
     /// 进度保存间隔 (player_tick 的 5s 决策沿用)
@@ -47,6 +50,7 @@ impl PlaybackManager {
             closed_by_user: Arc::new(Mutex::new(false)),
             crash_restarts: Mutex::new(0),
             max_crash_restarts: 1,
+            pre_dead: Arc::new(Mutex::new(None)),
             last_save: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
             save_interval_secs: 5.0,
             app_data_dir: Mutex::new(None),
@@ -60,6 +64,12 @@ impl PlaybackManager {
     /// 注入 app_data 目录 (mpv.exe 查找), Tauri setup 时调用一次
     pub fn set_app_data_dir(&self, dir: PathBuf) {
         *self.app_data_dir.lock().unwrap() = Some(dir);
+    }
+
+    /// 用户主动发起新播放时清零 crash 重拉计数 (recovery 重拉不得清零,
+    /// 否则持续崩溃的坏文件会绕过 max_crash_restarts 无限循环)
+    pub fn reset_crash_restarts(&self) {
+        *self.crash_restarts.lock().unwrap() = 0;
     }
 
     /// 当前状态快照
@@ -86,11 +96,11 @@ impl PlaybackManager {
             };
         }
         *self.closed_by_user.lock().unwrap() = false;
-        *self.crash_restarts.lock().unwrap() = 0;
         on_event(&self.state(), &MpvEvent::LoadStarted);
 
         let url = resource.url.clone();
         let state_ref = self.state.clone();
+        let pre_dead_ref = self.pre_dead.clone();
         let cb = Arc::new(move |ev: MpvEvent| {
             let mut state = state_ref.lock().unwrap();
             // Time/Duration 同步到快照
@@ -98,6 +108,10 @@ impl PlaybackManager {
                 MpvEvent::Time(t) => state.time = *t,
                 MpvEvent::Duration(d) => state.duration = *d,
                 _ => {}
+            }
+            // 进程死亡会清空 state, 先留快照给 crash 判定
+            if matches!(ev, MpvEvent::ProcessDead) {
+                *pre_dead_ref.lock().unwrap() = Some(state.clone());
             }
             state.transition(ev.clone());
             on_event(&state, &ev);
@@ -135,28 +149,23 @@ impl PlaybackManager {
         Ok(result)
     }
 
-    /// mpv crash recovery (07-migration Phase 6): 进程意外退出且非用户主动
-    /// 关闭时, 在 max_crash_restarts 内自动重拉并从断点续播。
-    /// 返回 Some(重拉完成后的 LoadStarted) 表示已触发恢复。
-    pub async fn recover_after_crash(
-        &self,
-        resource: &MediaResource,
-        on_event: impl Fn(&PlaybackState, &MpvEvent) + Send + Sync + 'static,
-    ) -> Option<Result<MpvLaunchResult, String>> {
+    /// crash 判定 (纯同步, 不拉起进程): 满足恢复条件时消耗一次重拉额度
+    /// 并返回断点秒数; 不满足返回 None。与实际重拉分离以便单测。
+    fn consume_crash_restart(&self) -> Option<Option<f64>> {
         if *self.closed_by_user.lock().unwrap() {
             return None;
         }
-        // crash 判定: 之前在活跃态播放且本次 play_resource 未先 stop
-        let was_active = {
-            let state = self.state.lock().unwrap();
-            matches!(
-                state.status,
-                PlaybackStatus::Playing
-                    | PlaybackStatus::Paused
-                    | PlaybackStatus::Loading
-                    | PlaybackStatus::Error
-            ) && state.resource_id.is_some()
-        };
+        // crash 判定看死亡前快照: ProcessDead 已把 state 清回 Idle,
+        // 活跃态判定与断点位置都从 pre_dead 取 (Phase 6 修复: 原实现读
+        // 已被重置的 state, 活跃态条件永假, recovery 实际不触发)
+        let snapshot = self.pre_dead.lock().unwrap().clone()?;
+        let was_active = matches!(
+            snapshot.status,
+            PlaybackStatus::Playing
+                | PlaybackStatus::Paused
+                | PlaybackStatus::Loading
+                | PlaybackStatus::Error
+        ) && snapshot.resource_id.is_some();
         if !was_active {
             return None;
         }
@@ -165,12 +174,28 @@ impl PlaybackManager {
             return None;
         }
         *restarts += 1;
-        let resume_at = {
-            let state = self.state.lock().unwrap();
-            (state.time > 1.0 && state.duration > 0.0 && state.time < state.duration - 1.0)
-                .then_some(state.time)
-        };
-        log::warn!("mpv 意外退出, 尝试 crash recovery 第 {} 次重拉", *restarts);
+        let resume_at = (snapshot.time > 1.0
+            && snapshot.duration > 0.0
+            && snapshot.time < snapshot.duration - 1.0)
+            .then_some(snapshot.time);
+        log::warn!(
+            "mpv 意外退出 (死亡前状态 {:?}, 进度 {:.1}s), crash recovery 第 {} 次重拉",
+            snapshot.status,
+            snapshot.time,
+            *restarts
+        );
+        Some(resume_at)
+    }
+
+    /// mpv crash recovery (07-migration Phase 6): 进程意外退出且非用户主动
+    /// 关闭时, 在 max_crash_restarts 内自动重拉并从断点续播。
+    /// 返回 Some(重拉完成后的 LoadStarted) 表示已触发恢复。
+    pub async fn recover_after_crash(
+        &self,
+        resource: &MediaResource,
+        on_event: impl Fn(&PlaybackState, &MpvEvent) + Send + Sync + 'static,
+    ) -> Option<Result<MpvLaunchResult, String>> {
+        let resume_at = self.consume_crash_restart()?;
         Some(self.play_resource(resource, resume_at, on_event).await)
     }
 
@@ -212,6 +237,24 @@ impl PlaybackManager {
             serde_json::json!("add"),
             serde_json::json!("volume"),
             serde_json::json!(delta),
+        ])
+    }
+
+    /// 播放速度 (mpv speed 属性)
+    pub fn set_speed(&self, speed: f64) -> Result<(), String> {
+        self.backend.send_command(&[
+            serde_json::json!("set_property"),
+            serde_json::json!("speed"),
+            serde_json::json!(speed),
+        ])
+    }
+
+    /// 音量绝对值 (mpv volume 属性, 0..=volume-max)
+    pub fn set_volume(&self, volume: f64) -> Result<(), String> {
+        self.backend.send_command(&[
+            serde_json::json!("set_property"),
+            serde_json::json!("volume"),
+            serde_json::json!(volume),
         ])
     }
 
@@ -268,33 +311,60 @@ mod tests {
     }
 
     #[test]
-    fn crash_recovery_requires_active_state() {
-        // Idle 状态下管道死亡不是 crash (无内容在播), 不重拉
+    fn crash_recovery_requires_pre_dead_snapshot() {
+        // 无 ProcessDead 快照 (如从未播放) → 不重拉
         let manager = PlaybackManager::new();
-        let r = manager
-            .recover_after_crash(&test_resource(), |_, _| {})
-            .now_or_never()
-            .unwrap();
-        assert!(r.is_none());
+        assert!(manager.consume_crash_restart().is_none());
+    }
+
+    #[test]
+    fn crash_recovery_requires_active_pre_dead_state() {
+        // 死亡前是 Idle (空载退出) → 不是 crash, 不重拉
+        let manager = PlaybackManager::new();
+        *manager.pre_dead.lock().unwrap() = Some(PlaybackState::idle());
+        assert!(manager.consume_crash_restart().is_none());
+    }
+
+    #[test]
+    fn crash_recovery_triggers_from_pre_dead_snapshot() {
+        // 死亡前在 Playing → 触发重拉, 断点取自快照 time
+        let manager = PlaybackManager::new();
+        let mut snap = PlaybackState::idle().with_status(PlaybackStatus::Playing);
+        snap.resource_id = Some("s1:1".into());
+        snap.time = 30.0;
+        snap.duration = 100.0;
+        *manager.pre_dead.lock().unwrap() = Some(snap);
+        let resume = manager.consume_crash_restart().unwrap();
+        assert_eq!(resume, Some(30.0));
+        assert_eq!(*manager.crash_restarts.lock().unwrap(), 1);
+        // 上限 1: 再次崩溃 (未经用户发起新播放清零) → 不再重拉,
+        // 防止持续崩溃的坏文件绕过上限无限循环
+        assert!(manager.consume_crash_restart().is_none());
+    }
+
+    #[test]
+    fn crash_recovery_skips_resume_near_end() {
+        // 快照时间接近片尾 (>duration-1s) → 重拉但不续播
+        let manager = PlaybackManager::new();
+        let mut snap = PlaybackState::idle().with_status(PlaybackStatus::Playing);
+        snap.resource_id = Some("s1:1".into());
+        snap.time = 99.5;
+        snap.duration = 100.0;
+        *manager.pre_dead.lock().unwrap() = Some(snap);
+        assert_eq!(manager.consume_crash_restart().unwrap(), None);
     }
 
     #[test]
     fn crash_recovery_limit() {
         let mut manager = PlaybackManager::new();
-        {
-            let mut state = manager.state.lock().unwrap();
-            state.status = PlaybackStatus::Playing;
-            state.resource_id = Some("s1:1".into());
-            state.time = 30.0;
-            state.duration = 100.0;
-        }
+        let mut snap = PlaybackState::idle().with_status(PlaybackStatus::Playing);
+        snap.resource_id = Some("s1:1".into());
+        snap.time = 30.0;
+        snap.duration = 100.0;
+        *manager.pre_dead.lock().unwrap() = Some(snap);
         manager.max_crash_restarts = 0;
         // 上限 0 → 不重拉
-        let r = manager
-            .recover_after_crash(&test_resource(), |_, _| {})
-            .now_or_never()
-            .unwrap();
-        assert!(r.is_none());
+        assert!(manager.consume_crash_restart().is_none());
     }
 
     fn test_resource() -> MediaResource {

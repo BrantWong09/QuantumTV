@@ -97,7 +97,6 @@ pub fn run() {
             }
             app.manage(StorageManager::new(app.handle()));
             // V2 Phase 4: PlaybackManager 统一 mpv 生命周期
-            // (mpv_embed_* 旧命令由 commands/playback.rs 委托实现)
             let playback_state = commands::playback::PlaybackManagerState::new();
             if let Ok(data_dir) = app.path().app_data_dir() {
                 playback_state.manager.set_app_data_dir(data_dir);
@@ -199,7 +198,6 @@ pub fn run() {
             commands::search::search_page_open,
             commands::search::apply_search_filter,
             commands::video::abort_active_search,
-            commands::video::resolve_spider_episode,
             commands::search::get_search_cache_stats,
             commands::bridge::get_bridge_config,
             commands::bridge::save_bridge_config,
@@ -209,23 +207,17 @@ pub fn run() {
             commands::netdisk::netdisk_launch_login,
             commands::netdisk::cloud_login_start,
             commands::netdisk::cloud_login_poll,
-            // 外部 mpv 播放 (WebView2 无 HEVC 扩展时网盘源的黑屏兜底)
-            commands::mpv_player::launch_mpv,
-            commands::mpv_player::mpv_available,
-            // mpv 受控播放 (方案 C: 独立窗口 + JSON IPC; B 嵌入实测不稳)
-            // V2 Phase 4: playback_* 新接口 + mpv_embed_* 委托到 PlaybackManager
-            // (commands/mpv_embed.rs 的同名命令实现已由 playback.rs 接管)
+            // V2 Phase 4: playback_* 命令族 (mpv_embed_* 兼容命令已在 Phase 6 删除)
             commands::playback::playback_play,
             commands::playback::playback_play_episode,
             commands::playback::playback_pause,
             commands::playback::playback_set_paused,
             commands::playback::playback_seek,
             commands::playback::playback_add_volume,
+            commands::playback::playback_set_volume,
+            commands::playback::playback_set_speed,
             commands::playback::playback_stop,
             commands::playback::playback_state,
-            commands::playback::mpv_embed_launch,
-            commands::playback::mpv_embed_command,
-            commands::playback::mpv_embed_close,
             commands::settings::get_settings_bootstrap,
             commands::config::is_adult_source,
             // 跳过片头片尾

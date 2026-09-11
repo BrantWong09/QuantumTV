@@ -2661,84 +2661,7 @@ pub async fn initialize_player_by_query(
     })
 }
 
-/// 解析 spider 网盘集: playerContent(flag,id) → 真实直链
-/// 供前端播放/切集时调用; 未登录网盘时 Err 文案含登录指引
-#[tauri::command]
-pub async fn resolve_spider_episode(
-    source: String,
-    flag: String,
-    episode_id: String,
-    storage: State<'_, StorageManager>,
-    db: State<'_, crate::db::db_client::Db>,
-) -> Result<ResolveEpisodeResponse, String> {
-    log::info!(
-        "[播放解析] 前端请求 resolve_spider_episode: source={} flag={:?} episode_id={}",
-        source,
-        flag,
-        quantumtv_core::spider::trunc(&episode_id, 80)
-    );
-    let config = get_config_with_db_sources(&storage, &db)?;
-    let site = resolve_enabled_source(&config, &source)
-        .ok_or_else(|| format!("Source not found or disabled: {}", source))?;
-    if site.site_type.unwrap_or(1) != 3 {
-        return Err("非 Spider 站点无需解析".into());
-    }
-    let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
-    let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
-        return Err("桥接未就绪".into());
-    };
-    // V2 Phase 2: 解析链委托 ResolverManager (SpiderResolver + BridgeSpiderPlayFetcher)
-    let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
-        quantumtv_core::spider::BridgeSpiderPlayFetcher {
-            bridge_url: bridge_url.clone(),
-        },
-    ));
-    let resource = manager
-        .resolve(&quantumtv_core::resolver::ResolveInput::spider(
-            source.clone(),
-            flag.clone(),
-            episode_id.clone(),
-            class_name,
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
-    // V2 Phase 3: 网盘直链经 PlaybackGateway 包装 (opaque token)
-    let play_url = match quantumtv_core::gateway::wrap_resource(&resource).await {
-        Ok(url) => url,
-        Err(e) => {
-            log::warn!(
-                "[播放解析] Gateway 包装失败, 回退旧网盘代理路径: {}",
-                quantumtv_core::spider::trunc(&e, 120)
-            );
-            match quantumtv_core::netdisk_proxy::ensure_started().await {
-                Ok(port) => quantumtv_core::netdisk_proxy::wrap_proxy_url(
-                    &resource.url,
-                    resource.user_agent.as_deref(),
-                    port,
-                ),
-                Err(_) => resource.url.clone(),
-            }
-        }
-    };
-    log::info!(
-        "[播放解析] 下发播放地址: {}",
-        quantumtv_core::spider::trunc(&play_url, 120)
-    );
-    Ok(ResolveEpisodeResponse {
-        url: play_url,
-        header: serde_json::Value::Null,
-        source_site_type: 3,
-    })
-}
-
-#[derive(Debug, Serialize)]
-pub struct ResolveEpisodeResponse {
-    pub url: String,
-    pub header: serde_json::Value,
-    pub source_site_type: i32,
-}
-
-/// Spider 网盘源首集直链化: playerContent 解析第 1 集, 剩余集留给前端 resolve_spider_episode 按需解析
+/// Spider 网盘源首集直链化: playerContent 解析第 1 集, 剩余集经 ResolverManager 按需解析 (playback_play_episode)
 /// 解析为空直链(未登录网盘)时置 login_hint, 前端展示引导
 async fn enrich_first_episode_direct(result: &mut SearchResult, site: &ApiSite) {
     let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
@@ -2750,7 +2673,7 @@ async fn enrich_first_episode_direct(result: &mut SearchResult, site: &ApiSite) 
         return;
     };
     let flag = String::new(); // wex 系 playerContent 的 flag 对网盘组不敏感(组序已在 id 内编码)
-    // V2 Phase 2: 首集直链化同走 ResolverManager (与 resolve_spider_episode 同一解析链)
+    // V2 Phase 2: 首集直链化走 ResolverManager (与 playback_play_episode 同一解析链)
     let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
         quantumtv_core::spider::BridgeSpiderPlayFetcher {
             bridge_url: bridge_url.clone(),
