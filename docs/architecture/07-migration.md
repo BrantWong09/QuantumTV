@@ -89,6 +89,17 @@ UI 不再直接操作 mpv。
 MediaResource -> PlaybackManager -> mpv
 ```
 
+Phase 5 落地记录 (v0.9.0):
+
+- 播放编排收口 Rust: 新增 `playback_play_episode(source, flag, episodeId)`
+  命令, 内部走 ResolverManager → Gateway.wrap_resource → PlaybackManager。
+  前端只传"哪一集", 不再判定直链/解析 raw id/包装代理地址。
+- 前端删 HTML5/Plyr/HLS 播放器整条路径, mpv 是唯一播放引擎
+  (03-playback.md §7); 页面只剩遥控面板 + 列表 UI, 状态订阅
+  `playback_state` 事件。
+- 兼容期: `mpv_embed_*` 命令与 `mpv-embed-event` 事件保留 (speed/volume
+  面板与旧事件消费者), Phase 6 删除。
+
 ## Phase 6: 稳定性
 
 增加：

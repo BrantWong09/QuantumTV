@@ -216,6 +216,7 @@ pub fn run() {
             // V2 Phase 4: playback_* 新接口 + mpv_embed_* 委托到 PlaybackManager
             // (commands/mpv_embed.rs 的同名命令实现已由 playback.rs 接管)
             commands::playback::playback_play,
+            commands::playback::playback_play_episode,
             commands::playback::playback_pause,
             commands::playback::playback_set_paused,
             commands::playback::playback_seek,

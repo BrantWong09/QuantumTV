@@ -175,6 +175,125 @@ pub async fn playback_state(
     Ok(PlaybackStateDto::from(&state.manager.state()))
 }
 
+/// V2 Phase 5: 播放编排收口到 Rust —— 前端只传"哪一集", 不再自己解析/包装。
+///
+/// 编排链 (07-migration.md 最终形态):
+/// ```text
+/// source+flag+episodeId
+///   → ResolverManager (spider raw id 解析 / 直链直通)
+///   → proxy_required ? PlaybackGateway.wrap_resource (opaque token)
+///   → PlaybackManager.play_resource (loadfile + 续播)
+/// ```
+/// 非 spider 直链源也走这里 (DirectResolver 直通), 前端 isDirectPlayableUrl 判定删除。
+#[tauri::command]
+pub async fn playback_play_episode(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, PlaybackManagerState>,
+    source: String,
+    flag: String,
+    episode_id: String,
+    title: Option<String>,
+    episode: Option<String>,
+    start_at: Option<f64>,
+    storage: tauri::State<'_, crate::storage::StorageManager>,
+    db: tauri::State<'_, crate::db::db_client::Db>,
+) -> Result<serde_json::Value, String> {
+    // 站点信息: spider 站点需要类名与 site_type 判定
+    let config =
+        crate::commands::config::get_config_with_db_sources(&storage, &db)?;
+    let site = crate::commands::video::resolve_enabled_source(&config, &source)
+        .ok_or_else(|| format!("Source not found or disabled: {}", source))?;
+    let site_type = site.site_type.unwrap_or(1);
+
+    // ResolverManager 组装 (与 resolve_spider_episode 同一解析链)
+    let resource = if site_type == 3 {
+        let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
+        let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
+            return Err("桥接未就绪".into());
+        };
+        let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
+            quantumtv_core::spider::BridgeSpiderPlayFetcher {
+                bridge_url: bridge_url.clone(),
+            },
+        ));
+        manager
+            .resolve(&quantum_core_resolve_input_spider(
+                &source,
+                &flag,
+                &episode_id,
+                class_name,
+            ))
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        // 直链源: episode_id 即 url, DirectResolver 直通 (带 header 归一化)
+        let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
+            quantumtv_core::spider::BridgeSpiderPlayFetcher {
+                bridge_url: String::new(),
+            },
+        ));
+        manager
+            .resolve(&quantumtv_core::resolver::ResolveInput::direct(
+                source.clone(),
+                episode_id.clone(),
+            ))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    // 展示元数据 (窗口标题)
+    let mut resource = resource;
+    resource.metadata.title = title;
+    resource.metadata.episode = episode;
+
+    // proxy_required 资源经 PlaybackGateway 包装 (opaque token, 隐藏直链+带请求头)
+    if resource.proxy_required {
+        match quantumtv_core::gateway::wrap_resource(&resource).await {
+            Ok(url) => resource.url = url,
+            Err(e) => {
+                log::warn!(
+                    "[播放编排] Gateway 包装失败, 回退旧网盘代理路径: {}",
+                    quantumtv_core::spider::trunc(&e, 120)
+                );
+                let port = quantumtv_core::netdisk_proxy::ensure_started().await?;
+                resource.url = quantumtv_core::netdisk_proxy::wrap_proxy_url(
+                    &resource.url,
+                    resource.user_agent.as_deref(),
+                    port,
+                );
+            }
+        }
+    }
+
+    let manager = state.manager.clone();
+    let app_cb = app.clone();
+    let result = manager
+        .play_resource(&resource, start_at, move |s, e| {
+            emit_playback_event(&app_cb, s, e);
+        })
+        .await?;
+    log::info!(
+        "[播放编排] playback_play_episode 完成: source={} episode_id={} reused={}",
+        source,
+        quantumtv_core::spider::trunc(&episode_id, 60),
+        result.reused
+    );
+    Ok(serde_json::json!({
+        "launched": result.launched,
+        "reused": result.reused,
+    }))
+}
+
+/// ResolveInput::spider 的简写包装 (避免长调用)
+fn quantum_core_resolve_input_spider(
+    source: &str,
+    flag: &str,
+    episode_id: &str,
+    class_name: &str,
+) -> quantumtv_core::resolver::ResolveInput {
+    quantumtv_core::resolver::ResolveInput::spider(source, flag, episode_id, class_name)
+}
+
 // ---------------------------------------------------------------------------
 // 旧 mpv_embed_* 命令 → 委托 PlaybackManager (兼容期, Phase 5 删除)
 //

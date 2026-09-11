@@ -59,12 +59,21 @@
 
 ## Phase 5: UI
 
-- [ ] play/page.tsx 只保留 UI orchestration
-- [ ] 删除 resolve 逻辑
-- [ ] 删除 HLS 播放逻辑
-- [ ] 删除直接 mpv IPC
-- [ ] 删除第二套 playback state
-- [ ] UI 通过 Tauri IPC 控制播放
+- [x] play/page.tsx 只保留 UI orchestration（3725 → ~1560 行, 播放编排经 playback_play_episode 在 Rust 侧）
+- [x] 删除 resolve 逻辑（isDirectPlayableUrl / resolveEpisodeUrl / resolveTokenRef 前端判定全删, 解析链在 ResolverManager）
+- [x] 删除 HLS 播放逻辑（hls.js / TauriHlsJsLoader / fetch_m3u8 前端路径全删; m3u8 由 mpv 直接拉流）
+- [x] 删除直接 mpv IPC（前端 mpv_embed_command 透传全删, 控制经 playback_* 命令; speed/volume 走 mpv_embed_command 委托版）
+- [x] 删除第二套 playback state（mpvState useState 全删, 订阅 playback_state 事件, TS PlaybackState 类型接线）
+- [x] UI 通过 Tauri IPC 控制播放（playback_play_episode/pause/set_paused/seek/add_volume/stop/playback_state）
+- [x] 同步删除: Plyr 整条路径 (initPlyr/enhancePlyrUi/手势层/音量增强/TauriHlsJsLoader/触屏滑动快进)、HEVC 黑屏兜底切 mpv (mpv 为唯一播放器, 无需兜底)、plyrReloadTick 双状态切换
+
+## Phase 5 兼容期残留 (Phase 6 删除)
+
+- [ ] mpv_embed_launch/command/close 委托命令 (speed/volume 面板仍在用 → Phase 6 换成 set_property 命令族后删)
+- [ ] mpv-embed-event 兼容翻译 (emit_playback_event 内)
+- [ ] src-tauri/src/commands/mpv_embed.rs 旧实现文件
+- [ ] resolve_spider_episode 命令 (播放编排已迁 playback_play_episode, 命令暂留)
+- [ ] mpv_player.rs launch_mpv HEVC 兜底路径 (fire-and-forget 语义, 是否并入 PlaybackManager 待决策)
 
 ## Phase 6: Cleanup
 
