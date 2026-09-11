@@ -92,6 +92,9 @@ pub(crate) fn client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             // 流式透传不能设总超时(整个 3GB 响应都走这一个请求), 只限连接建立
             .connect_timeout(Duration::from_secs(15))
+            // Phase 7: 显式重定向策略 (原为 reqwest 默认 10 跳)。
+            // 网盘 302 → CDN 必须跟随, 收紧到 5 跳并显式声明
+            .redirect(reqwest::redirect::Policy::limited(5))
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
             .no_proxy()

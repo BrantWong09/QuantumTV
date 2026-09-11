@@ -39,7 +39,7 @@
 - [x] opaque token（uuid v4 simple，32 位不可枚举）
 - [x] Range（透传 Content-Range/206/Accept-Ranges）
 - [x] HEAD
-- [ ] Redirect（沿用 reqwest 默认跟随策略，显式策略配置留待 Phase 6 稳定性）
+- [x] Redirect（显式策略 Policy::limited(5)，Phase 7 补配置；网盘 302 → CDN 跟随语义不变）
 - [x] Header/Cookie（UA/Referer/Cookie/自定义头注入，CRLF 防注入）
 - [x] TTL（120s 空闲过期 + 访问续期 + 过期计数）
 - [x] localhost-only（沿用 127.0.0.1 随机端口绑定）
@@ -96,3 +96,22 @@
   non-default manifests")。与 Phase 6 改动无关 (HEAD 同样复现), 待单独处理。
 - 前端 jest 无测试文件 (No tests found, 存量状态)。
 - lint:strict 45 warnings 全部为存量 (改动文件 0 warning, 0 error)。
+
+## Phase 7: 可选优化
+
+- [x] mpv IPC 命令级超时 (send_command 带 request_id, 写入管道后登记 awaiting
+  + 5s 看门狗; 响应由读循环按 request_id 派发; 超时/mpv 报错 → CommandFailed
+  事件; loadfile 活跃态转 Error 用户可见可重试, 控制命令仅日志; Idle 下迟到
+  超时忽略; 排队期不计时避免管道慢连接误报)
+- [x] Gateway Redirect 显式策略 (netdisk_proxy::client Policy::limited(5),
+  与网盘代理共用连接池同语义)
+- [x] libmpv embedding 评估结论: 继续冻结 (ADR-004; 独立窗口方案 C 已稳定,
+  嵌入的跨平台渲染/GPU 集成风险无对应收益)
+- [x] AndroidSpiderResolver 拆分: 维持 SpiderResolver + BridgeSpiderPlayFetcher
+  承担同一职责, bridge 直连形态仍留待需要时拆分 (非优化项, 登记决策)
+- [x] 回归: core 131 tests 全绿 (新增 9: 状态机 3 + 响应关联 3 + 超时 2 + 排队 1),
+  src-tauri cargo check 通过
+
+### Phase 7 备注
+
+- 超时值为常量 COMMAND_TIMEOUT_MS_DEFAULT = 5000 (mpv_backend.rs), 测试可注入。

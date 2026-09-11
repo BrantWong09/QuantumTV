@@ -129,6 +129,18 @@ Phase 6 落地记录 (v0.9.0, 详见 11-refactor-checklist.md):
 
 只有在独立 mpv 窗口已经稳定后，再评估 libmpv embedding。
 
+Phase 7 落地记录 (v0.9.0, 详见 11-refactor-checklist.md):
+
+- 超时 (mpv IPC 命令级) 已实现: send_command 带 request_id, 命令实际写入
+  管道后登记 awaiting + 5s 看门狗; 读循环按 request_id 派发响应; 超时或
+  mpv 报错 → CommandFailed 事件, loadfile 在活跃态转 Error (用户可见可
+  重试), 控制命令只留日志。排队期 (管道连接最长 10s) 不计时, 避免慢连接
+  误报; Idle 下的迟到超时不劫持状态。
+- Gateway Redirect 显式策略: netdisk_proxy::client (与 PlaybackGateway
+  共用) 显式 Policy::limited(5), 补 Phase 3 遗留配置项, 跟随语义不变。
+- libmpv embedding: 继续冻结 (ADR-004)。独立窗口方案 C 已稳定, 嵌入的
+  跨平台渲染/GPU 集成风险无对应收益, 评估结论为不启动。
+
 ## 每阶段原则
 
 每完成一个阶段都必须保证：
