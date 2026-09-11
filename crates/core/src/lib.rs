@@ -3,6 +3,7 @@ pub mod adult;
 pub mod bridge;
 pub mod gateway;
 pub mod media;
+pub mod media_filter;
 pub mod netdisk;
 pub mod netdisk_proxy;
 pub mod playback;
@@ -24,7 +25,7 @@ pub use gateway::{
 pub use media::{
     parse_cookie_header, MediaMetadata, MediaResource, ResourceType, SubtitleResource,
 };
-pub use playback::{filter_ads_from_m3_u8, SkipAction, SkipDetection};
+pub use media_filter::{filter_ads_from_m3_u8, SkipAction, SkipDetection};
 pub use resolver::{
     DirectResolver, LocalFileResolver, NetdiskResolver, RawPlayResult, ResolveError,
     ResolveInput, ResolverManager, SpiderPlayFetcher, SpiderResolver,

@@ -47,14 +47,15 @@
 
 ## Phase 4: Playback
 
-- [ ] PlaybackManager
-- [ ] PlaybackState
-- [ ] MpvBackend
-- [ ] mpv JSON IPC
-- [ ] load/play/pause/stop/seek
-- [ ] duration/time-pos
-- [ ] error
-- [ ] mpv crash recovery
+- [x] PlaybackManager（crates/core/src/playback/manager.rs，播放控制唯一入口 + 进度保存节流）
+- [x] PlaybackState（crates/core/src/playback/state.rs，状态机迁移纯函数 + 单测）
+- [x] MpvBackend（crates/core/src/playback/mpv_backend.rs，从 src-tauri/commands/mpv_embed.rs 迁入；Core 不依赖 tauri，事件经回调上抛）
+- [x] mpv JSON IPC（--input-ipc-server 命名管道，observe_property 订阅 playback-time/duration/pause/eof-reached）
+- [x] load/play/pause/stop/seek（playback_play/pause/set_paused/stop/seek 命令 + manager seek_relative/seek_absolute）
+- [x] duration/time-pos（playback_time / playback_duration 事件，Time 500ms 节流沿用）
+- [x] error（end-file reason=error → PlaybackError → playback_error 事件 + 状态 Error）
+- [x] mpv crash recovery（recover_after_crash：非用户关闭 + 活跃态 + max_crash_restarts 内自动重拉断点续播）
+- [x] src-tauri 接线（commands/playback.rs：PlaybackManagerState + playback_* 命令；旧 mpv_embed_* 命令委托同一 manager，旧 mpv-embed-event 兼容翻译）
 
 ## Phase 5: UI
 

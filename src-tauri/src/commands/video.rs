@@ -4,7 +4,7 @@ use crate::commands::source_intelligence::SourceIntelligenceManager;
 use crate::storage::StorageManager;
 use image::{GenericImageView, ImageOutputFormat};
 use moka::future::Cache;
-use quantumtv_core::playback::{SkipAction, SkipDetection};
+use quantumtv_core::media_filter::{SkipAction, SkipDetection};
 use quantumtv_core::types::{PlayGroup, SearchResult};
 use quantumtv_core::{
     prefer_best_source, test_video_source, SourceTestResult as CoreSourceTestResult,

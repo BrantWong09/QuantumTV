@@ -96,7 +96,13 @@ pub fn run() {
                 app.global_shortcut().register(boss_key_shortcut)?;
             }
             app.manage(StorageManager::new(app.handle()));
-            app.manage(commands::mpv_embed::MpvEmbedState::default());
+            // V2 Phase 4: PlaybackManager 统一 mpv 生命周期
+            // (mpv_embed_* 旧命令由 commands/playback.rs 委托实现)
+            let playback_state = commands::playback::PlaybackManagerState::new();
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                playback_state.manager.set_app_data_dir(data_dir);
+            }
+            app.manage(playback_state);
             app.manage(commands::video::VideoCacheManager::new());
             app.manage(commands::video::SearchCacheManager::new());
             app.manage(commands::search::SearchResultCache::new());
@@ -207,9 +213,18 @@ pub fn run() {
             commands::mpv_player::launch_mpv,
             commands::mpv_player::mpv_available,
             // mpv 受控播放 (方案 C: 独立窗口 + JSON IPC; B 嵌入实测不稳)
-            commands::mpv_embed::mpv_embed_launch,
-            commands::mpv_embed::mpv_embed_command,
-            commands::mpv_embed::mpv_embed_close,
+            // V2 Phase 4: playback_* 新接口 + mpv_embed_* 委托到 PlaybackManager
+            // (commands/mpv_embed.rs 的同名命令实现已由 playback.rs 接管)
+            commands::playback::playback_play,
+            commands::playback::playback_pause,
+            commands::playback::playback_set_paused,
+            commands::playback::playback_seek,
+            commands::playback::playback_add_volume,
+            commands::playback::playback_stop,
+            commands::playback::playback_state,
+            commands::playback::mpv_embed_launch,
+            commands::playback::mpv_embed_command,
+            commands::playback::mpv_embed_close,
             commands::settings::get_settings_bootstrap,
             commands::config::is_adult_source,
             // 跳过片头片尾
@@ -322,7 +337,9 @@ pub fn run() {
         .run(|_app, event| {
             if let tauri::RunEvent::Exit = event {
                 tauri::async_runtime::block_on(quantumtv_core::bridge::shutdown());
-                _app.state::<commands::mpv_embed::MpvEmbedState>().shutdown();
+                _app.state::<commands::playback::PlaybackManagerState>()
+                    .manager
+                    .shutdown();
             }
         });
 }

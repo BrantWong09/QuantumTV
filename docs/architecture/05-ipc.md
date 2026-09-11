@@ -11,23 +11,32 @@ search
 get_detail
 get_episodes
 resolve_episode
-play
-pause
-stop
-seek
-set_volume
+playback_play        (MediaResource JSON + start_at)
+playback_pause
+playback_set_paused
+playback_stop
+playback_seek        (secs + absolute)
+playback_add_volume
+playback_state       (快照兜底)
 ```
+
+V2 Phase 4 已落地 `playback_*` 命令族 (src-tauri/src/commands/playback.rs)。
+兼容期旧命令 `mpv_embed_launch/command/close` 委托到同一 PlaybackManager,
+Phase 5 UI 切换后删除。
 
 ## 2. Rust -> UI
 
-Tauri Event 推送状态：
+Tauri Event 推送状态 (Rust 侧唯一真相 PlaybackManager):
 
 ```text
-playback_state
-playback_time
+playback_state       (完整快照: status/time/duration/resource_id/error)
+playback_time        (time, 500ms 节流)
 playback_duration
 playback_error
 ```
+
+兼容期同时翻译旧 `mpv-embed-event` (kind=time/duration/pause/eof/
+file-loaded/dead), Phase 5 UI 切换后删除。
 
 ## 3. 不建议
 

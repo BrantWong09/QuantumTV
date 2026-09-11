@@ -170,6 +170,31 @@ export interface MediaResource {
   metadata: MediaMetadata;
 }
 
+// ---------------------------------------------------------------------------
+// Playback (V2 Phase 4, 对应 crates/core/src/playback/, 仅类型定义暂未接线)
+// ---------------------------------------------------------------------------
+
+/** 播放器状态: 与 Rust PlaybackStatus 的 snake_case 序列化保持一致 */
+export type PlaybackStatus =
+  | 'idle'
+  | 'loading'
+  | 'playing'
+  | 'paused'
+  | 'stopped'
+  | 'ended'
+  | 'error';
+
+/** Rust → UI 状态快照 (playback_state / playback_state 命令返回值) */
+export interface PlaybackState {
+  status: PlaybackStatus;
+  time: number;
+  duration: number;
+  /** 当前资源标识, 不含敏感直链 */
+  resourceId?: string | null;
+  /** status=error 时的可读信息 */
+  error?: string | null;
+}
+
 // 收藏数据结构
 export interface Favorite {
   source_name: string;

@@ -28,6 +28,25 @@ PlaybackManager 是 Rust Core 中唯一负责播放器控制的组件。
 - 状态同步
 - 错误处理
 
+### 2.1 落地形态 (V2 Phase 4)
+
+```text
+crates/core/src/playback/
+├── mod.rs          # 模块出口
+├── manager.rs      # PlaybackManager: 控制入口 + 状态单一真相 + crash recovery
+├── mpv_backend.rs  # mpv 子进程 + JSON IPC 命名管道 (locate_mpv 查找)
+└── state.rs        # PlaybackState 状态机 (纯函数迁移 + 单测)
+```
+
+- Core 不依赖 tauri: MpvBackend 事件经回调上抛, mpv 查找目录由
+  Tauri 层注入 (`set_app_data_dir`)。
+- Tauri 接线在 `src-tauri/src/commands/playback.rs`:
+  `playback_*` 命令族 + `playback_state/time/duration/error` 事件;
+  兼容期旧 `mpv_embed_*` 命令与 `mpv-embed-event` 事件由同一 manager
+  委托/翻译, Phase 5 UI 切换后删除。
+- crash recovery: mpv 意外退出 (非用户关闭) 且状态处于活跃态时,
+  `recover_after_crash` 在 `max_crash_restarts` 内自动重拉并断点续播。
+
 ## 3. 播放流程
 
 ```text

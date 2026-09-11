@@ -1,4 +1,4 @@
-use quantumtv_core::playback::{SkipAction, SkipDetection};
+use quantumtv_core::media_filter::{SkipAction, SkipDetection};
 
 /// 检查是否应该跳过片头或片尾
 ///

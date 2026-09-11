@@ -17,42 +17,11 @@ pub struct MpvLaunchResult {
     pub reused: bool,
 }
 
-/// mpv.exe 查找顺序:
-/// 1) 环境变量 QUANTUMTV_MPV_PATH 指定的可执行文件
-/// 2) <app_data>/mpv/mpv.exe   (推荐用户放置位置)
-/// 3) <exe_dir>/mpv/mpv.exe    (便携包布局)
-/// 4) PATH 上的 mpv
+/// mpv.exe 查找顺序 (V2 Phase 4 起委托 quantumtv_core::playback::mpv_backend::locate_mpv,
+/// 与 PlaybackManager 同一实现): env QUANTUMTV_MPV_PATH → <app_data>/mpv →
+/// <exe_dir>/mpv → PATH
 pub fn locate_mpv(app: &tauri::AppHandle) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("QUANTUMTV_MPV_PATH") {
-        let path = PathBuf::from(p);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    if let Ok(data_dir) = app.path().app_data_dir() {
-        let path = data_dir.join("mpv").join("mpv.exe");
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let path = dir.join("mpv").join("mpv.exe");
-            if path.is_file() {
-                return Some(path);
-            }
-        }
-    }
-    // PATH 探测: 逐个候选目录查 mpv.exe (避免引入 which 依赖)
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("mpv.exe");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    quantumtv_core::playback::mpv_backend::locate_mpv(app.path().app_data_dir().ok().as_deref())
 }
 
 /// 用 mpv 独立窗口播放 url。

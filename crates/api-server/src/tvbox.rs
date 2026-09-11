@@ -3,7 +3,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use base64::Engine;
 use quantumtv_core::is_adult_source;
-use quantumtv_core::playback::filter_ads_from_m3_u8;
+use quantumtv_core::media_filter::filter_ads_from_m3_u8;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
