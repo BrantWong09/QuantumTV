@@ -85,6 +85,8 @@
 - [x] 架构依赖检查 (quantumtv-core 无 tauri 依赖, grep 验证)
 - [x] 修复存量 bug: crash recovery 读已被 ProcessDead 重置的 state → 活跃态判定永假。改为 pre_dead 死亡前快照判定
 - [x] 清理 dead code: commands/playback.rs app_data_dir / tauri::Manager unused import
+- [x] 补充: 修复 gateway 测试并行 flaky (SESSIONS 全局 map 被并行测试污染, 触碰共享 map 的测试加锁串行; gateway 模块 10 次全绿)
+- [x] 补充: 删除被跟踪的遗留 package-lock.json (项目用 pnpm, 该文件仍含已删的 hls.js/plyr)
 
 ### Phase 6 备注
 

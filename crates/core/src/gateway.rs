@@ -361,8 +361,19 @@ mod tests {
         r
     }
 
+    /// SESSIONS 是进程级全局 map, 测试并行执行时互相污染计数断言;
+    /// 触碰共享 map 的测试全部持此锁串行执行。
+    fn sessions_lock() -> std::sync::MutexGuard<'static, ()> {
+        static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn session_lifecycle() {
+        let _g = sessions_lock();
         let token = create_session(&test_resource("https://cdn.x.com/a.mp4", Some("ua1")));
         assert_eq!(session_count(), 1);
         let s = take_session(&token).expect("session alive");
@@ -377,6 +388,7 @@ mod tests {
 
     #[test]
     fn token_is_opaque_and_unpredictable() {
+        let _g = sessions_lock();
         let t1 = create_session(&test_resource("https://x.com/a.mp4", None));
         let t2 = create_session(&test_resource("https://x.com/b.mp4", None));
         assert_ne!(t1, t2);
@@ -390,6 +402,7 @@ mod tests {
 
     #[test]
     fn session_ttl_expiry() {
+        let _g = sessions_lock();
         // 直接操纵内部 map 验证 TTL 语义 (不打真实时钟)
         let token = create_session(&test_resource("https://x.com/a.mp4", None));
         let now = Instant::now();
@@ -432,6 +445,7 @@ mod tests {
 
     #[test]
     fn parse_media_path_forms() {
+        let _g = sessions_lock();
         let token = create_session(&test_resource("https://x.com/a.mp4", None));
         // 两种形态: /media/<token> 与 /media/file.mp4/<token>
         let via_plain = parse_media_path(&format!("/media/{token}"));
@@ -463,6 +477,7 @@ mod tests {
     #[test]
     fn header_injection_blocked_in_session_headers() {
         // 带 CRLF 的自定义头在 proxy_upstream 里被跳过 (此处验证 session 存储层不改制)
+        let _g = sessions_lock();
         let mut r = test_resource("https://x.com/a.mp4", None);
         r.headers.insert("X-Evil".into(), "v\r\nHost: evil.com".into());
         let token = create_session(&r);
@@ -475,6 +490,7 @@ mod tests {
     fn cookies_stored_in_session() {
         let mut r = test_resource("https://x.com/a.mp4", None);
         r.cookies = crate::media::parse_cookie_header("a=1; b=2");
+        let _g = sessions_lock();
         let token = create_session(&r);
         let s = take_session(&token).unwrap();
         assert_eq!(s.cookies.get("a").map(String::as_str), Some("1"));

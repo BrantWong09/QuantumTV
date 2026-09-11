@@ -73,3 +73,5 @@ key.properties
 # bridge apk build output
 android/spider-bridge/out/
 docs/QuantumTV-V2-architecture-docs.zip
+
+package-lock.json
