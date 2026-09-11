@@ -113,6 +113,11 @@ impl PlaybackManager {
             if matches!(ev, MpvEvent::ProcessDead) {
                 *pre_dead_ref.lock().unwrap() = Some(state.clone());
             }
+            // Phase 7 命令级超时: loadfile 失败经状态机转 Error (用户可见);
+            // 其余命令失败只留日志, 不劫持播放状态
+            if let MpvEvent::CommandFailed { command, error } = &ev {
+                log::warn!("[Playback] mpv 命令 {command} 失败: {error}");
+            }
             state.transition(ev.clone());
             on_event(&state, &ev);
         });

@@ -56,6 +56,8 @@ impl PlaybackState {
     /// - pause=true → Paused; pause=false → Playing (仅在活跃态)
     /// - eof-reached=true → Ended (从 Playing/Paused)
     /// - 管道死亡 → Idle (mpv 退出, 进程被外部关闭视为停止)
+    /// - CommandFailed(loadfile) → Error (仅活跃态; 控制命令与
+    ///   Idle 下的迟到超时不劫持状态)
     pub fn transition(&mut self, event: MpvEvent) {
         match event {
             MpvEvent::LoadStarted => {
@@ -88,6 +90,20 @@ impl PlaybackState {
                 self.status = PlaybackStatus::Error;
                 self.error = Some(msg);
             }
+            MpvEvent::CommandFailed { command, error } => {
+                // loadfile 失败/超时: 活跃态 → Error (用户可见, 可重试)。
+                // 控制命令 (seek/pause/...) 失败不劫持播放状态;
+                // Idle 下的迟到超时 (stop 后 quit 无响应) 同样忽略。
+                if command == "loadfile"
+                    && matches!(
+                        self.status,
+                        PlaybackStatus::Loading | PlaybackStatus::Playing | PlaybackStatus::Paused
+                    )
+                {
+                    self.status = PlaybackStatus::Error;
+                    self.error = Some(format!("mpv 命令失败: {error}"));
+                }
+            }
             MpvEvent::StoppedByUser => {
                 *self = Self::idle();
             }
@@ -98,7 +114,7 @@ impl PlaybackState {
 }
 
 /// mpv 侧事件 (backend → 状态机 的输入)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MpvEvent {
     /// loadfile 已下发
     LoadStarted,
@@ -113,6 +129,12 @@ pub enum MpvEvent {
     Duration(f64),
     /// mpv 上报播放错误 (end-file with error)
     PlaybackError(String),
+    /// IPC 命令超时或 mpv 回错误响应 (Phase 7 命令级超时)。
+    /// 仅 loadfile 在活跃态下推进状态机, 其余只用于日志。
+    CommandFailed {
+        command: String,
+        error: String,
+    },
     /// 管道关闭 = mpv 进程退出
     ProcessDead,
     /// 用户/UI 主动 stop
@@ -189,6 +211,41 @@ mod tests {
         s.transition(MpvEvent::Time(12.5));
         s.transition(MpvEvent::Duration(90.0));
         assert_eq!(s.status, PlaybackStatus::Playing);
+    }
+
+    #[test]
+    fn command_failed_loadfile_from_active_goes_error() {
+        // loadfile 超时/mpv 报错: 活跃态 → Error (用户可见, 可重试)
+        let mut s = PlaybackState::idle().with_status(PlaybackStatus::Loading);
+        s.transition(MpvEvent::CommandFailed {
+            command: "loadfile".into(),
+            error: "命令超时".into(),
+        });
+        assert_eq!(s.status, PlaybackStatus::Error);
+        assert_eq!(s.error.as_deref(), Some("mpv 命令失败: 命令超时"));
+    }
+
+    #[test]
+    fn command_failed_non_loadfile_ignored() {
+        // seek/pause 等控制命令失败不劫持播放状态 (慢流时避免误伤)
+        let mut s = playing();
+        s.transition(MpvEvent::CommandFailed {
+            command: "seek".into(),
+            error: "命令超时".into(),
+        });
+        assert_eq!(s.status, PlaybackStatus::Playing);
+        assert_eq!(s.error, None);
+    }
+
+    #[test]
+    fn command_failed_ignored_from_idle() {
+        // 用户 stop 后迟到的 loadfile 超时不把 Idle 翻成 Error
+        let mut s = PlaybackState::idle();
+        s.transition(MpvEvent::CommandFailed {
+            command: "loadfile".into(),
+            error: "命令超时".into(),
+        });
+        assert_eq!(s.status, PlaybackStatus::Idle);
     }
 
     #[test]

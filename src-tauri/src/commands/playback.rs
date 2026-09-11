@@ -73,6 +73,15 @@ pub fn emit_playback_event(app: &tauri::AppHandle, state: &PlaybackState, ev: &M
         MpvEvent::PlaybackError(msg) => {
             let _ = app.emit("playback_error", serde_json::json!({ "error": msg }));
         }
+        MpvEvent::CommandFailed { .. } => {
+            // loadfile 失败已经状态机转 Error; 状态快照里带错误信息时上抛
+            if state.status == PlaybackStatus::Error {
+                let _ = app.emit(
+                    "playback_error",
+                    serde_json::json!({ "error": state.error.clone().unwrap_or_default() }),
+                );
+            }
+        }
         MpvEvent::ProcessDead => {}
         MpvEvent::LoadStarted | MpvEvent::StoppedByUser => {}
     }
