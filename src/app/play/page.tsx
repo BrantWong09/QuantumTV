@@ -261,6 +261,7 @@ function PlayPageClient() {
         source: d.source,
         flag,
         episodeId,
+        vodId: d.id || null,
         title: d.title || null,
         episode: currentEpisodeTitle(),
         startAt: startAt ?? null,

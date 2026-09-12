@@ -2768,21 +2768,36 @@ async fn enrich_first_episode_direct(result: &mut SearchResult, site: &ApiSite) 
     let Some(first_raw) = result.episodes_raw.first().cloned() else {
         return;
     };
-    let flag = String::new(); // wex 系 playerContent 的 flag 对网盘组不敏感(组序已在 id 内编码)
-    // V2 Phase 2: 首集直链化走 ResolverManager (与 playback_play_episode 同一解析链)
-    let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
-        quantumtv_core::spider::BridgeSpiderPlayFetcher {
-            bridge_url: bridge_url.clone(),
-        },
-    ));
-    let input = quantumtv_core::resolver::ResolveInput::spider(
-        site.key.clone(),
-        flag,
-        first_raw,
-        class_name,
-    );
-    match manager.resolve(&input).await {
+    // 与 playback_play_episode 共用 Resolve 缓存 + SingleFlight (方案 §10/§13):
+    // 详情阶段解析过首集后, 点击播放第 1 集直接命中缓存, 不再发第二次 playerContent。
+    // flag 取默认组 (前端 activeGroupIndex=0 即 play_groups[0].flag), 保证 key 对齐;
+    // wex 系 playerContent 的 flag 对网盘组不敏感(组序已在 id 内编码)
+    let flag = result
+        .play_groups
+        .first()
+        .map(|g| g.flag.clone())
+        .unwrap_or_default();
+    let resolve_key = format!("resolve:{}:{}:{}:{}", site.key, result.id, flag, first_raw);
+    let class_c = class_name.to_string();
+    let source_c = site.key.clone();
+    let first_c = first_raw.clone();
+    let bridge_c = bridge_url.clone();
+    let flag_c = flag.clone();
+    let resolved = crate::commands::playback::cached_resolve_with(resolve_key, move || async move {
+        let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
+            quantumtv_core::spider::BridgeSpiderPlayFetcher { bridge_url: bridge_c },
+        ));
+        manager
+            .resolve(&quantumtv_core::resolver::ResolveInput::spider(
+                source_c, flag_c, first_c, &class_c,
+            ))
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    match resolved {
         Ok(resource) => {
+            let resource = (*resource).clone();
             // V2 Phase 3: 网盘直链经 PlaybackGateway 包装 (opaque token)
             let final_url = match quantumtv_core::gateway::wrap_resource(&resource).await {
                 Ok(url) => url,

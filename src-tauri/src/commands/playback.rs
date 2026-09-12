@@ -224,6 +224,7 @@ pub async fn playback_play_episode(
     source: String,
     flag: String,
     episode_id: String,
+    vod_id: Option<String>,
     title: Option<String>,
     episode: Option<String>,
     start_at: Option<f64>,
@@ -237,44 +238,56 @@ pub async fn playback_play_episode(
         .ok_or_else(|| format!("Source not found or disabled: {}", source))?;
     let site_type = site.site_type.unwrap_or(1);
 
-    // ResolverManager 组装 (spider raw id 解析 / 直链直通统一解析链)
-    let resource = if site_type == 3 {
-        let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
-        let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
-            return Err("桥接未就绪".into());
-        };
-        let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
-            quantumtv_core::spider::BridgeSpiderPlayFetcher {
-                bridge_url: bridge_url.clone(),
-            },
-        ));
-        manager
-            .resolve(&quantum_core_resolve_input_spider(
-                &source,
-                &flag,
-                &episode_id,
-                class_name,
-            ))
-            .await
-            .map_err(|e| e.to_string())?
+    // 桥接就绪前置检查保留 (fail fast, 不进缓存闭包, 不污染缓存)
+    let bridge_url_owned = if site_type == 3 {
+        Some(
+            quantumtv_core::bridge::effective_url()
+                .ok_or_else(|| "桥接未就绪".to_string())?,
+        )
     } else {
-        // 直链源: episode_id 即 url, DirectResolver 直通 (带 header 归一化)
-        let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
-            quantumtv_core::spider::BridgeSpiderPlayFetcher {
-                bridge_url: String::new(),
-            },
-        ));
-        manager
-            .resolve(&quantumtv_core::resolver::ResolveInput::direct(
-                source.clone(),
-                episode_id.clone(),
-            ))
-            .await
-            .map_err(|e| e.to_string())?
+        None
     };
 
+    // Resolve 缓存 + SingleFlight (方案 §10/§12/§13): 播放只 Resolve, 不得 Search;
+    // 与 enrich_first_episode_direct 共用同一缓存条目, 首集不重复 playerContent
+    let source_c = source.clone();
+    let flag_c = flag.clone();
+    let ep_c = episode_id.clone();
+    let vod_c = vod_id.clone().unwrap_or_default();
+    let class_c = site.api.strip_prefix("csp_").unwrap_or(&site.api).to_string();
+    let site_type_c = site_type;
+    let resolve_key = format!("resolve:{}:{}:{}:{}", source_c, vod_c, flag_c, ep_c);
+    let resource = cached_resolve_with(resolve_key, move || async move {
+        if site_type_c == 3 {
+            let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
+                quantumtv_core::spider::BridgeSpiderPlayFetcher {
+                    bridge_url: bridge_url_owned.unwrap_or_default(),
+                },
+            ));
+            manager
+                .resolve(&quantumtv_core::resolver::ResolveInput::spider(
+                    &source_c, &flag_c, &ep_c, &class_c,
+                ))
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            // 直链源: episode_id 即 url, DirectResolver 直通 (带 header 归一化)
+            let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
+                quantumtv_core::spider::BridgeSpiderPlayFetcher { bridge_url: String::new() },
+            ));
+            manager
+                .resolve(&quantumtv_core::resolver::ResolveInput::direct(
+                    source_c.clone(),
+                    ep_c.clone(),
+                ))
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await?;
+
     // 展示元数据 (窗口标题)
-    let mut resource = resource;
+    let mut resource = (*resource).clone();
     resource.metadata.title = title;
     resource.metadata.episode = episode;
 
@@ -315,16 +328,6 @@ pub async fn playback_play_episode(
         "launched": result.launched,
         "reused": result.reused,
     }))
-}
-
-/// ResolveInput::spider 的简写包装 (避免长调用)
-fn quantum_core_resolve_input_spider(
-    source: &str,
-    flag: &str,
-    episode_id: &str,
-    class_name: &str,
-) -> quantumtv_core::resolver::ResolveInput {
-    quantumtv_core::resolver::ResolveInput::spider(source, flag, episode_id, class_name)
 }
 
 #[cfg(test)]
