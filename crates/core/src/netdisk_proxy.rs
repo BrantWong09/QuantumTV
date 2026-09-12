@@ -90,13 +90,15 @@ fn effective_ua(param_ua: Option<String>) -> Option<String> {
 pub(crate) fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            // 流式透传不能设总超时(整个 3GB 响应都走这一个请求), 只限连接建立
-            .connect_timeout(Duration::from_secs(15))
+            // 流式透传不能设总超时(整个 3GB 响应都走这一个请求), 只限连接建立 (方案 §29: 5s)
+            .connect_timeout(Duration::from_secs(5))
             // Phase 7: 显式重定向策略 (原为 reqwest 默认 10 跳)。
             // 网盘 302 → CDN 必须跟随, 收紧到 5 跳并显式声明
             .redirect(reqwest::redirect::Policy::limited(5))
+            // 方案 §29: 连接池参数 (pool_idle_timeout 90s / tcp_keepalive 30s)
+            .pool_idle_timeout(Duration::from_secs(90))
             .tcp_nodelay(true)
-            .tcp_keepalive(Duration::from_secs(60))
+            .tcp_keepalive(Duration::from_secs(30))
             .no_proxy()
             .build()
             .expect("netdisk proxy client")
@@ -334,5 +336,61 @@ mod tests {
     fn decode_rejects_truncated_escape() {
         assert_eq!(percent_decode("abc%2"), "abc%2");
         assert_eq!(percent_decode("a%ZZb"), "a%ZZb");
+    }
+
+    #[tokio::test]
+    async fn netdisk_range_forwarded_and_206_passthrough() {
+        // 方案 §27/§45: mpv 的 Range 必须原样打给上游, 206 透传回播放器
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 上游 mock: 校验 Range 头, 回 206 + Content-Range
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let up = tokio::spawn(async move {
+            let (mut s, _) = upstream.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            // reqwest 上线时头名小写化 (range:), 代理提取本就大小写不敏感; 断言按原值匹配
+            assert!(
+                req.to_lowercase().contains("range: bytes=50000000-"),
+                "上游未收到原样 Range: {req}"
+            );
+            s.write_all(
+                b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 50000000-50000099/100000000\r\nContent-Length: 100\r\nContent-Type: video/mp4\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            s.write_all(&vec![7u8; 100]).await.unwrap();
+        });
+
+        let port = ensure_started().await.unwrap();
+        let inner = format!("http://127.0.0.1:{upstream_port}/video.mp4");
+        let wrapped = wrap_proxy_url(&inner, None, port);
+        let path = wrapped
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_string();
+
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=50000000-\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        // 代理响应为 Connection: close + shutdown, read_to_end 可靠终止
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 206 Partial Content"), "{text}");
+        assert!(
+            text.contains("Content-Range: bytes 50000000-50000099/100000000"),
+            "{text}"
+        );
+        let body_len = resp.len() - text.find("\r\n\r\n").unwrap() - 4;
+        assert_eq!(body_len, 100);
+
+        up.await.unwrap();
     }
 }
