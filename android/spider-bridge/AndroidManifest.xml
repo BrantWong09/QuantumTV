@@ -47,5 +47,14 @@
             android:name=".BridgeService"
             android:exported="true"
             android:foregroundServiceType="dataSync" />
+        <!-- Spider Worker: 独立进程。playerContent 挂死只杀自己, 不碰 Control/TCP (§5/§6/§51)。 -->
+        <service
+            android:name=".worker.GeneralWorkerService"
+            android:process=":spider_general"
+            android:exported="false" />
+        <service
+            android:name=".worker.PlaybackWorkerService"
+            android:process=":spider_playback"
+            android:exported="false" />
     </application>
 </manifest>

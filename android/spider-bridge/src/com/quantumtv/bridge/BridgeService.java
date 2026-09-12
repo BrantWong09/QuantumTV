@@ -34,6 +34,8 @@ public class BridgeService extends Service {
     ExecutorService pool;
     /** /detail 专用单线程池: 与搜索队列隔离, 保证点击播放低延迟 */
     ExecutorService detailExecutor;
+    /** 控制面 Worker 生命周期管理 (T3+): spider 调用派发至独立进程 */
+    public com.quantumtv.bridge.control.WorkerManager workers;
     private boolean initialized = false;
     /** 站点级 ext 配置, /init 时由桌面端传入; TVBoxOSC 在 getSpider 后调用 spider.init(context, ext) */
     private volatile String extConfig = "";
@@ -90,6 +92,8 @@ public class BridgeService extends Service {
             pool = Executors.newFixedThreadPool(4);
             detailExecutor = Executors.newSingleThreadExecutor();
             new Thread(this::acceptLoop, "BridgeAccept").start();
+            workers = new com.quantumtv.bridge.control.WorkerManager(this);
+            workers.start();
         TunnelClient.start(this);
         } catch (Exception e) {
             Log.e(TAG, "server start failed: " + e);
@@ -623,6 +627,7 @@ public class BridgeService extends Service {
     @Override
     public void onDestroy() {
         if (runningInstance == this) runningInstance = null;
+        if (workers != null) workers.shutdown();
         try { if (server != null) server.close(); } catch (Exception e) {}
         super.onDestroy();
     }
