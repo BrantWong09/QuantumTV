@@ -53,21 +53,16 @@ pub(crate) fn parse_register(payload: &[u8]) -> Option<(String, String)> {
 
 // ---- 服务层 ----
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{LazyLock, Mutex as StdMutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, Notify};
+
+use super::session::{BridgeSession, Limits, RequestKind};
 
 pub const DEFAULT_TUNNEL_PORT: u16 = 18099;
-
-struct TunnelConn {
-    #[allow(dead_code)]
-    device: String,
-    writer: mpsc::Sender<(u32, Vec<u8>)>,
-}
 
 /// 测试入口: 用现成 listener 启动隧道/虚拟桥接 (与 ensure_started 共用 accept 循环)
 #[cfg(test)]
@@ -79,10 +74,8 @@ async fn serve(tunnel: TcpListener, bridge: TcpListener, bridge_url: String) {
     HANDLES.lock().unwrap().extend([h1, h2]);
 }
 
-static ACTIVE: LazyLock<StdMutex<Option<TunnelConn>>> = LazyLock::new(|| StdMutex::new(None));
-static PENDING: LazyLock<StdMutex<HashMap<u32, oneshot::Sender<Vec<u8>>>>> =
-    LazyLock::new(|| StdMutex::new(HashMap::new()));
-static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+static ACTIVE: LazyLock<StdMutex<Option<Arc<BridgeSession>>>> =
+    LazyLock::new(|| StdMutex::new(None));
 static STARTED: AtomicBool = AtomicBool::new(false);
 static NOTIFY: LazyLock<Notify> = LazyLock::new(|| Notify::new());
 static HANDLES: LazyLock<StdMutex<Vec<tokio::task::JoinHandle<()>>>> =
@@ -153,9 +146,8 @@ pub async fn shutdown_all() {
     for h in HANDLES.lock().unwrap().drain(..) {
         h.abort();
     }
-    *ACTIVE.lock().unwrap() = None;
-    for (_, tx) in PENDING.lock().unwrap().drain() {
-        let _ = tx.send(Vec::new());
+    if let Some(s) = ACTIVE.lock().unwrap().take() {
+        s.fail_all_pending("shutdown");
     }
     log::info!("[桥接] 隧道服务已关闭");
 }
@@ -177,10 +169,11 @@ async fn tunnel_accept_loop(listener: TcpListener) {
             Some(f) if f.id == 0 => {
                 if let Some((device, _apk)) = parse_register(&f.payload) {
                     let (rd, wr) = s.into_split();
-                    let (tx, rx) = mpsc::channel::<(u32, Vec<u8>)>(64);
-                    *ACTIVE.lock().unwrap() = Some(TunnelConn { device: device.clone(), writer: tx });
+                    let (tx, rx) = mpsc::channel::<Frame>(64);
+                    let session = BridgeSession::new(device.clone(), tx, Limits::default());
+                    *ACTIVE.lock().unwrap() = Some(session.clone());
                     tokio::spawn(writer_task(wr, rx));
-                    tokio::spawn(reader_task(rd));
+                    tokio::spawn(reader_task(rd, session));
                     let url = BRIDGE_URL.lock().unwrap().clone();
                     super::set_effective(&url, super::EFFECTIVE_TUNNEL);
                     // Starting→Ready 由 ensure_ready_with 收尾; Failed/Idle 时隧道拨入即自愈
@@ -195,29 +188,23 @@ async fn tunnel_accept_loop(listener: TcpListener) {
     }
 }
 
-async fn writer_task(mut wr: tokio::net::tcp::OwnedWriteHalf, mut rx: mpsc::Receiver<(u32, Vec<u8>)>) {
-    while let Some((id, payload)) = rx.recv().await {
-        if write_frame(&mut wr, id, &payload).await.is_err() {
+async fn writer_task(mut wr: tokio::net::tcp::OwnedWriteHalf, mut rx: mpsc::Receiver<Frame>) {
+    while let Some(f) = rx.recv().await {
+        if write_frame(&mut wr, f.id, &f.payload).await.is_err() {
             break;
         }
     }
 }
 
-async fn reader_task(mut rd: tokio::net::tcp::OwnedReadHalf) {
+async fn reader_task(mut rd: tokio::net::tcp::OwnedReadHalf, session: Arc<BridgeSession>) {
     loop {
         match read_frame(&mut rd).await {
-            Some(f) => {
-                if let Some(tx) = PENDING.lock().unwrap().remove(&f.id) {
-                    let _ = tx.send(f.payload);
-                }
-            }
+            Some(f) => session.deliver(f.id, f.payload),
             None => break,
         }
     }
-    // 隧道断开: 所有 pending 立即失败 (空 payload = 传输层死亡)
-    for (_, tx) in PENDING.lock().unwrap().drain() {
-        let _ = tx.send(Vec::new());
-    }
+    // 隧道断开: 所有 pending 立即失败 (方案 §45: 不能永久挂起)
+    session.fail_all_pending("隧道断开");
     *ACTIVE.lock().unwrap() = None;
     log::warn!("[桥接] 隧道断开, 等待 APK 重拨");
 }
@@ -234,32 +221,32 @@ async fn bridge_accept_loop(listener: TcpListener) {
 
 async fn handle_bridge_client(mut stream: TcpStream) {
     let Some(raw) = read_http_request(&mut stream).await else { return };
-    let writer_tx = {
-        let guard = ACTIVE.lock().unwrap();
-        match guard.as_ref() {
-            Some(c) => c.writer.clone(),
-            None => return, // 无隧道: 直接关连接 → reqwest 传输错误
-        }
+    let session = ACTIVE.lock().unwrap().clone();
+    let Some(session) = session else { return }; // 无隧道: 直接关连接 → reqwest 传输错误
+    let kind = RequestKind::from_path(request_path(&raw));
+    let body = match session.request(kind, raw).await {
+        Ok(b) => b,
+        Err(e) => e.to_err_json().into_bytes(),
     };
-    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    let (tx, rx) = oneshot::channel();
-    PENDING.lock().unwrap().insert(id, tx);
-    if writer_tx.send((id, raw)).await.is_err() {
-        PENDING.lock().unwrap().remove(&id);
-        return;
-    }
-    match rx.await {
-        Ok(body) if !body.is_empty() => {
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(head.as_bytes()).await;
-            let _ = stream.write_all(&body).await;
-            let _ = stream.shutdown().await;
-        }
-        _ => { /* 隧道死亡: 直接关闭 → reqwest 传输错误 */ }
-    }
+    write_http_response(&mut stream, &body).await;
+}
+
+/// 请求行路径 ("POST /search HTTP/1.1" → "/search")
+fn request_path(raw: &[u8]) -> &str {
+    let head = std::str::from_utf8(raw).unwrap_or("");
+    let line = head.lines().next().unwrap_or("");
+    line.split_whitespace().nth(1).unwrap_or("/")
+}
+
+/// 写 HTTP 响应头+体并关闭 (本任务保持 Connection: close; Task 3 改 keep-alive)
+async fn write_http_response(stream: &mut TcpStream, body: &[u8]) {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes()).await;
+    let _ = stream.write_all(body).await;
+    let _ = stream.shutdown().await;
 }
 
 /// 读完整 HTTP 请求 (头 + Content-Length body); 返回原始字节
@@ -332,6 +319,14 @@ pub(crate) async fn read_frame<S: AsyncReadExt + Unpin>(s: &mut S) -> Option<Fra
 mod tests {
     use super::*;
 
+    /// ACTIVE/STARTED/HANDLES/BRIDGE_URL 是进程级全局, 端到端测试并行会互踩
+    /// (一方注册使另一方被 busy 拒绝; 一方 shutdown 掐断另一方的 accept 循环);
+    /// 触碰全局态的用例全部持此锁串行执行 (同 gateway.rs::sessions_lock 模式)。
+    fn tunnel_lock() -> std::sync::MutexGuard<'static, ()> {
+        static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn frame_roundtrip() {
         let raw = encode_frame(7, b"{\"code\":200}");
@@ -365,6 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn tunnel_end_to_end_and_reject_second() {
+        let _g = tunnel_lock();
         let tl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tunnel_port = tl.local_addr().unwrap().port();
@@ -398,6 +394,40 @@ mod tests {
 
         mock.await.unwrap();
         // 清理全局态, 不污染其他用例
+        shutdown_all().await;
+        crate::bridge::reset_effective();
+        crate::bridge::set_status(crate::bridge::BridgeStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn bridge_timeout_returns_error_json() {
+        let _g = tunnel_lock();
+        // mock APK 注册后不应答 → 桌面侧 HEALTH_TIMEOUT(2s) 内返回业务错误 JSON, 不再挂死 (方案 §18)
+        let tl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tunnel_port = tl.local_addr().unwrap().port();
+        let bridge_port = bl.local_addr().unwrap().port();
+        serve(tl, bl, format!("http://127.0.0.1:{bridge_port}")).await;
+
+        let mock = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", tunnel_port)).await.unwrap();
+            write_frame(&mut s, 0, br#"{"device":"SilentMu","apk":"1.1"}"#).await.unwrap();
+            // 不读取、不应答后续帧
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        });
+
+        assert!(wait_registration(std::time::Duration::from_secs(3)).await);
+
+        let started = std::time::Instant::now();
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", bridge_port)).await.unwrap();
+        s.write_all(b"POST /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(started.elapsed() < std::time::Duration::from_secs(4), "超时必须快速失败");
+        assert!(text.contains("\"code\":504"), "{text}");
+
+        mock.abort();
         shutdown_all().await;
         crate::bridge::reset_effective();
         crate::bridge::set_status(crate::bridge::BridgeStatus::Idle);
