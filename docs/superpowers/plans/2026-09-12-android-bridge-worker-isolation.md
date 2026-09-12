@@ -71,7 +71,7 @@ Control→Worker 只发 REQ/HB 请求/COOKIE/HANG；Worker→Control 只发 HELL
 **Interfaces:**
 - Produces: `Proto.encode(int reqId, int type, byte[] payload) -> byte[]`; `Proto.decode(byte[] buf, int off, int len) -> Frame|null`（null=不完整）; `Frame{int reqId,type; byte[] payload; int used}`; 常量 `Proto.T_HELLO=1 ... T_HANG=7`。payload JSON 用 org.json（android 内置；host 测试用 `deps/json.jar`? 无 → **Proto 不做 JSON 解析，只管字节帧**；JSON 组包留给调用方）。
 
-- [ ] **Step 1: 写失败测试 `hosttest/ProtoTest.java`**
+- [x] **Step 1: 写失败测试 `hosttest/ProtoTest.java`**
 
 ```java
 import com.quantumtv.bridge.ipc.Proto;
@@ -118,7 +118,7 @@ public class ProtoTest {
 }
 ```
 
-- [ ] **Step 2: 写 host 测试脚本 `hosttest/run_hosttests.ps1` 并确认失败**
+- [x] **Step 2: 写 host 测试脚本 `hosttest/run_hosttests.ps1` 并确认失败**
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -144,7 +144,7 @@ Write-Host "ALL HOSTTESTS OK"
 Run: `powershell -File android\spider-bridge\hosttest\run_hosttests.ps1`
 Expected: javac 失败（Proto.java 尚不存在）。注：脚本同时引用 Task 2 的三个类文件——先建空壳（见 Step 4 注释），或逐任务临时注释掉未建文件；以 Proto 为准先跑通 ProtoTest 亦可。
 
-- [ ] **Step 3: 实现 `ipc/Proto.java`**
+- [x] **Step 3: 实现 `ipc/Proto.java`**
 
 ```java
 package com.quantumtv.bridge.ipc;
@@ -209,12 +209,12 @@ public final class Proto {
 }
 ```
 
-- [ ] **Step 4: host 跑通**
+- [x] **Step 4: host 跑通**
 
 Run: `powershell -File android\spider-bridge\hosttest\run_hosttests.ps1`（临时只放开 ProtoTest 行亦可）
 Expected: `ProtoTest OK`。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add android/spider-bridge/src/com/quantumtv/bridge/ipc/Proto.java android/spider-bridge/hosttest
@@ -237,7 +237,7 @@ git commit -m "feat(android-ipc): LocalSocket 帧协议 Proto + host 往返测�
   - `TimeoutPolicy.hardMs(String method) -> long`（`"playerContent","search","detail","home","category","init"`；阶段 A: playerContent 90000, search/detail/home/category 60000, init 30000; `static volatile long PLAYERCONTENT_MS` 等便于 Task 10 调整与 `__test_stats` 展示）
   - `SourceBreaker(long openMs)`: `boolean allowPlayerContent(String cls)`; `void recordPlayerContentSuccess(String cls)`; `void recordPlayerContentTimeout(String cls)`（连续 3 次 → OPEN 30s → 半开放 1 探测）; `String snapshot()`（health 展示用）。
 
-- [ ] **Step 1: 写失败测试（三个 host main）**
+- [x] **Step 1: 写失败测试（三个 host main）**
 
 ```java
 // WorkerStateTest.java
@@ -297,9 +297,9 @@ public class SourceBreakerTest {
 }
 ```
 
-- [ ] **Step 2: 运行确认失败** — `powershell -File android\spider-bridge\hosttest\run_hosttests.ps1` → 编译失败。
+- [x] **Step 2: 运行确认失败** — `powershell -File android\spider-bridge\hosttest\run_hosttests.ps1` → 编译失败。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `ipc/WorkerState.java`:
 
@@ -410,9 +410,9 @@ public final class SourceBreaker {
 }
 ```
 
-- [ ] **Step 4: host 全绿** — `ALL HOSTTESTS OK`。
+- [x] **Step 4: host 全绿** — `ALL HOSTTESTS OK`。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add android/spider-bridge/src/com/quantumtv/bridge/ipc/WorkerState.java android/spider-bridge/src/com/quantumtv/bridge/ipc/TimeoutPolicy.java android/spider-bridge/src/com/quantumtv/bridge/control/SourceBreaker.java android/spider-bridge/hosttest
@@ -435,7 +435,7 @@ git commit -m "feat(android): 纯逻辑件 WorkerState/TimeoutPolicy/SourceBreak
 - Consumes: Task 1 Proto, Task 2 WorkerState
 - Produces: abstract LocalSocket 名 `"qtv.bridge.ctl.general"` / `"qtv.bridge.ctl.playback"`；`WorkerManager.state(String role) -> WorkerState`；`Map<String,Integer> workerPids()`（验收用）。Control 端 `readFrame/writeFrame` 走 `LocalSocket` 流。
 
-- [ ] **Step 1: manifest 加双 worker 进程**
+- [x] **Step 1: manifest 加双 worker 进程**
 
 `<application>` 内追加（BridgeService 之后）：
 
@@ -447,7 +447,7 @@ git commit -m "feat(android): 纯逻辑件 WorkerState/TimeoutPolicy/SourceBreak
             android:process=":spider_playback" android:exported="false" />
 ```
 
-- [ ] **Step 2: `BaseSpiderWorker` — 连控制面→HELLO→READY→心跳**
+- [x] **Step 2: `BaseSpiderWorker` — 连控制面→HELLO→READY→心跳**
 
 ```java
 package com.quantumtv.bridge.worker;
@@ -570,7 +570,7 @@ public class PlaybackWorkerService extends BaseSpiderWorker {
 }
 ```
 
-- [ ] **Step 3: `WorkerManager` 监听 + 登记**
+- [x] **Step 3: `WorkerManager` 监听 + 登记**
 
 ```java
 package com.quantumtv.bridge.control;
@@ -684,7 +684,7 @@ public final class WorkerManager {
 
 （import `android.content.Intent`。）
 
-- [ ] **Step 4: BridgeService 接线**
+- [x] **Step 4: BridgeService 接线**
 
 `onCreate` 之后字段区加 `public WorkerManager workers;`；`onStartCommand` 里 `TunnelClient.start(this);` 之前：
 
@@ -695,7 +695,7 @@ public final class WorkerManager {
 
 `onDestroy` 开头：`if (workers != null) workers.shutdown();`
 
-- [ ] **Step 5: 构建 + 装机验证（失败先行不可行, 用行为断言）**
+- [x] **Step 5: 构建 + 装机验证（失败先行不可行, 用行为断言）**
 
 ```powershell
 powershell -File android\spider-bridge\build.ps1
@@ -711,7 +711,7 @@ Start-Sleep 6
 
 Expected: 三进程都在（主 + `:spider_general` + `:spider_playback`），logcat 两条 `worker=<role> pid=NNN status=ready`。若某行缺失 = 本任务失败，修到绿。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add android/spider-bridge
@@ -733,7 +733,7 @@ git commit -m "feat(android): Worker 双进程声明 + HELLO/READY 握手 (contr
 - 超时双条件 kill（§19/§21/§67）：请求年龄 > `TimeoutPolicy.hardMs(method)` **或** 心跳停 >5s 且当前请求已超硬超时；先 `state=SUSPECT`（拒新请求 §31），`Process.killProcess(pid)`，`spawn` 重启。
 - Crash-loop（§40）：worker 死亡事件计数，30s 内第 2 次 → 照常重启；60s 内第 3 次 → `DISABLED`（health 可见，重启由 `/__test_stats` 人工/后续命令触发）。
 
-- [ ] **Step 1: 写验收脚本（先红）** `test_isolation.ps1`：
+- [x] **Step 1: 写验收脚本（先红）** `test_isolation.ps1`：
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -764,9 +764,9 @@ Write-Host "ISOLATION TESTS OK"
 
 （若模拟器 shell 无 curl：改用 `run_hosttests` 里同逻辑的 python 请求器；实现者按现场可用性二选一并在执行记录注明。）
 
-- [ ] **Step 2: 运行确认失败** — 当前 routeRequest 无 `/__test_hang`、无派发、无 watchdog → `FAIL[hard timeout kill]`。
+- [x] **Step 2: 运行确认失败** — 当前 routeRequest 无 `/__test_hang`、无派发、无 watchdog → `FAIL[hard timeout kill]`。
 
-- [ ] **Step 3: WorkerManager 派发 + watchdog + kill/restart**
+- [x] **Step 3: WorkerManager 派发 + watchdog + kill/restart**
 
 字段区追加：
 
@@ -896,7 +896,7 @@ watchdog 线程（start() 内启动）：
 
 `start()` 内：`new Thread(this::watchdogLoop, "WorkerWatchdog").start();`
 
-- [ ] **Step 4: worker 侧执行线程 + HANG**
+- [x] **Step 4: worker 侧执行线程 + HANG**
 
 `BaseSpiderWorker.onFrame` 替换为：
 
@@ -943,7 +943,7 @@ watchdog 线程（start() 内启动）：
 
 `BridgeService.onStartCommand` 里 `workers.start()` 之后无需额外动作（watchdog 已在 manager 内）。
 
-- [ ] **Step 5: BridgeService 路由改造（本任务范围：hang + 路由骨架，spider 实际调用 Task 6 接管）**
+- [x] **Step 5: BridgeService 路由改造（本任务范围：hang + 路由骨架，spider 实际调用 Task 6 接管）**
 
 `routeRequest` 中，`/health` 保持原样（control 自答），在其后加：
 
@@ -960,10 +960,10 @@ watchdog 线程（start() 内启动）：
 
 （`/__test_hang` 故意不等回包语义：worker 挂死后由 control watchdog 回 `worker_killed`——正是本任务要验的链路。）
 
-- [ ] **Step 6: 跑验收** — build + `test_isolation.ps1`
+- [x] **Step 6: 跑验收** — build + `test_isolation.ps1`
 Expected: `ISOLATION TESTS OK`。特别确认：kill 与 restart 日志、health 在挂死窗口内 200、`status=ready` 在 <3s 内出现。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add android/spider-bridge
@@ -981,7 +981,7 @@ git commit -m "feat(android): WorkerManager 派发 + Control 侧 Watchdog kill/r
 **Interfaces:**
 - Produces: 路由矩阵——`/playerContent` → ROLE_PLAYBACK；`/search` `/detail` `/home` `/category` → ROLE_GENERAL；`SourceBreaker` 在派发前拦截（playerContent 类级熔断 §41/§61）；`/health` 输出 §48 结构。
 
-- [ ] **Step 1: 扩展 test_isolation.ps1（先红）**
+- [x] **Step 1: 扩展 test_isolation.ps1（先红）**
 
 ```powershell
 # —— §61/§41: 连续 3 次 playerContent 超时 → 类级熔断, 第 4 次秒拒; general 不受影响
@@ -996,7 +996,7 @@ if ($search -notmatch '"general":"ready"') { throw "FAIL[general-alive]: $search
 Write-Host "BREAKER TESTS OK"
 ```
 
-- [ ] **Step 2: 实现路由矩阵 + 接线 Breaker + /health §48**
+- [x] **Step 2: 实现路由矩阵 + 接线 Breaker + /health §48**
 
 BridgeService 字段：`private final com.quantumtv.bridge.control.SourceBreaker breaker = new com.quantumtv.bridge.control.SourceBreaker(30_000, System::currentTimeMillis);`
 
@@ -1041,9 +1041,9 @@ BridgeService 字段：`private final com.quantumtv.bridge.control.SourceBreaker
 
 `ipcReq(m, cls, body)`: 把桌面 body 的 `class/keyword/ids/id/flag/tid/pg` 按方法重组为 worker REQ JSON `{"method":...,"class":...,"args":{...}}`（实现者按 do* 现有字段映射逐字搬，勿省略字段）。
 
-- [ ] **Step 3: 验收** — 重跑 `test_isolation.ps1` 两段 → `ISOLATION TESTS OK` + `BREAKER TESTS OK`；MuMu 上 `/search`（非 guard 类, 纯 java spider）确认走 general 有正常回包。
+- [x] **Step 3: 验收** — 重跑 `test_isolation.ps1` 两段 → `ISOLATION TESTS OK` + `BREAKER TESTS OK`；MuMu 上 `/search`（非 guard 类, 纯 java spider）确认走 general 有正常回包。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add android/spider-bridge
@@ -1063,7 +1063,7 @@ git commit -m "feat(android): 路由拆分 general/playback + playerContent 类�
 **Interfaces:**
 - Produces: worker 内 `SpiderExec.handle(String method, JSONObject-ish body) -> Resp`（1 线程 1 实例缓存，无锁——§57）；control `currentExt()` + cookie 广播。
 
-- [ ] **Step 1: SpiderExec 迁移**
+- [x] **Step 1: SpiderExec 迁移**
 
 逐字搬运 BridgeService:259-544 中 spider 执行路径，两处结构性修改：
 1. 删掉 `synchronized (spiderLock)` 外层与 `detailPending` 让锁循环（§27/§28——进程隔离即串行）；
@@ -1080,7 +1080,7 @@ git commit -m "feat(android): 路由拆分 general/playback + playerContent 类�
 
 （`jsonQuote` 把字符串包成 JSON 字面量并转义；SpiderExec 内部 `invoke` 与旧 `invokeSpider` 等价但返回 Resp 对象。）
 
-- [ ] **Step 2: cookie/ext 下发（§决策#2）**
+- [x] **Step 2: cookie/ext 下发（§决策#2）**
 
 `BridgeService.doSetCookie` 末尾（现有逻辑保留在 control：写 CookieManager+文件）追加广播：
 
@@ -1104,11 +1104,11 @@ git commit -m "feat(android): 路由拆分 general/playback + playerContent 类�
 
 worker `onCookie` → `SpiderExec.get().reinit(ext)`（清 spiderCache、写 `TV/.<drive>cookie` 文件兜底逻辑沿用 `writeCookieFile`）。
 
-- [ ] **Step 3: BridgeService 删净旧执行体**
+- [x] **Step 3: BridgeService 删净旧执行体**
 
 删除 `pool`（4 线程 HTTP 路由池保留用于 acceptLoop 的 control 侧快速路径：/health /init /setCookie /__test_*）；保留 `detailExecutor` 仅当 8080 兼容层仍需要同步回写——实际 spider 派发已是 CompletableFuture，**删 detailExecutor**（§57 收尾）。`initialized` 语义改为"control init 完成"，不再触发 spiderLock。`invalidateSpiders` 改为 `workers.broadcastCookie(ext, drives)`。
 
-- [ ] **Step 4: 验收**
+- [x] **Step 4: 验收**
 
 `test_isolation.ps1` 全绿 + 新增：
 
@@ -1121,7 +1121,7 @@ Write-Host "WORKER-EXEC OK"
 
 （`<NON_GUARD_CLASS>` 由执行者从当前订阅缓存的 spider.jar 类列表里选一个无 native 依赖的类；若无则本断言降级为"返回 500 且进程存活、health ready"。）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add android/spider-bridge
@@ -1139,7 +1139,7 @@ git commit -m "refactor(android): spider 执行体迁入 worker 进程, 删除�
 **Interfaces:**
 - Produces: `/init` = control 存 ext → 广播 → **立即返回** `{"code":200,"data":"{\"ok\":true,\"bridge\":\"ready\",\"worker\":\"starting\"}"}`；worker 首 REQ 时 lazy `SpiderExec.init`（native 库下载不再阻塞控制面，失败不拖垮 /init——§47）。桌面 `bridge_post_with` 对 data 只判 code → 零桌面改动。
 
-- [ ] **Step 1: doInit 重写**
+- [x] **Step 1: doInit 重写**
 
 ```java
     private String doInit(String body) {
@@ -1153,9 +1153,9 @@ git commit -m "refactor(android): spider 执行体迁入 worker 进程, 删除�
 
 （原 `ensureWexNativeLibs`+`Init.init` 从 doInit 移除——迁到 SpiderExec 首调用路径。）
 
-- [ ] **Step 2: 验收** — 挂死 playback 时 `/init` <1s 返回（curl 计时）；`test_isolation.ps1` 扩展断言 `health` 含 `"init":true`；桌面端 `/init ok (3ms)` 级日志重现（对照旧日志的 45005ms "伪 ok"）。
+- [x] **Step 2: 验收** — 挂死 playback 时 `/init` <1s 返回（curl 计时）；`test_isolation.ps1` 扩展断言 `health` 含 `"init":true`；桌面端 `/init ok (3ms)` 级日志重现（对照旧日志的 45005ms "伪 ok"）。
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add android/spider-bridge
@@ -1170,11 +1170,11 @@ git commit -m "refactor(android): /init 与 spider native 初始化解耦 (contr
 - Modify: `worker/SpiderExec.java` / `control/WorkerManager.java`
 - Create: `android/spider-bridge/test_metrics.ps1`
 
-- [ ] **Step 1: 每条 RESP 打 `[SpiderPerf]`**
+- [x] **Step 1: 每条 RESP 打 `[SpiderPerf]`**
 
 worker 侧：`[SpiderPerf] role= worker= pid= method= class= duration= status=`；control 侧派发完成同样打一行（双端可对账）。
 
-- [ ] **Step 2: 采集协议**
+- [x] **Step 2: 采集协议**
 
 ```powershell
 # test_metrics.ps1: 真机 PGBM10 隧道下, 由用户对各网盘线路各点 3~5 集播放,
@@ -1185,7 +1185,7 @@ worker 侧：`[SpiderPerf] role= worker= pid= method= class= duration= status=`�
 
 （执行任务：指导用户跑一轮夸克/百度/UC 播放采样；产出 `docs/superpowers/specs/2026-09-12-bridge-timeout-evidence.md` 汇总表。）
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add android/spider-bridge
@@ -1200,7 +1200,7 @@ git commit -m "feat(android): [SpiderPerf] 双端时长指标 + 采样脚本 (�
 - Modify: `crates/core/src/spider/player.rs`（classify）
 - Test: 同模块 tests
 
-- [ ] **Step 1: 失败测试**
+- [x] **Step 1: 失败测试**
 
 ```rust
     #[test]
@@ -1213,7 +1213,7 @@ git commit -m "feat(android): [SpiderPerf] 双端时长指标 + 采样脚本 (�
     }
 ```
 
-- [ ] **Step 2: classify 前插分支**
+- [x] **Step 2: classify 前插分支**
 
 ```rust
     if err.contains("worker_killed") || err.contains("worker_restarting")
@@ -1227,7 +1227,7 @@ git commit -m "feat(android): [SpiderPerf] 双端时长指标 + 采样脚本 (�
     }
 ```
 
-- [ ] **Step 3: 验证 + Commit**
+- [x] **Step 3: 验证 + Commit**
 
 `cargo test -p quantumtv-core` 全绿后：
 
@@ -1240,11 +1240,11 @@ git commit -m "fix(spider): worker_killed/熔断/重启中 归为执行环境故
 
 ### Task 10: 定值 + 总验收 + 文档
 
-- [ ] **Step 1: 用 Task 8 数据改 `TimeoutPolicy` 常量**（P95×2, 下限 30s）→ host TimeoutPolicyTest 断言随之更新 → rebuild → 装机。
-- [ ] **Step 2: §85 全量验收**：`test_isolation.ps1` 断言序列（①playerContent 永久挂死：search/detail/health/init/其他 spider 全正常 ②15s 级检测→kill→restart<3s ③worker 重启不断桌面 TCP ④3×超时→类级熔断且他源搜索正常 ⑤桌面 App 重启后隧道自动重建仍 ready）。
-- [ ] **Step 3: 真机夸克回归**：PGBM10 隧道下播放夸克线路 → 记录 `[BridgePerf]`/`[SpiderPerf]` → 对照验收；不达标 → 回 Task 8 加采样。
-- [ ] **Step 4: 文档**：`docs/adr/0004-android-bridge-worker-isolation.md`（决策+验收记录）；执行记录追加回本计划。
-- [ ] **Step 5: Commit**
+- [ ] **Step 1: 用 Task 8 数据改 `TimeoutPolicy` 常量**（P95×2, 下限 30s）→ host TimeoutPolicyTest 断言随之更新 → rebuild → 装机。⏳ 待真夸克采样。
+- [x] **Step 2: §85 全量验收**：`test_isolation.ps1` 断言序列（①playerContent 永久挂死：search/detail/health/init/其他 spider 全正常 ②15s 级检测→kill→restart<3s ③worker 重启不断桌面 TCP ④3×超时→类级熔断且他源搜索正常 ⑤桌面 App 重启后隧道自动重建仍 ready）。
+- [ ] **Step 3: 真机夸克回归**：PGBM10 隧道下播放夸克线路 → 记录 `[BridgePerf]`/`[SpiderPerf]` → 对照验收；不达标 → 回 Task 8 加采样。⏳ 待用户真机配合。
+- [x] **Step 4: 文档**：`docs/adr/0004-android-bridge-worker-isolation.md`（决策+验收记录）；执行记录追加回本计划。
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
