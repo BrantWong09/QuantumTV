@@ -69,7 +69,9 @@ public final class SpiderExec {
                 if (n <= 0) continue;
                 String cookie = new String(buf, 0, n, "UTF-8").trim();
                 if (cookie.isEmpty()) continue;
-                for (String h : cookieHosts(drive)) cm.setCookie("https://" + h + "/", cookie);
+                for (String h : cookieHosts(drive)) {
+                    setCookiePairs(cm, "https://" + h + "/", cookie);
+                }
                 Log.i(TAG, "restoreCookieFiles: " + drive + " " + cookie.length() + "B 已注入本进程");
             }
             cm.flush();
@@ -94,13 +96,25 @@ public final class SpiderExec {
         try {
             CookieManager cm = CookieManager.getInstance();
             cm.setAcceptCookie(true);
-            for (String h : hosts) cm.setCookie("https://" + h + "/", cookie);
+            for (String h : hosts) setCookiePairs(cm, "https://" + h + "/", cookie);
             cm.flush();
         } catch (Throwable t) {
             Log.w(TAG, "applyCookie: " + t);
         }
         writeCookieFile(app, drive, cookie);
         reinit(null);
+    }
+
+    /**
+     * CookieManager 按 RFC6265 一次只吃一条 k=v ("a=1; b=2" 整串会被当单条, 其余成属性丢弃 —
+     * 真机取证: jar 永远只有首个 _UP_28A_52_=381 15B)。TVBox 同款: 逐对 set。
+     */
+    public static void setCookiePairs(CookieManager cm, String url, String cookie) {
+        if (cookie == null || cookie.isEmpty()) return;
+        for (String pair : cookie.split(";")) {
+            String kv = pair.trim();
+            if (!kv.isEmpty() && kv.indexOf('=') > 0) cm.setCookie(url, kv);
+        }
     }
 
     public static String[] cookieHosts(String drive) {
@@ -165,6 +179,22 @@ public final class SpiderExec {
                 }
                 case "home":
                     return invokeSpider(cls, "homeContent", new Class<?>[]{boolean.class}, new Object[]{true});
+                case "__probe_cookie": { // 诊断: 在本进程 webview jar 上写→读, 返回长度不回显值
+                    try {
+                        String url = JsonLite.string(json, "url");
+                        String ck = JsonLite.string(json, "cookie");
+                        CookieManager cm = CookieManager.getInstance();
+                        cm.setAcceptCookie(true);
+                        String before = cm.getCookie(url);
+                        int beforeLen = before == null ? 0 : before.length();
+                        if (ck != null && !ck.isEmpty()) setCookiePairs(cm, url, ck);
+                        cm.flush();
+                        String now = cm.getCookie(url);
+                        java.io.File f = new java.io.File(app.getFilesDir(), "TV");
+                        return new Resp(200, null, "{\"before_len\":" + beforeLen + ",\"len\":"
+                                + (now == null ? 0 : now.length()) + ",\"tv_dir\":" + (f.exists() && f.isDirectory()) + "}");
+                    } catch (Throwable t) { return new Resp(500, "probe:" + t, null); }
+                }
                 case "category": {
                     String tid = JsonLite.string(json, "tid");
                     String pg = JsonLite.string(json, "pg");

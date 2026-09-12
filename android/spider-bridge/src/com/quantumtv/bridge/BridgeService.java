@@ -191,11 +191,34 @@ public class BridgeService extends Service {
             if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
                 return json(404, "not_found", null);
             }
+            String q = parseField(body, "probe_cookie");
+            if (q != null) { // 只报长度, 不回显 cookie 本体
+                String c = android.webkit.CookieManager.getInstance().getCookie(q);
+                return json(200, "ok", "{\"url\":\"" + JsonLite.escape(q)
+                        + "\",\"cookie_len\":" + (c == null ? 0 : c.length()) + "}");
+            }
             try {
                 long v = parseNum(body, "disable_recovery_ms", -1);
                 if (v > 0) WorkerManager.DISABLE_RECOVERY_MS = Math.max(500, v);
             } catch (Exception e) { return json(400, "bad_config", null); }
             return json(200, "ok", "{\"disable_recovery_ms\":" + WorkerManager.DISABLE_RECOVERY_MS + "}");
+        }
+        if ("/__test_probe".equals(path) && "POST".equalsIgnoreCase(method)) {
+            if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
+                return json(404, "not_found", null);
+            }
+            java.util.concurrent.CompletableFuture<String> f = new java.util.concurrent.CompletableFuture<>();
+            try {
+                byte[] req = ("{\"method\":\"__probe_cookie\",\"class\":\""
+                        + JsonLite.escape(parseField(body, "class") == null ? "probe" : parseField(body, "class"))
+                        + "\",\"url\":\"" + JsonLite.escape(parseField(body, "url")) + "\""
+                        + (parseField(body, "cookie") == null ? "" : ",\"cookie\":\""
+                            + JsonLite.escape(parseField(body, "cookie")) + "\"}") + "}").getBytes("UTF-8");
+                workers.dispatch(WorkerManager.ROLE_GENERAL, "__probe_cookie", req, r ->
+                        f.complete(json(r.code, r.err, r.data == null ? null : JsonLite.quote(r.data))));
+            } catch (Exception e) { return json(500, "probe_enc", null); }
+            try { return f.get(30, java.util.concurrent.TimeUnit.SECONDS); }
+            catch (Exception e) { return json(500, "probe_timeout", null); }
         }
         if (isSpiderOp(path) && "POST".equalsIgnoreCase(method)) {
             return dispatchSpider(path, body);
@@ -351,7 +374,7 @@ public class BridgeService extends Service {
             CookieManager cm = CookieManager.getInstance();
             cm.setAcceptCookie(true);
             for (String h : hosts) {
-                cm.setCookie("https://" + h + "/", cookie);
+                SpiderExec.setCookiePairs(cm, "https://" + h + "/", cookie);
             }
             cm.flush();
             SpiderExec.writeCookieFile(this, drive, cookie);

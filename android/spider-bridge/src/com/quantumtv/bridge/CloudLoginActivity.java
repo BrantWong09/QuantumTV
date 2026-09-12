@@ -36,7 +36,7 @@ public class CloudLoginActivity extends Activity {
     /** 登录页 URL 前缀, 用于判定已进入网盘主域 */
     private static final String[][] DRIVE_HOSTS = {
             {"quark", "quark.cn", "pan.quark.cn", "uop.quark.cn"},
-            {"uc", "uc.cn", "pc.uc.cn"},
+            {"uc", "drive.uc.cn", "uc.cn", "pc.uc.cn"},
             {"baidu", "pan.baidu.com", "pan.baidu.com"},
     };
 
@@ -136,7 +136,7 @@ public class CloudLoginActivity extends Activity {
             case "baidu":
                 return "https://pan.baidu.com/";
             case "uc":
-                return "https://pc.uc.cn/";
+                return "https://drive.uc.cn/";
             case "quark":
             default:
                 return "https://pan.quark.cn/";
