@@ -21,3 +21,10 @@
 - 正面: 挂死半径 = 单个 worker 进程；general 与 playback 互不连坐（§61 风暴验收过）；control 永不阻塞，`/health`、`/init`、隧道在 worker 全灭时仍正常；native 崩溃/内存泄漏可被重启回收；健康度与故障计数入 `/health`（§48 `sources_open`）。
 - 负面: 每请求多一次本机 socket 帧往返（实测排队+IPC 开销 ≈ 2ms，可忽略）；worker 重启丢 spider 实例缓存（首次类加载 ~2.5s 已在日志量化）；内存占用 +2 进程（~30MB×2，换取隔离值得）；JAR 反射需与 control 同 dex（经 build 合并 `spider_classes.dex`）。
 - 兼容: 隧道帧协议、HTTP 路由、`csp_*` 类名、订阅格式均不变；外部 TVBox 直连 8080 路径行为增强（不再全局连坐）。
+
+## 真机教训 (2026-09-12 首轮 PGBM10+MuMu 验证即暴雷, 已全部修复并有 Phase C 回归)
+
+1. **在途请求的 HB 静默 ≠ 死亡**：wex native 反调试/houdini dlopen 会连 HB 线程一起冻住 >5s，旧 Watchdog 的 `hbStale>5s → kill` 把合法慢初始化误杀 → 连环 3 杀 → crash_loop DISABLED → 全站 `worker_disabled`。修复：kill 权只属于 per-method 硬超时；`__test_freeze` 钩子常驻回归（Phase C1）。
+2. **watchdog 必须单例**：误建在 per-role 循环内 → 双 watchdog 并发 kill/重复计 death，2 次 hang 即提前熔。
+3. **每个 role 只认最新连接**：worker 重连产生的双 `connectionLoop` 会互相踩 `h.out`，RESP 滞留旧 socket 90s（orphan RESP）→ 已死 worker 被二次误杀。修复：connId 代数守卫 + supersede 旧连接；kill/disconnect 一律 `failAllPending`（§35 完整化）。
+4. **DISABLED 必须有半开自愈**：冷却窗口（默认 60s，`/health` 可见）到期自动重探，否则任何一次误杀都永久砖化本会话。
