@@ -35,6 +35,9 @@ public abstract class BaseSpiderWorker extends Service {
 
     @Override public void onCreate() {
         super.onCreate();
+        // WebView 单数据目录不支持多进程共用 (Chromium 文件锁互踩 → CookieManager 卡死 60s+ 真机取证):
+        // 每个 worker 进程用独立后缀, 登录态经 files/TV cookie 文件 + T_COOKIE 下发同步
+        try { android.webkit.WebView.setDataDirectorySuffix("worker_" + role()); } catch (Throwable ignored) { }
         // worker 进程独立 WebView CookieManager (§决策#2): 登录后由控制面 T_COOKIE 显式下发
         SpiderExec.get().attach(getApplicationContext(), "");
     }
