@@ -46,6 +46,36 @@ public final class SpiderExec {
     public void attach(Context app, String ext) {
         this.app = app;
         this.extConfig = ext == null ? "" : ext;
+        restoreCookieFiles();
+    }
+
+    /**
+     * 进程隔离回归修复: spider 读的是本进程 webkit CookieManager, 而登录 cookie 由主进程
+     * CloudLoginActivity 写入其独立 jar; 文件通道 files/TV/.<drive>cookie 是唯一跨进程真相源
+     * (桌面从不重推, control cookieStore 重启即空)。worker 启动时据此回填本进程。
+     */
+    public void restoreCookieFiles() {
+        if (app == null) return;
+        try {
+            CookieManager cm = CookieManager.getInstance();
+            cm.setAcceptCookie(true);
+            for (String drive : new String[]{"quark", "uc", "baidu"}) {
+                File f = new File(new File(app.getFilesDir(), "TV"), "." + drive + "cookie");
+                if (!f.exists() || f.length() == 0) continue;
+                byte[] buf = new byte[(int) f.length()];
+                java.io.FileInputStream fis = new java.io.FileInputStream(f);
+                int n = fis.read(buf);
+                fis.close();
+                if (n <= 0) continue;
+                String cookie = new String(buf, 0, n, "UTF-8").trim();
+                if (cookie.isEmpty()) continue;
+                for (String h : cookieHosts(drive)) cm.setCookie("https://" + h + "/", cookie);
+                Log.i(TAG, "restoreCookieFiles: " + drive + " " + cookie.length() + "B 已注入本进程");
+            }
+            cm.flush();
+        } catch (Throwable t) {
+            Log.w(TAG, "restoreCookieFiles: " + t);
+        }
     }
 
     /** 网盘 cookie/ext 变更: 清实例缓存, 下次调用按最新 CookieManager/文件重建 (§28 下发通道) */
