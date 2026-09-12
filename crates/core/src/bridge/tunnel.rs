@@ -215,20 +215,27 @@ async fn bridge_accept_loop(listener: TcpListener) {
             _ = NOTIFY.notified() => return,
             r = listener.accept() => match r { Ok(x) => x, Err(_) => return },
         };
-        tokio::spawn(handle_bridge_client(stream));
+        tokio::spawn(handle_bridge_session(stream));
     }
 }
 
-async fn handle_bridge_client(mut stream: TcpStream) {
-    let Some(raw) = read_http_request(&mut stream).await else { return };
-    let session = ACTIVE.lock().unwrap().clone();
-    let Some(session) = session else { return }; // 无隧道: 直接关连接 → reqwest 传输错误
-    let kind = RequestKind::from_path(request_path(&raw));
-    let body = match session.request(kind, raw).await {
-        Ok(b) => b,
-        Err(e) => e.to_err_json().into_bytes(),
-    };
-    write_http_response(&mut stream, &body).await;
+/// 方案 §16: 一条客户端连接 = 一个 HTTP 会话, 循环服务多个请求 (keep-alive)
+async fn handle_bridge_session(mut stream: TcpStream) {
+    loop {
+        // 空闲读兜底 120s: keep-alive 客户端(reqwest 池)长时间不发请求则关闭任务
+        let read =
+            tokio::time::timeout(Duration::from_secs(120), read_http_request(&mut stream));
+        let Ok(Some(raw)) = read.await else { return };
+        let Some(session) = ACTIVE.lock().unwrap().clone() else { return };
+        let kind = RequestKind::from_path(request_path(&raw));
+        let body = match session.request(kind, raw).await {
+            Ok(b) => b,
+            Err(e) => e.to_err_json().into_bytes(),
+        };
+        if !write_http_response(&mut stream, &body).await {
+            return; // 客户端已断开
+        }
+    }
 }
 
 /// 请求行路径 ("POST /search HTTP/1.1" → "/search")
@@ -238,15 +245,16 @@ fn request_path(raw: &[u8]) -> &str {
     line.split_whitespace().nth(1).unwrap_or("/")
 }
 
-/// 写 HTTP 响应头+体并关闭 (本任务保持 Connection: close; Task 3 改 keep-alive)
-async fn write_http_response(stream: &mut TcpStream, body: &[u8]) {
+/// 写 keep-alive HTTP 响应 (连接保持, 由循环继续服务下一个请求); 写失败返回 false
+async fn write_http_response(stream: &mut TcpStream, body: &[u8]) -> bool {
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
         body.len()
     );
-    let _ = stream.write_all(head.as_bytes()).await;
-    let _ = stream.write_all(body).await;
-    let _ = stream.shutdown().await;
+    if stream.write_all(head.as_bytes()).await.is_err() {
+        return false;
+    }
+    stream.write_all(body).await.is_ok()
 }
 
 /// 读完整 HTTP 请求 (头 + Content-Length body); 返回原始字节
@@ -386,9 +394,8 @@ mod tests {
         // spider 层视角: 连虚拟桥接发 /health, 收 200 + JSON
         let mut s = tokio::net::TcpStream::connect(("127.0.0.1", bridge_port)).await.unwrap();
         s.write_all(b"POST /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.unwrap();
-        let mut buf = Vec::new();
-        s.read_to_end(&mut buf).await.unwrap();
-        let text = String::from_utf8_lossy(&buf);
+        // keep-alive: 服务端不再主动关闭连接, 按 Content-Length 精确读一个响应
+        let text = read_http_response(&mut s).await;
         assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
         assert!(text.contains("\"code\":200"), "{text}");
 
@@ -421,9 +428,8 @@ mod tests {
         let started = std::time::Instant::now();
         let mut s = tokio::net::TcpStream::connect(("127.0.0.1", bridge_port)).await.unwrap();
         s.write_all(b"POST /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.unwrap();
-        let mut buf = Vec::new();
-        s.read_to_end(&mut buf).await.unwrap();
-        let text = String::from_utf8_lossy(&buf);
+        // keep-alive: 按 Content-Length 精确读一个响应 (read_to_end 会挂到空闲超时)
+        let text = read_http_response(&mut s).await;
         assert!(started.elapsed() < std::time::Duration::from_secs(4), "超时必须快速失败");
         assert!(text.contains("\"code\":504"), "{text}");
 
@@ -431,5 +437,79 @@ mod tests {
         shutdown_all().await;
         crate::bridge::reset_effective();
         crate::bridge::set_status(crate::bridge::BridgeStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn bridge_keep_alive_serves_multiple_requests_per_connection() {
+        // 方案 §15/§16: 一条 TCP 客户端连接服务多个 HTTP 请求
+        let _g = tunnel_lock();
+        let tl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tunnel_port = tl.local_addr().unwrap().port();
+        let bridge_port = bl.local_addr().unwrap().port();
+        serve(tl, bl, format!("http://127.0.0.1:{bridge_port}")).await;
+
+        let mock = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", tunnel_port)).await.unwrap();
+            write_frame(&mut s, 0, br#"{"device":"KeepMu","apk":"1.1"}"#).await.unwrap();
+            for _ in 0..2 {
+                let f = read_frame(&mut s).await.unwrap();
+                assert!(f.payload.starts_with(b"POST /health"));
+                write_frame(&mut s, f.id, b"{\"code\":200,\"err\":\"ok\",\"data\":\"{}\"}")
+                    .await
+                    .unwrap();
+            }
+        });
+
+        assert!(wait_registration(std::time::Duration::from_secs(3)).await);
+
+        // 同一 TCP 连接上依次发两个 HTTP 请求, 都能得到完整响应
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", bridge_port)).await.unwrap();
+        s.write_all(b"POST /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        let resp1 = read_http_response(&mut s).await;
+        assert!(resp1.starts_with("HTTP/1.1 200 OK"), "{resp1}");
+        assert!(resp1.contains("\"code\":200"), "{resp1}");
+        assert!(resp1.contains("Connection: keep-alive"), "{resp1}");
+
+        s.write_all(b"POST /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        let resp2 = read_http_response(&mut s).await;
+        assert!(resp2.contains("\"code\":200"), "{resp2}");
+
+        mock.await.unwrap();
+        shutdown_all().await;
+        crate::bridge::reset_effective();
+        crate::bridge::set_status(crate::bridge::BridgeStatus::Idle);
+    }
+
+    /// 测试辅助: 按 Content-Length 读完整一个 HTTP 响应 (keep-alive 连接不能 read_to_end)
+    async fn read_http_response(s: &mut tokio::net::TcpStream) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let header_end = loop {
+            let n = s.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "连接被对端关闭");
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let content_length: usize = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    v.trim().parse().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        while buf.len() < header_end + content_length {
+            let n = s.read(&mut tmp).await.unwrap();
+            assert!(n > 0);
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        format!("{}{}", head, String::from_utf8_lossy(&buf[header_end..]))
     }
 }
