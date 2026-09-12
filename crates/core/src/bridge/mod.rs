@@ -1,4 +1,5 @@
 pub mod tunnel;
+pub(crate) mod session;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
