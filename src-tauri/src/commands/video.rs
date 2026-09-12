@@ -118,6 +118,43 @@ impl SearchCacheManager {
     }
 }
 
+/// Bridge/Spider 站点级搜索缓存 (方案 §8: key=spider_id+keyword, TTL 60s)。
+/// 用户"搜索→详情→返回→再搜索"与换关键词回退场景不重复打 Android Spider;
+/// try_get_with 兼带请求级 SingleFlight, 失败结果不入缓存。
+pub(crate) struct BridgeSearchCache {
+    cache: Cache<String, Arc<Vec<SearchResult>>>,
+}
+
+impl BridgeSearchCache {
+    pub fn new() -> Self {
+        Self {
+            cache: Cache::builder()
+                .max_capacity(500)
+                .time_to_live(std::time::Duration::from_secs(60))
+                .build(),
+        }
+    }
+
+    pub async fn get_or_insert_with<F, Fut>(
+        &self,
+        key: String,
+        fetch: F,
+    ) -> Result<Vec<SearchResult>, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<SearchResult>, String>>,
+    {
+        self.cache
+            .try_get_with(key, async { fetch().await.map(Arc::new) })
+            .await
+            .map(|v| (*v).clone())
+            .map_err(|e| (*e).clone())
+    }
+}
+
+pub(crate) static BRIDGE_SEARCH_CACHE: std::sync::LazyLock<BridgeSearchCache> =
+    std::sync::LazyLock::new(BridgeSearchCache::new);
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GetVideoDetailOptimizedResponse {
     pub detail: SearchResult,
@@ -1089,54 +1126,73 @@ pub(crate) async fn search_site_results(
             return Ok(vec![]);
         }
         let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
-        let items = if quantumtv_core::spider::is_bridge_class(class_name) {
-            // wex Guard 类: 走 Android 桥接 (含 OLLVM/DexNative 保护, JVM 无法加载)
-            let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
-                return Err("桥接未就绪".to_string());
-            };
-            quantumtv_core::spider::spider_bridge_search(class_name, query, &bridge_url).await?
-        } else {
-            let spider = site.spider.clone().unwrap_or_default();
-            quantumtv_core::spider::spider_search(
-                &site.key, query, class_name, &spider, cache_root,
-            )
-            .await?
-        };
+        // 方案 §8: 站点级搜索缓存 key = spider_id + keyword (闭包须 'static, 借用字段全部 clone)
+        let cache_key = format!("bridge-search:{}:{}", site.key, query);
+        let class_owned = class_name.to_string();
+        let query_owned = query.to_string();
+        let source_key = site.key.clone();
+        let source_name = site.name.clone();
+        let source_site_type = site.site_type;
+        let spider_owned = site.spider.clone().unwrap_or_default();
+        let cache_root_owned = cache_root.to_path_buf();
 
-        let results = items
-            .into_iter()
-            .map(|item| {
-                let play_url = item.vod_play_url.as_deref().unwrap_or("");
-                let (episodes, episodes_titles, play_groups) =
-                    parse_episode_groups(play_url, item.vod_play_from.as_deref(), true);
-                SearchResult {
-                    id: match item.vod_id {
-                        Value::String(s) => s,
-                        Value::Number(n) => n.to_string(),
-                        _ => "".to_string(),
-                    },
-                    title: item.vod_name.trim().to_string(),
-                    poster: item.vod_pic,
-                    episodes,
-                    episodes_titles,
-                    play_groups,
-                    source: site.key.clone(),
-                    source_name: site.name.clone(),
-                    class: item.vod_class,
-                    year: item.vod_year,
-                    desc: item.vod_content.map(|c| clean_html_tags(&c)),
-                    type_name: item.type_name,
-                    douban_id: item
-                        .vod_douban_id
-                        .and_then(|v| v.as_i64())
-                        .map(|v| v as i32),
-                    source_site_type: site.site_type,
-                    login_hint: None,
-                    episodes_raw: Vec::new(),
-                }
+        BRIDGE_SEARCH_CACHE
+            .get_or_insert_with(cache_key, || async move {
+                let items = if quantumtv_core::spider::is_bridge_class(&class_owned) {
+                    // wex Guard 类: 走 Android 桥接 (含 OLLVM/DexNative 保护, JVM 无法加载)
+                    let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
+                        return Err("桥接未就绪".to_string());
+                    };
+                    quantumtv_core::spider::spider_bridge_search(
+                        &class_owned, &query_owned, &bridge_url,
+                    )
+                    .await?
+                } else {
+                    quantumtv_core::spider::spider_search(
+                        &source_key,
+                        &query_owned,
+                        &class_owned,
+                        &spider_owned,
+                        &cache_root_owned,
+                    )
+                    .await?
+                };
+
+                Ok(items
+                    .into_iter()
+                    .map(|item| {
+                        let play_url = item.vod_play_url.as_deref().unwrap_or("");
+                        let (episodes, episodes_titles, play_groups) =
+                            parse_episode_groups(play_url, item.vod_play_from.as_deref(), true);
+                        SearchResult {
+                            id: match item.vod_id {
+                                Value::String(s) => s,
+                                Value::Number(n) => n.to_string(),
+                                _ => "".to_string(),
+                            },
+                            title: item.vod_name.trim().to_string(),
+                            poster: item.vod_pic,
+                            episodes,
+                            episodes_titles,
+                            play_groups,
+                            source: source_key.clone(),
+                            source_name: source_name.clone(),
+                            class: item.vod_class,
+                            year: item.vod_year,
+                            desc: item.vod_content.map(|c| clean_html_tags(&c)),
+                            type_name: item.type_name,
+                            douban_id: item
+                                .vod_douban_id
+                                .and_then(|v| v.as_i64())
+                                .map(|v| v as i32),
+                            source_site_type,
+                            login_hint: None,
+                            episodes_raw: Vec::new(),
+                        }
+                    })
+                    .collect::<Vec<SearchResult>>())
             })
-            .collect();
-        Ok(results)
+            .await
     } else {
         let search_url = format!(
             "{}?ac=videolist&wd={}",
@@ -4059,5 +4115,71 @@ mod home_catalog_tests {
         assert_eq!(card.year.as_deref(), Some("2020"));
         assert_eq!(card.class.as_deref(), Some("电影"));
         assert_eq!(card.episodes.len(), 2);
+    }
+
+    // ---- Bridge/Spider 站点级搜索缓存 (方案 §8) ----
+
+    fn ok_fetch(
+        c: Arc<std::sync::atomic::AtomicU32>,
+    ) -> impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<SearchResult>, String>> + Send>>
+           + Send
+           + 'static {
+        move || {
+            let c = c.clone();
+            Box::pin(async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<Vec<SearchResult>, String>(vec![])
+            })
+        }
+    }
+
+    fn err_fetch(
+        c: Arc<std::sync::atomic::AtomicU32>,
+    ) -> impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<SearchResult>, String>> + Send>>
+           + Send
+           + 'static {
+        move || {
+            let c = c.clone();
+            Box::pin(async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<Vec<SearchResult>, String>("boom".into())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_search_cache_hit_avoids_refetch() {
+        // 方案 §8/§38: 重复搜索必须命中缓存, 不再访问 Bridge
+        let cache = BridgeSearchCache::new();
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let r1 = cache
+            .get_or_insert_with("k1:斗破".into(), ok_fetch(counter.clone()))
+            .await;
+        let r2 = cache
+            .get_or_insert_with("k1:斗破".into(), ok_fetch(counter.clone()))
+            .await;
+        assert!(r1.is_ok() && r2.is_ok());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // 不同关键词各自独立缓存
+        let _ = cache
+            .get_or_insert_with("k1:斗破苍穹".into(), ok_fetch(counter.clone()))
+            .await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn bridge_search_cache_error_not_cached() {
+        // 失败不缓存: 下次可重试
+        let cache = BridgeSearchCache::new();
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        assert!(cache
+            .get_or_insert_with("k2:x".into(), err_fetch(counter.clone()))
+            .await
+            .is_err());
+        assert!(cache
+            .get_or_insert_with("k2:x".into(), err_fetch(counter.clone()))
+            .await
+            .is_err());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }
