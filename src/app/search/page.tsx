@@ -35,6 +35,7 @@ type SearchPageOpenResponse = {
   fluidSearch: boolean;
   results: SearchResult[];
   cacheHit: boolean;
+  generation: number;
   filterCategoriesAll: SearchFilterCategory[];
   filterCategoriesAgg: SearchFilterCategory[];
 };
@@ -115,6 +116,8 @@ function SearchPageClient() {
 
   // 流式搜索的渐进式结果: 每个站点完成即上屏(客户端聚合), 搜索完成后被权威结果替换
   const streamingRef = useRef<SearchResult[]>([]);
+  // 搜索代际守卫 (方案 §7): 只接受最新一次搜索的流式事件, 旧代际结果直接丢弃
+  const generationRef = useRef<number>(-1);
   // 渲染节流: 滑动/滚动期间站点事件密集, 用 rAF 合并渲染避免列表卡顿
   const streamRafRef = useRef<number | null>(null);
   const streamDirtyRef = useRef(false);
@@ -325,9 +328,14 @@ function SearchPageClient() {
     // 重置流式累积
     streamingRef.current = [];
 
+    // 新搜索启动即断旧搜索 (方案 §7): Rust 侧旧代际任务在站点间检查点自行退出
+    invoke('abort_active_search').catch(() => {});
+
     // 调用搜索命令
     invoke<SearchPageOpenResponse>('search_page_open', { query: qParam })
       .then((response) => {
+        const gen = response?.generation ?? -1;
+        if (gen > generationRef.current) generationRef.current = gen;
         setSearchHistory(response?.searchHistory || []);
         setUseFluidSearch(response?.fluidSearch ?? true);
         setFilterOptions({
@@ -391,6 +399,12 @@ function SearchPageClient() {
       try {
         // 监听流式结果事件: 增量累积已到达的站点结果, 立即分组上屏
         unlistenStream = await listen<any>('search-stream-result', (event) => {
+          // 方案 §7: 代际单调递增, 低于已见最大代际的事件属于被取代的旧搜索, 丢弃
+          const gen = event.payload?.generation;
+          if (typeof gen === 'number') {
+            if (gen < generationRef.current) return;
+            generationRef.current = gen;
+          }
           const { total_sources, completed_sources, results } = event.payload;
           setTotalSources(total_sources);
           setCompletedSources(completed_sources);
@@ -410,7 +424,13 @@ function SearchPageClient() {
         });
 
         // 监听搜索完成事件: 后端权威聚合(含过滤/排序)替换渐进式结果
-        unlistenCompleted = await listen<any>('search-stream-completed', () => {
+        unlistenCompleted = await listen<any>('search-stream-completed', (event) => {
+          // 方案 §7: 旧搜索的完成事件不得触发权威结果拉取
+          const gen = event.payload?.generation;
+          if (typeof gen === 'number') {
+            if (gen < generationRef.current) return;
+            generationRef.current = gen;
+          }
           streamingRef.current = [];
           if (streamRafRef.current != null) {
             cancelAnimationFrame(streamRafRef.current);

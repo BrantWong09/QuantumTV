@@ -615,6 +615,8 @@ pub struct SearchStreamEvent {
     pub source_name: String,
     pub total_sources: i32,
     pub completed_sources: i32,
+    /// 本次搜索的代际: 前端只接受 generation == 最新代际的事件 (方案 §7)
+    pub generation: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -949,6 +951,11 @@ pub fn abort_active_search() {
     SEARCH_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// 当前代际值 (缓存命中/空查询路径回填 generation 用)
+pub(crate) fn current_search_generation() -> u64 {
+    SEARCH_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// 检查指定代际的搜索是否已被新的代际取代
 fn search_generation_is_stale(my_gen: u64) -> bool {
     SEARCH_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != my_gen
@@ -1258,10 +1265,11 @@ pub(crate) async fn search_with_cache_hit(
     storage: State<'_, StorageManager>,
     cache: State<'_, SearchCacheManager>,
     db: &crate::db::db_client::Db,
-) -> Result<(Vec<SearchResult>, bool), String> {
+) -> Result<(Vec<SearchResult>, bool, u64), String> {
     // 首先尝试从缓存获取结果
     if let Some(cached_results) = cache.get(&query).await {
-        return Ok((cached_results, true));
+        // 缓存命中不产生新代际: 返回当前值供前端对齐守卫
+        return Ok((cached_results, true, current_search_generation()));
     }
 
     let config = get_config_with_db_sources(&storage, db)?;
@@ -1316,7 +1324,7 @@ pub(crate) async fn search_with_cache_hit(
         };
 
     if sites.is_empty() {
-        return Ok((vec![], false));
+        return Ok((vec![], false, current_search_generation()));
     }
 
     // 读取过滤配置
@@ -1333,7 +1341,7 @@ pub(crate) async fn search_with_cache_hit(
 
     // 过滤后如果没有源了，直接返回
     if sites.is_empty() {
-        return Ok((vec![], false));
+        return Ok((vec![], false, current_search_generation()));
     }
 
     let total_sources = sites.len() as i32;
@@ -1376,6 +1384,7 @@ pub(crate) async fn search_with_cache_hit(
                         source_name: site_name.to_string(),
                         total_sources,
                         completed_sources: completed.get(),
+                        generation: my_generation,
                     },
                 );
             }
@@ -1386,7 +1395,7 @@ pub(crate) async fn search_with_cache_hit(
     for site in &sites {
         // 代际检查点 1: 已有更新的搜索启动(如用户点了播放), 立即停止, 不再请求后续站点
         if search_generation_is_stale(my_generation) {
-            return Ok((Vec::new(), false));
+            return Ok((Vec::new(), false, my_generation));
         }
 
         // 按 site_type 分流搜索,统一产出 Vec<SearchResult>
@@ -1402,7 +1411,7 @@ pub(crate) async fn search_with_cache_hit(
             Err(_) => {
                 // 代际已过期: 静默退出(不emit)
                 if search_generation_is_stale(my_generation) {
-                    return Ok((Vec::new(), false));
+                    return Ok((Vec::new(), false, my_generation));
                 }
                 emit_stream_event(&completed, &site.key, &site.name, vec![]);
                 continue;
@@ -1411,7 +1420,7 @@ pub(crate) async fn search_with_cache_hit(
 
         // 代际检查点 2: 搜索期间用户点播放/发起新搜索, 丢弃结果并停止流式事件
         if search_generation_is_stale(my_generation) {
-            return Ok((Vec::new(), false));
+            return Ok((Vec::new(), false, my_generation));
         }
 
         // 流式输出前进行内容关键词过滤(源已经在搜索前过滤了)
@@ -1428,7 +1437,7 @@ pub(crate) async fn search_with_cache_hit(
 
     // 代际已过期: 本轮搜索已被取代, 不聚合/不缓存/不发完成事件
     if search_generation_is_stale(my_generation) {
-        return Ok((Vec::new(), false));
+        return Ok((Vec::new(), false, my_generation));
     }
 
     // Filter duplicates
@@ -1492,7 +1501,8 @@ pub(crate) async fn search_with_cache_hit(
                 "search-stream-completed",
                 serde_json::json!({
                     "total": unique_results.len(),
-                    "query": query
+                    "query": query,
+                    "generation": my_generation
                 }),
             );
         }
@@ -1503,7 +1513,7 @@ pub(crate) async fn search_with_cache_hit(
         cache.set(query, unique_results.clone()).await;
     }
 
-    Ok((unique_results, false))
+    Ok((unique_results, false, my_generation))
 }
 
 #[tauri::command]
@@ -1514,7 +1524,7 @@ pub async fn search(
     cache: State<'_, SearchCacheManager>,
     db: State<'_, crate::db::db_client::Db>,
 ) -> Result<Vec<SearchResult>, String> {
-    let (results, _cache_hit) =
+    let (results, _cache_hit, _generation) =
         search_with_cache_hit(query, app_handle, storage, cache, &db).await?;
     Ok(results)
 }
@@ -2681,7 +2691,7 @@ pub async fn initialize_player_by_query(
         return Err("Missing query".to_string());
     }
 
-    let (results, _) =
+    let (results, _, _generation) =
         search_with_cache_hit(query.to_string(), app_handle.clone(), storage.clone(), cache, &db)
             .await?;
     let filter_title = request.filter_title.trim();

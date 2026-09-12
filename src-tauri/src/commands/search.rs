@@ -1,5 +1,5 @@
 use crate::commands::config::{get_user_preferences, UserPreferences};
-use crate::commands::video::{search_with_cache_hit, SearchCacheManager};
+use crate::commands::video::{current_search_generation, search_with_cache_hit, SearchCacheManager};
 use crate::db::db_client::Db;
 use crate::db::search_history::get_search_history;
 use crate::storage::StorageManager;
@@ -325,6 +325,8 @@ pub struct SearchPageBootstrap {
 pub struct SearchPageQueryResponse {
     pub results: Vec<SearchResult>,
     pub cache_hit: bool,
+    /// 本次搜索的代际 (方案 §7): 前端以此守卫流式事件
+    pub generation: u64,
     pub filter_categories_all: Vec<SearchFilterCategory>,
     pub filter_categories_agg: Vec<SearchFilterCategory>,
 }
@@ -336,6 +338,8 @@ pub struct SearchPageOpenResponse {
     pub fluid_search: bool,
     pub results: Vec<SearchResult>,
     pub cache_hit: bool,
+    /// 本次搜索的代际 (方案 §7): 前端以此守卫流式事件
+    pub generation: u64,
     pub filter_categories_all: Vec<SearchFilterCategory>,
     pub filter_categories_agg: Vec<SearchFilterCategory>,
 }
@@ -558,7 +562,7 @@ pub async fn search_page_query(
     db: State<'_, Db>,
     result_cache: State<'_, SearchResultCache>,
 ) -> Result<SearchPageQueryResponse, String> {
-    let (results, cache_hit) =
+    let (results, cache_hit, generation) =
         search_with_cache_hit(query.clone(), app_handle, storage, cache, &db).await?;
 
     // 保存搜索结果到缓存
@@ -569,6 +573,7 @@ pub async fn search_page_query(
     Ok(SearchPageQueryResponse {
         results,
         cache_hit,
+        generation,
         filter_categories_all: filter_categories.clone(),
         filter_categories_agg: filter_categories,
     })
@@ -587,8 +592,8 @@ pub async fn search_page_open(
     let preferences = get_user_preferences(storage.clone()).await?;
 
     let trimmed_query = query.unwrap_or_default().trim().to_string();
-    let (results, cache_hit) = if trimmed_query.is_empty() {
-        (Vec::new(), false)
+    let (results, cache_hit, generation) = if trimmed_query.is_empty() {
+        (Vec::new(), false, current_search_generation())
     } else {
         search_with_cache_hit(trimmed_query.clone(), app_handle, storage, cache, &db).await?
     };
@@ -605,6 +610,7 @@ pub async fn search_page_open(
         fluid_search: preferences.fluid_search,
         results,
         cache_hit,
+        generation,
         filter_categories_all: filter_categories.clone(),
         filter_categories_agg: filter_categories,
     })
