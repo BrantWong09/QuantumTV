@@ -18,7 +18,7 @@ $tests = Get-ChildItem $PSScriptRoot -Filter *Test.java | ForEach-Object { $_.Fu
 
 $oldEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
-& "$jdk\bin\javac.exe" -encoding UTF-8 -nowarn -d $out $srcs $tests 2>&1 | Out-Null
+& "$jdk\bin\javac.exe" -encoding UTF-8 -nowarn -d $out $srcs $tests 2>&1 | Tee-Object -FilePath "$out\javac.log" | Out-Host
 $ErrorActionPreference = $oldEAP
 if ($LASTEXITCODE -ne 0) { throw "hosttest javac failed" }
 
