@@ -12,9 +12,27 @@ use crate::resolver::{RawPlayResult, ResolveError, SpiderPlayFetcher};
 /// 把 spider 错误字符串归类为 Resolver 错误模型。
 /// 桥接透传的 Java 异常 (InvocationTargetException/JSONException/bridge error)
 /// 几乎都是 spider 内部调网盘 API 失败 (未登录网盘/cookie 失效) → 认证类。
+/// 注意: 会话层超时/断连也走 "bridge error: bridge_timeout" 形态, 必须先于
+/// 泛化认证分支判定, 否则超时会被谎报成"需要登录网盘"。
 pub(crate) fn classify_spider_error(class_name: &str, flag: &str, err: &str) -> ResolveError {
     let source = "spider".to_string();
     let short = short_err(err);
+    if err.contains("bridge_timeout") || err.contains("timed out") || err.contains("timeout")
+        || err.contains("超时")
+    {
+        return ResolveError::Timeout {
+            source,
+            message: short,
+        };
+    }
+    if err.contains("bridge_disconnected") || err.contains("bridge_send_failed")
+        || err.contains("bridge_not_connected")
+    {
+        return ResolveError::NetworkError {
+            source,
+            message: "桥接连接已断开, 请确认手机/模拟器桥接在线后重试".into(),
+        };
+    }
     if err.contains("InvocationTargetException")
         || err.contains("JSONException")
         || err.contains("bridge error")
@@ -26,12 +44,6 @@ pub(crate) fn classify_spider_error(class_name: &str, flag: &str, err: &str) -> 
                 netdisk_login_hint_for(class_name, flag),
                 short
             ),
-        };
-    }
-    if err.contains("timed out") || err.contains("timeout") || err.contains("超时") {
-        return ResolveError::Timeout {
-            source,
-            message: short,
         };
     }
     ResolveError::NetworkError {
@@ -301,7 +313,10 @@ fn short_err(e: &str) -> String {
 
 #[cfg(test)]
 mod hint_tests {
-    use super::{netdisk_login_hint, netdisk_login_hint_for};
+    use super::{
+        classify_spider_error, netdisk_login_hint, netdisk_login_hint_for,
+    };
+    use crate::resolver::ResolveError;
 
     #[test]
     fn login_hint_by_class_name() {
@@ -319,5 +334,43 @@ mod hint_tests {
         assert!(netdisk_login_hint_for("WexWoXunLeiPanGuard", "迅雷原画").contains("迅雷"));
         // flag 无信息时退回按类名推断
         assert!(netdisk_login_hint_for("WexquarkGuard", "").contains("夸克"));
+    }
+
+    #[test]
+    fn bridge_timeout_classifies_as_timeout_not_auth() {
+        // 会话层 504 串形如 "bridge error: bridge_timeout" — 必须归 Timeout,
+        // 不能谎报"需要登录夸克网盘" (回归: 2026-09-12 wex 设备超时被误分类)
+        let e = classify_spider_error(
+            "WexmuouggGuard",
+            "夸克原画",
+            "bridge error: bridge_timeout",
+        );
+        assert!(
+            matches!(e, ResolveError::Timeout { .. }),
+            "timeout 被误分类为: {e:?}"
+        );
+    }
+
+    #[test]
+    fn bridge_disconnect_classifies_as_network() {
+        let e = classify_spider_error(
+            "WexmuouggGuard",
+            "夸克原画",
+            "bridge error: bridge_disconnected",
+        );
+        assert!(matches!(e, ResolveError::NetworkError { .. }), "got: {e:?}");
+    }
+
+    #[test]
+    fn real_spider_exception_still_classifies_as_auth() {
+        let e = classify_spider_error(
+            "WexmuouggGuard",
+            "夸克原画",
+            "bridge error: java.lang.reflect.InvocationTargetException",
+        );
+        assert!(
+            matches!(e, ResolveError::AuthenticationRequired { .. }),
+            "got: {e:?}"
+        );
     }
 }

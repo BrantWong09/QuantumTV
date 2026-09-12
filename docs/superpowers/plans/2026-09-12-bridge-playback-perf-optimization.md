@@ -1824,3 +1824,7 @@ git add docs/superpowers/plans/2026-09-12-bridge-playback-perf-optimization.md
 - Task 9 测试: reqwest 上线将头名小写化为 `range:`, 上游 mock 断言改为大小写不敏感 (代理自身提取即大小写不敏感)。
 
 验收结果: quantumtv-core 141+2 全过; src-tauri 270 全过; `npm run typecheck` 干净。既有环境问题 (与本次无关, 已验证基线同样失败): `npm test` (jest 无任何测试文件), `next lint` 脚本失效, `lint:strict` 存量 console 告警 (改动文件基线 12 = 改后 12, 零新增), api-server `config_file_test` 依赖不存在的 `crates/api-server/data.json`。方案 §38 冒烟需模拟器+APK, 待人工执行。
+
+### 追加修复 (2026-09-12 冒烟后)
+
+真机 PGBM10 + WexmuouggGuard(夸克) 冒烟暴露: 方案 §18 的超时值 (search 8s / resolve 15s) 低于 wex Android spider 的真实延迟 (search >8s, playerContent >15s), 导致 search/resolve 100% 超时失败 (dev_run.log 37/37 全灭), 且 `bridge error: bridge_timeout` 被 `classify_spider_error` 的泛化 "bridge error" 分支抢先命中, 谎报为"需要登录夸克网盘"。修复: 超时对齐设备现实 (Search 45s / Detail 30s / Resolve 60s, 仍低于旧 spider 层 60/120s 外层), 错误归类 timeout/断连前置于认证分支 + 3 个回归测试。

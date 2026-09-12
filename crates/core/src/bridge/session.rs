@@ -18,10 +18,13 @@ pub(crate) const MAX_SEARCH_INFLIGHT: usize = 4;
 pub(crate) const MAX_DETAIL_INFLIGHT: usize = 2;
 pub(crate) const MAX_RESOLVE_INFLIGHT: usize = 1;
 
-// ---- 按类别超时 (方案 §18: Search 8s / Detail 8s / Resolve 15s / Health 2s) ----
-pub(crate) const SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
-pub(crate) const DETAIL_TIMEOUT: Duration = Duration::from_secs(8);
-pub(crate) const RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+// ---- 按类别超时 ----
+// 方案 §18 的理想值 (8/8/15/2s) 实测对 wex 系 Android spider 过激:
+// 真机 PGBM10 上 /search 普遍 >8s, 夸克 /playerContent >15s (旧行为靠 spider 层
+// 60s/120s 硬扛成功)。取"设备可完成 + 低于旧外层上限"的折中值, 仍保证有界。
+pub(crate) const SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const DETAIL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 请求类别: 由 VirtualBridge 收到的 HTTP 请求行路径推断
