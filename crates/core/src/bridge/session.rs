@@ -55,7 +55,6 @@ impl RequestKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RequestError {
-    NoTunnel,
     Timeout,
     TunnelClosed,
     SendFailed,
@@ -65,7 +64,6 @@ impl RequestError {
     /// 转 spider 层可识别的业务错误 JSON (code!=200 即错, spider/mod.rs:460)
     pub(crate) fn to_err_json(&self) -> String {
         let (code, msg) = match self {
-            RequestError::NoTunnel => (503, "bridge_not_connected"),
             RequestError::Timeout => (504, "bridge_timeout"),
             RequestError::TunnelClosed => (502, "bridge_disconnected"),
             RequestError::SendFailed => (502, "bridge_send_failed"),
@@ -112,7 +110,6 @@ impl Default for Limits {
 
 struct PendingEntry {
     tx: oneshot::Sender<Vec<u8>>,
-    enqueued_at: Instant,
 }
 
 /// 长期桥接会话: 一条隧道连接上的全部逻辑请求复用 (方案 §4)
@@ -121,8 +118,6 @@ pub(crate) struct BridgeSession {
     writer: mpsc::Sender<Frame>,
     pending: StdMutex<HashMap<u32, PendingEntry>>,
     next_id: AtomicU32,
-    /// 观测用: 正常完成路径递减; 调用方取消时不保证归零, 权威值看 pending_count
-    inflight: AtomicU32,
     search_gate: Arc<Semaphore>,
     detail_gate: Arc<Semaphore>,
     resolve_gate: Arc<Semaphore>,
@@ -139,17 +134,12 @@ impl BridgeSession {
             writer,
             pending: StdMutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
-            inflight: AtomicU32::new(0),
             limits,
         })
     }
 
     pub(crate) fn pending_count(&self) -> usize {
         self.pending.lock().unwrap().len()
-    }
-
-    pub(crate) fn inflight_count(&self) -> u32 {
-        self.inflight.load(Ordering::SeqCst)
     }
 
     /// 一次逻辑请求 (方案 §5 生命周期):
@@ -171,14 +161,9 @@ impl BridgeSession {
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(id, PendingEntry { tx, enqueued_at });
-        self.inflight.fetch_add(1, Ordering::SeqCst);
+        self.pending.lock().unwrap().insert(id, PendingEntry { tx });
 
         if self.writer.send(Frame { id, payload }).await.is_err() {
-            self.inflight.fetch_sub(1, Ordering::SeqCst);
             self.pending.lock().unwrap().remove(&id);
             return Err(RequestError::SendFailed);
         }
@@ -191,7 +176,6 @@ impl BridgeSession {
             // PendingEntry 被 deliver/fail_all 消费后丢弃, 或会话整体被 drop
             Ok(Err(_)) => Err(RequestError::TunnelClosed),
         };
-        self.inflight.fetch_sub(1, Ordering::SeqCst);
         // 兜底清理: 超时/取消路径的 pending 也必须移除 (方案 §5)
         self.pending.lock().unwrap().remove(&id);
 
