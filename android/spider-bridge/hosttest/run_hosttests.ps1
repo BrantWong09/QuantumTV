@@ -10,6 +10,7 @@ New-Item -ItemType Directory -Path $out | Out-Null
 
 $srcs = @(
     "src\com\quantumtv\bridge\ipc\Proto.java",
+    "src\com\quantumtv\bridge\ipc\JsonLite.java",
     "src\com\quantumtv\bridge\ipc\WorkerState.java",
     "src\com\quantumtv\bridge\ipc\TimeoutPolicy.java",
     "src\com\quantumtv\bridge\control\SourceBreaker.java"

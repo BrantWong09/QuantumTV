@@ -4,70 +4,53 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
-import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
 import android.os.IBinder;
 import android.util.Log;
+import android.webkit.CookieManager;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.InputStream;
-import java.io.InputStreamReader;
+import com.quantumtv.bridge.control.WorkerManager;
+import com.quantumtv.bridge.ipc.JsonLite;
+import com.quantumtv.bridge.worker.SpiderExec;
+
 import java.io.OutputStream;
-import java.lang.reflect.Method;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 
+/**
+ * Bridge Control 进程 (方案 §7): 只负责桌面 TCP 隧道/兼容 8080、路由、Worker 生命周期、健康。
+ * 不再执行任何 spider 调用 (§23/§27/§49): /init /health 与 spider 卡死彻底解耦;
+ * spider 调用全部派发到 :spider_general / :spider_playback 独立进程 (WorkerManager)。
+ */
 public class BridgeService extends Service {
     private static final String TAG = "Bridge";
     private static final int PORT = 8080;
-    /** wex 系 spider 的配置入口 (AES 加密返回配置服务器地址) */
-    private static final String WEX_CONFIG_URL = "https://9280.kstore.vip/api.txt";
     private ServerSocket server;
     ExecutorService pool;
-    /** /detail 专用单线程池: 与搜索队列隔离, 保证点击播放低延迟 */
-    ExecutorService detailExecutor;
-    /** 控制面 Worker 生命周期管理 (T3+): spider 调用派发至独立进程 */
-    public com.quantumtv.bridge.control.WorkerManager workers;
+    /** 控制面 Worker 生命周期管理: 派发/Watchdog/重启/冷却 */
+    public WorkerManager workers;
     /** 类级 playerContent 熔断 (§41/§42): 连续 3 次超时 → 30s 内该 class 秒拒 */
     private final com.quantumtv.bridge.control.SourceBreaker breaker =
         new com.quantumtv.bridge.control.SourceBreaker(30_000, System::currentTimeMillis);
-    private boolean initialized = false;
-    /** 站点级 ext 配置, /init 时由桌面端传入; TVBoxOSC 在 getSpider 后调用 spider.init(context, ext) */
+    private volatile boolean initialized = false;
+    /** 站点级 ext 配置, /init 时由桌面端传入, 随 cookie 一并下发 worker (§决策#2) */
     private volatile String extConfig = "";
-    /** 已初始化的 spider 实例缓存: TVBoxOSC 同样按 jar+site 缓存, init 只跑一次 */
-    private final Map<String, Object> spiderCache = new HashMap<>();
-    /** wex 系 spider 的 native 链 (DexNative/libLoadNiMa) 非线程安全, 并发调用会 SIGABRT, 必须串行 */
-    private final Object spiderLock = new Object();
-    /** detail 优先标记: >0 时搜索线程在调用间隙主动让出 spiderLock */
-    private final java.util.concurrent.atomic.AtomicInteger detailPending =
-        new java.util.concurrent.atomic.AtomicInteger(0);
-    /** 上次成功 init 携带的 ext (用于检测网盘 cookie 变更并重建 spider) */
-    private String lastInitExt;
+    /** 网盘 cookie 留存, worker (重)启动时显式补发 */
+    private final Map<String, String> cookieStore = new ConcurrentHashMap<>();
 
     /**
-     * 网盘账号在 WebView 登录后调用: 清空已缓存 spider 实例,
-     * 下次 spider 调用会按最新的系统 CookieManager 重新 init。
+     * 网盘账号在 WebView 登录后调用: 广播 cookie/ext 到全部 worker, 各自清缓存重建 (§28)。
      */
     public static void invalidateSpiders() {
-        // 通过一个 static 引用访问服务单例的缓存 (服务是应用内唯一实例)
-        BridgeService instance = getRunningInstance();
-        if (instance == null) {
-            return;
-        }
-        synchronized (instance.spiderCache) {
-            instance.spiderCache.clear();
-        }
-        instance.initialized = false;
-        instance.lastInitExt = null;
-        Log.i(TAG, "spider 缓存已清空, 等待按新 CookieManager 重建");
+        BridgeService instance = runningInstance;
+        if (instance == null) return;
+        instance.workers.broadcastCookie(instance.extConfig, instance.cookieStore);
+        Log.i(TAG, "cookie/ext 已广播至 workers, spider 实例将重建");
     }
 
     private static BridgeService runningInstance;
@@ -76,10 +59,6 @@ public class BridgeService extends Service {
     public void onCreate() {
         super.onCreate();
         runningInstance = this;
-    }
-
-    private static BridgeService getRunningInstance() {
-        return runningInstance;
     }
 
     @Override
@@ -93,11 +72,12 @@ public class BridgeService extends Service {
             server = new ServerSocket(PORT);
             Log.i(TAG, "HTTP server listening on " + PORT);
             pool = Executors.newFixedThreadPool(4);
-            detailExecutor = Executors.newSingleThreadExecutor();
             new Thread(this::acceptLoop, "BridgeAccept").start();
-            workers = new com.quantumtv.bridge.control.WorkerManager(this);
+            workers = new WorkerManager(this);
+            // worker (重)启动就绪后补发 cookie/ext, 不等桌面 /init (§22/决策#2)
+            workers.readyHook = role -> workers.broadcastCookie(extConfig, cookieStore);
             workers.start();
-        TunnelClient.start(this);
+            TunnelClient.start(this);
         } catch (Exception e) {
             Log.e(TAG, "server start failed: " + e);
         }
@@ -171,18 +151,17 @@ public class BridgeService extends Service {
         }
     }
 
-    /** 路由分发 (同步阻塞; spider 类请求经 WorkerManager 派发至独立进程) */
+    /** 路由分发 (控制面): spider 类操作派发至独立进程, 其余 control 自答 (§7/§23/§24)。 */
     String routeRequest(String method, String path, String body) {
         if ("/health".equals(path)) {
             // §24/§48: control 自答, 绝不触碰 spider 执行体; worker 挂死时 bridge 仍 healthy
             return json(200, "ok", "{\"bridge\":\"healthy\",\"init\":" + initialized
-                    + ",\"workers\":{\"general\":\"" + workerLabel(com.quantumtv.bridge.control.WorkerManager.ROLE_GENERAL)
-                    + "\",\"playback\":\"" + workerLabel(com.quantumtv.bridge.control.WorkerManager.ROLE_PLAYBACK) + "\"}"
+                    + ",\"workers\":{\"general\":\"" + workerLabel(WorkerManager.ROLE_GENERAL)
+                    + "\",\"playback\":\"" + workerLabel(WorkerManager.ROLE_PLAYBACK) + "\"}"
                     + ",\"sources_open\":" + (workers == null ? "{}" : breaker.snapshot()) + "}");
         }
         if ("/__test_hang".equals(path)) {
-            // 隔离验收钩子 (§58/§60/§62): 仅 debuggable APK; playback worker 永久挂死 →
-            // 由 control watchdog 按硬超时 kill+restart, 本请求收到 worker_killed 明确回包 (§35)
+            // 隔离验收钩子 (§58/§60/§61): 仅 debuggable APK; 按 playerContent 记入类级熔断
             if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
                 return json(404, "not_found", null);
             }
@@ -190,18 +169,13 @@ public class BridgeService extends Service {
             java.util.concurrent.CompletableFuture<String> f = new java.util.concurrent.CompletableFuture<>();
             byte[] req;
             try {
-                req = ("{\"method\":\"__test_hang\",\"class\":\"" + cls + "\"}").getBytes("UTF-8");
+                req = ("{\"method\":\"__test_hang\",\"class\":\"" + JsonLite.escape(cls) + "\"}").getBytes("UTF-8");
             } catch (Exception e) { return json(500, "enc", null); }
-            workers.dispatch(com.quantumtv.bridge.control.WorkerManager.ROLE_PLAYBACK, "__test_hang", req,
-                    r -> {
-                        // 验收钩子等价物: 按 playerContent 记入类级熔断 (§41/§61 全路径验证)
-                        if (r.code == 503 && "worker_killed".equals(r.err)) {
-                            breaker.recordPlayerContentTimeout(cls);
-                        } else if (r.code == 200) {
-                            breaker.recordPlayerContentSuccess(cls);
-                        }
-                        f.complete(json(r.code, r.err, r.data == null ? null : "\"" + esc(r.data) + "\""));
-                    });
+            workers.dispatch(WorkerManager.ROLE_PLAYBACK, "__test_hang", req, r -> {
+                if (r.code == 503 && "worker_killed".equals(r.err)) breaker.recordPlayerContentTimeout(cls);
+                else if (r.code == 200) breaker.recordPlayerContentSuccess(cls);
+                f.complete(json(r.code, r.err, r.data == null ? null : JsonLite.quote(r.data)));
+            });
             try { return f.get(120, java.util.concurrent.TimeUnit.SECONDS); }
             catch (Exception e) { return json(500, "hang_dispatch_failed", null); }
         }
@@ -221,8 +195,7 @@ public class BridgeService extends Service {
     /** spider 调用统一派发 (§15/§16/§44): playerContent→playback worker, 其余→general worker。 */
     private String dispatchSpider(String path, String body) {
         final boolean pc = "/playerContent".equals(path);
-        String role = pc ? com.quantumtv.bridge.control.WorkerManager.ROLE_PLAYBACK
-                : com.quantumtv.bridge.control.WorkerManager.ROLE_GENERAL;
+        String role = pc ? WorkerManager.ROLE_PLAYBACK : WorkerManager.ROLE_GENERAL;
         final String cls = parseField(body, "class");
         if (cls == null) return json(400, "missing class", null);
         if (pc && !breaker.allowPlayerContent(cls)) {
@@ -240,7 +213,7 @@ public class BridgeService extends Service {
                 if (r.code == 503 && "worker_killed".equals(r.err)) breaker.recordPlayerContentTimeout(cls);
                 else if (r.code == 200) breaker.recordPlayerContentSuccess(cls);
             }
-            f.complete(json(r.code, r.err, r.data == null ? null : "\"" + esc(r.data) + "\""));
+            f.complete(json(r.code, r.err, r.data == null ? null : JsonLite.quote(r.data)));
         });
         try { return f.get(150, java.util.concurrent.TimeUnit.SECONDS); }
         catch (Exception e) { return json(500, "dispatch_failed", null); }
@@ -249,24 +222,15 @@ public class BridgeService extends Service {
     /** 桌面 body → worker REQ 载荷 (§8): 保留原 method 语义的字段映射。 */
     private static String ipcReq(String m, String cls, String body) {
         StringBuilder sb = new StringBuilder("{\"method\":\"").append(m)
-                .append("\",\"class\":\"").append(cls).append("\"");
+                .append("\",\"class\":\"").append(JsonLite.escape(cls)).append("\"");
         String v;
-        if ((v = parseFieldStatic(body, "keyword")) != null) sb.append(",\"keyword\":\"").append(v).append("\"");
-        if ((v = parseFieldStatic(body, "ids")) != null) sb.append(",\"ids\":\"").append(v).append("\"");
-        if ((v = parseFieldStatic(body, "id")) != null) sb.append(",\"id\":\"").append(v).append("\"");
-        if ((v = parseFieldStatic(body, "flag")) != null) sb.append(",\"flag\":\"").append(v).append("\"");
-        if ((v = parseFieldStatic(body, "tid")) != null) sb.append(",\"tid\":\"").append(v).append("\"");
-        if ((v = parseFieldStatic(body, "pg")) != null) sb.append(",\"pg\":\"").append(v).append("\"");
+        if ((v = parseField(body, "keyword")) != null) sb.append(",\"keyword\":\"").append(JsonLite.escape(v)).append("\"");
+        if ((v = parseField(body, "ids")) != null) sb.append(",\"ids\":\"").append(JsonLite.escape(v)).append("\"");
+        if ((v = parseField(body, "id")) != null) sb.append(",\"id\":\"").append(JsonLite.escape(v)).append("\"");
+        if ((v = parseField(body, "flag")) != null) sb.append(",\"flag\":\"").append(JsonLite.escape(v)).append("\"");
+        if ((v = parseField(body, "tid")) != null) sb.append(",\"tid\":\"").append(JsonLite.escape(v)).append("\"");
+        if ((v = parseField(body, "pg")) != null) sb.append(",\"pg\":\"").append(JsonLite.escape(v)).append("\"");
         return sb.append("}").toString();
-    }
-
-    private static String parseFieldStatic(String body, String key) {
-        String pat = "\"" + key + "\":\"";
-        int i = body.indexOf(pat);
-        if (i < 0) return null;
-        int s = i + pat.length();
-        int e = body.indexOf("\"", s);
-        return e < 0 ? null : body.substring(s, e);
     }
 
     /** §48: worker 状态标签 (health 与控制面解耦)。 */
@@ -307,30 +271,7 @@ public class BridgeService extends Service {
                 read += n;
             }
             String bodyStr = new String(body, 0, read, java.nio.charset.StandardCharsets.UTF_8);
-
-            // /detail 走优先通道: 用户点击播放不能排在全站搜索队列后面
-            if ("/detail".equals(path) && "POST".equalsIgnoreCase(method)) {
-                Log.i(TAG, method + " " + path + " body=" + bodyStr);
-                java.net.Socket sock = s;
-                detailExecutor.submit(() -> {
-                    String r = routeRequest(method, path, bodyStr);
-                    try { writeHttp(sock, r); sock.close(); } catch (Exception e) { Log.e(TAG, "detail write: " + e); }
-                });
-                return;
-            }
-
             Log.i(TAG, method + " " + path + " body=" + bodyStr);
-
-            // /playerContent 同走优先通道
-            if ("/playerContent".equals(path) && "POST".equalsIgnoreCase(method)) {
-                java.net.Socket sock = s;
-                detailExecutor.submit(() -> {
-                    String r = routeRequest(method, path, bodyStr);
-                    try { writeHttp(sock, r); sock.close(); } catch (Exception e) { Log.e(TAG, "playerContent write: " + e); }
-                });
-                return;
-            }
-
             String resp = routeRequest(method, path, bodyStr);
             writeHttp(s, resp);
             s.close();
@@ -360,305 +301,19 @@ public class BridgeService extends Service {
 
     private String esc(String s) { return s.replace("\\", "\\\\").replace("\"", "\\\""); }
 
+    /**
+     * §23/§45/§46: /init 由 control 秒回, ext 下发 worker; native 库下载/Init.init 在 worker
+     * 首次调用前后台自举 (§78)。worker 启动失败 bridge 仍 healthy, 只反映在 health 结构 (§47)。
+     */
     private String doInit(String body) {
-        try {
-            synchronized (spiderLock) {
-                String ext = (body != null && !body.isEmpty()) ? parseField(body, "ext") : null;
-                if (ext != null) extConfig = ext;
-                if (initialized && (ext == null || ext.equals(lastInitExt))) {
-                    // 已初始化且 ext 未变: 不重复跑 native 库检查与 Init.init
-                    return json(200, null, "{\"ok\":true}");
-                }
-                // 首次初始化或 ext 变更(网盘 cookie 更新): 重建全部 spider 实例
-                synchronized (spiderCache) {
-                    spiderCache.clear();
-                }
-                ensureWexNativeLibs();
-                Class<?> initCls = Class.forName("com.github.catvod.spider.Init");
-                initCls.getMethod("init", Context.class).invoke(null, getApplication());
-                initialized = true;
-                lastInitExt = ext;
-                Log.i(TAG, "init(重)完成, ext=" + (ext != null ? ext.length() + "字节" : "null"));
-                return json(200, null, "{\"ok\":true}");
-            }
-        } catch (Throwable t) {
-            Log.e(TAG, "init failed", t);
-            return json(500, t.toString(), null);
-        }
+        String ext = (body != null && !body.isEmpty()) ? parseField(body, "ext") : null;
+        if (ext != null) extConfig = ext;
+        initialized = true; // 控制面就绪 ≠ spider 就绪 (§46)
+        workers.broadcastCookie(extConfig, cookieStore);
+        return json(200, null, "{\"ok\":true,\"bridge\":\"ready\",\"worker\":\"starting\"}");
     }
 
-    /**
-     * wex 系 spider 依赖 files/TV/ 下的 native 库 (libLoadNiMa.so 等), 由原版宿主
-     * 启动时下载。这里复刻该逻辑: api.txt(AES) → 配置服务器 → go.php(AES) → 按 ABI 下载。
-     * 任一环节失败仅打日志, 不阻塞 spider 初始化 (非 wex 站点不需要这些库)。
-     */
-    private void ensureWexNativeLibs() {
-        try {
-            File tvDir = new File(getFilesDir(), "TV");
-            if (!tvDir.exists()) tvDir.mkdirs();
-            String conf = httpGetString(WEX_CONFIG_URL);
-            if (conf == null) { Log.w(TAG, "wex conf fetch failed"); return; }
-            String base = decryptWex(conf);
-            if (base == null || base.isEmpty()) { Log.w(TAG, "wex conf decrypt failed"); return; }
-            String goRaw = httpGetString(base + "/go.php");
-            if (goRaw == null) { Log.w(TAG, "go.php fetch failed"); return; }
-            String goJson = decryptWex(goRaw);
-            if (goJson == null) { Log.w(TAG, "go.php decrypt failed"); return; }
-            org.json.JSONObject go = new org.json.JSONObject(goJson);
-            // libLoadNiMa.so → wex_* 条目; libdecjni.so → hxq_* 条目 (awenc 库)
-            String key = abiKey();
-            downloadIfSizeMismatch(tvDir, go, "libLoadNiMa.so", "wex_" + key + "_size", "wex_" + key + "_url");
-            downloadIfSizeMismatch(tvDir, go, "libdecjni.so", "hxq_" + key + "_size", "hxq_" + key + "_url");
-        } catch (Throwable t) {
-            Log.w(TAG, "ensureWexNativeLibs: " + t);
-        }
-    }
-
-    /** go.php 配置中对应当前设备 ABI 的 key 段 (v7/v8/x86/x86_64) */
-    private String abiKey() {
-        String abi = Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "";
-        boolean isX86 = abi.startsWith("x86");
-        if (abi.contains("64")) return isX86 ? "x86_64" : "v8";
-        return isX86 ? "x86" : "v7";
-    }
-
-    /** 大小不符才下载 (go.php 提供 expected size) */
-    private void downloadIfSizeMismatch(File tvDir, org.json.JSONObject go, String fileName, String sizeKey, String urlKey) {
-        try {
-            if (!go.has(urlKey)) { Log.w(TAG, "no url for " + urlKey); return; }
-            long expected = go.getLong(sizeKey);
-            File target = new File(tvDir, fileName);
-            if (target.exists() && target.length() == expected) return;
-            Log.i(TAG, "downloading " + fileName + " from " + go.getString(urlKey));
-            byte[] data = httpGetBytes(go.getString(urlKey));
-            if (data == null || data.length != expected) { Log.w(TAG, "size mismatch after download: " + (data == null ? -1 : data.length)); return; }
-            java.io.FileOutputStream fos = new java.io.FileOutputStream(target);
-            fos.write(data);
-            fos.close();
-            target.setReadable(true, false);
-            target.setExecutable(true, false);
-            Log.i(TAG, "saved " + fileName + " (" + data.length + " bytes)");
-        } catch (Throwable t) {
-            Log.w(TAG, "downloadIfSizeMismatch " + fileName + ": " + t);
-        }
-    }
-
-    /** AES/CBC/PKCS7 解密 wex 配置 (key/iv 为固定混淆串) */
-    private String decryptWex(String base64) {
-        try {
-            byte[] ct = android.util.Base64.decode(base64.trim(), android.util.Base64.DEFAULT);
-            javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("AES/CBC/PKCS5Padding");
-            cipher.init(javax.crypto.Cipher.DECRYPT_MODE,
-                new javax.crypto.spec.SecretKeySpec("nifanbianyikeyia".getBytes("UTF-8"), "AES"),
-                new javax.crypto.spec.IvParameterSpec("keyijiangjiudian".getBytes("UTF-8")));
-            return new String(cipher.doFinal(ct), "UTF-8").trim();
-        } catch (Throwable t) {
-            Log.w(TAG, "decryptWex: " + t);
-            return null;
-        }
-    }
-
-    private String httpGetString(String url) {
-        byte[] data = httpGetBytes(url);
-        return data == null ? null : new String(data, java.nio.charset.StandardCharsets.UTF_8);
-    }
-
-    private byte[] httpGetBytes(String url) {
-        java.net.HttpURLConnection conn = null;
-        try {
-            conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
-            conn.setConnectTimeout(10000);
-            conn.setReadTimeout(20000);
-            conn.setRequestProperty("User-Agent", "okhttp/4.12.0");
-            java.io.InputStream in = conn.getResponseCode() >= 400 ? conn.getErrorStream() : conn.getInputStream();
-            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) != -1) bos.write(buf, 0, n);
-            in.close();
-            return bos.toByteArray();
-        } catch (Throwable t) {
-            Log.w(TAG, "httpGet " + url + ": " + t);
-            return null;
-        } finally {
-            if (conn != null) conn.disconnect();
-        }
-    }
-
-    private String doSearch(String body) {
-        try {
-            String className = parseField(body, "class");
-            String keyword = parseField(body, "keyword");
-            if (className == null || keyword == null) return json(400, "missing class/keyword", null);
-            return invokeSpiderWithRetry(className, "searchContent", new Class[]{String.class, boolean.class}, new Object[]{keyword, true}, false);
-        } catch (Throwable t) {
-            return json(500, t.toString(), null);
-        }
-    }
-
-    private String doDetail(String body) {
-        try {
-            String className = parseField(body, "class");
-            String ids = parseField(body, "ids");
-            if (className == null || ids == null) return json(400, "missing class/ids", null);
-            return invokeSpiderWithRetry(className, "detailContent", new Class[]{List.class}, new Object[]{java.util.Arrays.asList(ids.split(","))}, true);
-        } catch (Throwable t) {
-            return json(500, t.toString(), null);
-        }
-    }
-
-    /**
-     * spider 500 时重建实例重试一次。
-     * 场景: wex 系 spider 的运行时站点配置 (CDN 多 IP, 模拟器 DNS 轮询可能拿到死 IP)
-     * 拉取失败后进程内缓存 null, 后续 detail/category 持续 NPE; 重建实例触发重新拉取。
-     * 实测: 重启桥接进程即恢复 → 等价的实例级重建 + 单次重试。
-     */
-    private String invokeSpiderWithRetry(String className, String method, Class<?>[] paramTypes, Object[] args, boolean priority) {
-        String r = invokeSpider(className, method, paramTypes, args, priority);
-        if (r != null && r.contains("\"code\":500")) {
-            Log.w(TAG, method + " 500, 重建 spider 实例后重试一次");
-            invalidateSpiders();
-            r = invokeSpider(className, method, paramTypes, args, priority);
-        }
-        return r;
-    }
-
-    private String doPlayerContent(String body) {
-        try {
-            String className = parseField(body, "class");
-            String flag = parseField(body, "flag");
-            String id = parseField(body, "id");
-            if (className == null || id == null) return json(400, "missing class/id", null);
-            if (flag == null) flag = "";
-            // TVBox 标准: playerContent(flag, id, vipFlags) — 三参签名优先, 两参变体兜底
-            String r3 = null;
-            try {
-                r3 = invokeSpider(className, "playerContent",
-                    new Class[]{String.class, String.class, java.util.List.class},
-                    new Object[]{flag, id, java.util.Collections.emptyList()}, true);
-            } catch (Throwable t3) {
-                Log.w(TAG, "3-arg playerContent failed: " + t3);
-            }
-            if (r3 != null && !r3.contains("NoSuchMethodException")) return r3;
-            return invokeSpiderWithRetry(className, "playerContent",
-                new Class[]{String.class, String.class},
-                new Object[]{flag, id}, true);
-        } catch (Throwable t) {
-            return json(500, t.toString(), null);
-        }
-    }
-
-    private String doHome(String body) {
-        try {
-            String className = parseField(body, "class");
-            if (className == null) return json(400, "missing class", null);
-            return invokeSpider(className, "homeContent", new Class[]{boolean.class}, new Object[]{true});
-        } catch (Throwable t) {
-            return json(500, t.toString(), null);
-        }
-    }
-
-    private String doCategory(String body) {
-        try {
-            String className = parseField(body, "class");
-            String tid = parseField(body, "tid");
-            String pg = parseField(body, "pg");
-            if (className == null) return json(400, "missing class", null);
-            if (tid == null) tid = "1";
-            if (pg == null) pg = "1";
-            return invokeSpiderWithRetry(className, "categoryContent",
-                new Class[]{String.class, String.class, boolean.class, java.util.HashMap.class},
-                new Object[]{tid, pg, true, new java.util.HashMap<String, String>()}, true);
-        } catch (Throwable t) {
-            return json(500, t.toString(), null);
-        }
-    }
-
-    private String invokeSpider(String className, String method, Class<?>[] paramTypes, Object[] args) {
-        return invokeSpider(className, method, paramTypes, args, false);
-    }
-
-    /**
-     * spider 调用统一入口, native 链不支持并发故全互斥。
-     * @param priority detail 用: 进入锁前置位, 让正在搜索的线程在片段边界主动让出锁
-     */
-    private String invokeSpider(String className, String method, Class<?>[] paramTypes, Object[] args, boolean priority) {
-        if (priority) detailPending.incrementAndGet();
-        try {
-            synchronized (spiderLock) {
-                if (priority) detailPending.decrementAndGet();
-                // 短名自动补全包名 (桌面端传 csp_ 剥离后的短名)
-                String fqn = className.indexOf('.') >= 0 ? className : "com.github.catvod.spider." + className;
-                Class<?> initCls = Class.forName("com.github.catvod.spider.Init");
-                if (!initialized) {
-                    // 自愈: /search 直接到达(未经 /init)时也要确保 wex native 库就位
-                    ensureWexNativeLibs();
-                    initCls.getMethod("init", Context.class).invoke(null, getApplication());
-                    initialized = true;
-                }
-                Method getSpider = initCls.getMethod("getSpider", String.class);
-                Object spider;
-                synchronized (spiderCache) {
-                    spider = spiderCache.get(fqn);
-                    if (spider == null) {
-                        spider = getSpider.invoke(null, fqn);
-                        if (spider == null) return json(404, "spider not found: " + fqn, null);
-                        // TVBoxOSC 流程: newInstance 后必须调用 init(context, ext), 否则部分
-                        // spider (如 wex 系) 的资源初始化(libLoadNiMa.so 提取)不会执行
-                        try {
-                            java.lang.reflect.Field keyField = findField(spider.getClass(), "siteKey");
-                            if (keyField != null) {
-                                keyField.setAccessible(true);
-                                keyField.set(spider, className);
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                        try {
-                            spider.getClass()
-                                .getMethod("init", Context.class, String.class)
-                                .invoke(spider, getApplication(), extConfig);
-                        } catch (NoSuchMethodException e) {
-                            spider.getClass().getMethod("init", Context.class).invoke(spider, getApplication());
-                        }
-                        spiderCache.put(fqn, spider);
-                    }
-                }
-                Method m = spider.getClass().getMethod(method, paramTypes);
-                Object result;
-                if (priority) {
-                    // detail 的真正网络请求不占 spiderLock: 初始化/取类已在此锁内完成,
-                    // 多数 spider 的 detailContent 只是单次 HTTP + 解析, 原子性风险远低于搜索
-                    result = m.invoke(spider, args);
-                } else {
-                    // 搜索: 调用前后检查 detail 优先标记, 让在途 detail 尽快插进下个空档
-                    result = m.invoke(spider, args);
-                    while (detailPending.get() > 0) {
-                        synchronized (spiderLock) {
-                            spiderLock.wait(50);
-                        }
-                    }
-                }
-                String data = result == null ? "null" : result.toString();
-                return json(200, null, "\"" + esc(data) + "\"");
-            }
-        } catch (Throwable t) {
-            Log.e(TAG, "invokeSpider failed", t);
-            return json(500, t.toString(), null);
-        }
-    }
-
-    /** 反射向上查找字段 (wex 系 Spider 基类有 public siteKey 字段) */
-    private static java.lang.reflect.Field findField(Class<?> clz, String name) {
-        for (Class<?> c = clz; c != null; c = c.getSuperclass()) {
-            try {
-                return c.getDeclaredField(name);
-            } catch (NoSuchFieldException ignored) {
-            }
-        }
-        return null;
-    }
-
-    /** 桌面端扫码登录: cookie 写入 CookieManager + 落盘, 并重建 spider 实例 */
+    /** 桌面端扫码登录: cookie 留存 → 写本进程 CookieManager + 文件 → 显式下发全部 worker (§决策#2) */
     private String doSetCookie(String body) {
         try {
             String drive = parseField(body, "drive");
@@ -666,19 +321,20 @@ public class BridgeService extends Service {
             if (drive == null || cookie == null || cookie.isEmpty()) {
                 return json(400, "missing drive/cookie", null);
             }
-            String[] hosts = cookieHosts(drive);
+            String[] hosts = SpiderExec.cookieHosts(drive);
             if (hosts == null) {
                 return json(400, "unsupported drive: " + drive, null);
             }
-            android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+            CookieManager cm = CookieManager.getInstance();
             cm.setAcceptCookie(true);
             for (String h : hosts) {
                 cm.setCookie("https://" + h + "/", cookie);
             }
             cm.flush();
-            writeCookieFile(this, drive, cookie);
-            invalidateSpiders();
-            Log.i(TAG, "setCookie: drive=" + drive + " len=" + cookie.length());
+            SpiderExec.writeCookieFile(this, drive, cookie);
+            cookieStore.put(drive, cookie);
+            workers.broadcastCookie(extConfig, cookieStore);
+            Log.i(TAG, "setCookie: drive=" + drive + " len=" + cookie.length() + " 已下发 worker");
             return json(200, "ok", null);
         } catch (Exception e) {
             Log.e(TAG, "setCookie", e);
@@ -686,42 +342,19 @@ public class BridgeService extends Service {
         }
     }
 
-    /** 各网盘登录态所在域 (与 spider 读取通道一致) */
-    private static String[] cookieHosts(String drive) {
-        switch (drive) {
-            case "quark": return new String[]{"pan.quark.cn", "quark.cn", "uop.quark.cn", "drive-pc.quark.cn"};
-            case "uc":    return new String[]{"drive.uc.cn", "uc.cn", "pc.uc.cn"};
-            case "baidu": return new String[]{"pan.baidu.com", "passport.baidu.com", "wappass.baidu.com"};
-            default: return null;
-        }
+    /** 兼容 CloudLoginActivity 静态入口 (主进程文件兜底通道) */
+    public static void writeCookieFile(android.content.Context ctx, String drive, String cookies) {
+        SpiderExec.writeCookieFile(ctx, drive, cookies);
     }
 
-    /** 登录 cookie 落盘到 files/TV/.<drive>cookie (部分 spider 读文件兜底) */
-    static void writeCookieFile(android.content.Context ctx, String drive, String cookies) {
-        try {
-            java.io.File dir = new java.io.File(ctx.getFilesDir(), "TV");
-            if (!dir.exists()) dir.mkdirs();
-            java.io.File f = new java.io.File(dir, "." + drive + "cookie");
-            java.io.FileOutputStream fos = new java.io.FileOutputStream(f, false);
-            if (cookies != null) fos.write(cookies.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            fos.flush();
-            fos.close();
-            f.setReadable(true, false);
-            Log.i("CloudLogin", "cookie 已写入: " + f.getAbsolutePath());
-        } catch (Exception e) {
-            Log.e("CloudLogin", "persist cookie file failed", e);
-        }
-    }
-
-    private String parseField(String body, String key) {
-        // very minimal JSON parse for string fields
+    private static String parseField(String body, String key) {
+        // very minimal JSON parse for string fields (与 worker JsonLite 同语义)
         String pat = "\"" + key + "\":\"";
         int i = body.indexOf(pat);
         if (i < 0) return null;
         int s = i + pat.length();
         int e = body.indexOf("\"", s);
-        if (e < 0) return null;
-        return body.substring(s, e).replace("\\\\", "\\").replace("\\\"", "\"");
+        return e < 0 ? null : body.substring(s, e);
     }
 
     @Override

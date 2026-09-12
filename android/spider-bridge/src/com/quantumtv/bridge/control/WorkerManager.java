@@ -55,6 +55,36 @@ public final class WorkerManager {
     private final AtomicInteger nextReqId = new AtomicInteger(1);
     private final Context ctx;
     private volatile boolean running = true;
+    /** worker READY 回调 (§决策#2): control 借此补发 cookie/ext */
+    public volatile java.util.function.Consumer<String> readyHook;
+
+    /**
+     * cookie/ext 显式下发全部在线 worker (§28): {"ext":"...", "quark":"...", "uc":"...", "baidu":"..."}
+     * worker 侧清 spider 缓存并按新配置重建; 文件通道作为兜底已同步落盘。
+     */
+    public void broadcastCookie(String ext, Map<String, String> cookies) {
+        StringBuilder sb = new StringBuilder("{\"ext\":\"").append(
+                com.quantumtv.bridge.ipc.JsonLite.escape(ext == null ? "" : ext)).append("\"");
+        if (cookies != null) {
+            for (Map.Entry<String, String> e : cookies.entrySet()) {
+                sb.append(",\"").append(e.getKey()).append("\":\"")
+                        .append(com.quantumtv.bridge.ipc.JsonLite.escape(e.getValue())).append("\"");
+            }
+        }
+        byte[] body;
+        try {
+            body = sb.append("}").toString().getBytes("UTF-8");
+        } catch (Exception ex) { return; }
+        for (Handle h : workers.values()) {
+            if (h.out == null) continue;
+            try {
+                synchronized (h.out) {
+                    h.out.write(Proto.encode(0, Proto.T_COOKIE, body));
+                    h.out.flush();
+                }
+            } catch (Exception ignored) { }
+        }
+    }
 
     public WorkerManager(Context ctx) {
         this.ctx = ctx;
@@ -146,6 +176,10 @@ public final class WorkerManager {
                     case Proto.T_READY:
                         h.state = WorkerState.IDLE;
                         Log.i(TAG, "[Bridge] worker=" + role + " pid=" + h.pid + " status=ready");
+                        // (重)启动补发 cookie/ext (§决策#2): 不等桌面 /init, worker 首调用即带配置
+                        if (readyHook != null) {
+                            try { readyHook.accept(role); } catch (Exception ignored) { }
+                        }
                         break;
                     case Proto.T_RESP:
                         Pending p = pending.remove(fieldInt(body, "reqId"));

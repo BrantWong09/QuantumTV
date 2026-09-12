@@ -31,6 +31,12 @@ public abstract class BaseSpiderWorker extends Service {
 
     protected abstract String role();
 
+    @Override public void onCreate() {
+        super.onCreate();
+        // worker 进程独立 WebView CookieManager (§决策#2): 登录后由控制面 T_COOKIE 显式下发
+        SpiderExec.get().attach(getApplicationContext(), "");
+    }
+
     @Override public IBinder onBind(Intent i) { return null; }
 
     @Override public int onStartCommand(Intent i, int f, int s) {
@@ -92,53 +98,38 @@ public abstract class BaseSpiderWorker extends Service {
         }
     }
 
-    /** REQ 执行 (T6 前占位成功): 真实 spider 调用接管后替换此体。 */
+    /** REQ 执行 (T6): 真实 spider 调用在本进程单线程内串行, 卡死由 Control Watchdog kill (§21)。 */
     private void exec(int reqId, String body) {
         curReqId = reqId; curStartMs = System.currentTimeMillis(); state = WorkerState.BUSY;
-        curMethod = extract(body, "method");
+        curMethod = com.quantumtv.bridge.ipc.JsonLite.string(body, "method");
         if ("__test_hang".equals(curMethod)) {
             // 隔离验收 (§58): 模拟 native playerContent 永久挂死——不发 RESP, 等 control kill
             Log.w(TAG, role() + " HANG hook (REQ " + reqId + "): sleeping forever");
             try { Thread.sleep(Long.MAX_VALUE); } catch (InterruptedException ignored) { }
             return;
         }
-        send(Proto.T_RESP, reqId, respJson(reqId, 200, null, "").getBytes(StandardCharsets.UTF_8));
+        SpiderExec.Resp r = SpiderExec.get().invoke(curMethod, body);
+        send(Proto.T_RESP, reqId,
+                respJson(reqId, r.code, r.err, r.data).getBytes(StandardCharsets.UTF_8));
         state = WorkerState.IDLE; curReqId = -1; curMethod = ""; curStartMs = 0;
     }
 
-    protected void onCookie(String json) { }
+    /** cookie/ext 下发 (决策#2): {"ext":"...","quark":"...","uc":"...","baidu":"..."} */
+    protected void onCookie(String json) {
+        String ext = com.quantumtv.bridge.ipc.JsonLite.string(json, "ext");
+        if (ext != null) SpiderExec.get().reinit(ext);
+        for (String drive : new String[]{"quark", "uc", "baidu"}) {
+            String cookie = com.quantumtv.bridge.ipc.JsonLite.string(json, drive);
+            if (cookie != null && !cookie.isEmpty()) SpiderExec.get().applyCookie(drive, cookie);
+        }
+    }
 
     /** data 为原始字符串; 统一 JSON 转义后以字符串字面量嵌入 (与 Control stringField 的 unescape 配对) */
     static String respJson(int reqId, int code, String err, String data) {
         StringBuilder sb = new StringBuilder("{\"reqId\":").append(reqId).append(",\"code\":").append(code);
-        if (err != null) sb.append(",\"err\":\"").append(jsonEscape(err)).append("\"");
-        if (data != null) sb.append(",\"data\":\"").append(jsonEscape(data)).append("\"");
+        if (err != null) sb.append(",\"err\":\"").append(com.quantumtv.bridge.ipc.JsonLite.escape(err)).append("\"");
+        if (data != null) sb.append(",\"data\":\"").append(com.quantumtv.bridge.ipc.JsonLite.escape(data)).append("\"");
         return sb.append("}").toString();
-    }
-
-    static String jsonEscape(String s) {
-        StringBuilder sb = new StringBuilder(s.length() + 16);
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            switch (c) {
-                case '"': sb.append("\\\""); break;
-                case '\\': sb.append("\\\\"); break;
-                case '\n': sb.append("\\n"); break;
-                case '\r': sb.append("\\r"); break;
-                case '\t': sb.append("\\t"); break;
-                default: sb.append(c);
-            }
-        }
-        return sb.toString();
-    }
-
-    static String extract(String json, String key) {
-        String pat = "\"" + key + "\":\"";
-        int i = json.indexOf(pat);
-        if (i < 0) return "";
-        int s = i + pat.length();
-        int e = json.indexOf('"', s);
-        return e < 0 ? "" : json.substring(s, e);
     }
 
     private void startHeartbeat() {

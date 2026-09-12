@@ -82,11 +82,8 @@ public class TunnelClient implements Runnable {
                     Log.e(TAG, "frame handle: " + e);
                 }
             };
-            if ("/detail".equals(path) || "/playerContent".equals(path)) {
-                svc.detailExecutor.submit(job);
-            } else {
-                svc.pool.submit(job);
-            }
+            // 统一交 control 路由: spider 操作会被派发至对应 worker 进程, control 线程池不再区分优先级 (§15)
+            svc.pool.submit(job);
         }
         Log.w(TAG, "tunnel closed by host");
     }
