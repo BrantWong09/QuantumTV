@@ -160,24 +160,42 @@ public class BridgeService extends Service {
                     + "\",\"playback\":\"" + workerLabel(WorkerManager.ROLE_PLAYBACK) + "\"}"
                     + ",\"sources_open\":" + (workers == null ? "{}" : breaker.snapshot()) + "}");
         }
-        if ("/__test_hang".equals(path)) {
+        if ("/__test_hang".equals(path) || "/__test_freeze".equals(path)) {
             // 隔离验收钩子 (§58/§60/§61): 仅 debuggable APK; 按 playerContent 记入类级熔断
             if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
                 return json(404, "not_found", null);
             }
-            final String cls = parseField(body, "class") == null ? "WextestHang" : parseField(body, "class");
+            final boolean freeze = path.equals("/__test_freeze");
+            final String cls = parseField(body, "class") == null
+                    ? (freeze ? "WextestFreeze" : "WextestHang") : parseField(body, "class");
+            final String role = freeze && "general".equals(parseField(body, "role"))
+                    ? WorkerManager.ROLE_GENERAL : WorkerManager.ROLE_PLAYBACK;
+            final String m = freeze ? "__test_freeze" : "__test_hang";
             java.util.concurrent.CompletableFuture<String> f = new java.util.concurrent.CompletableFuture<>();
             byte[] req;
             try {
-                req = ("{\"method\":\"__test_hang\",\"class\":\"" + JsonLite.escape(cls) + "\"}").getBytes("UTF-8");
+                String msPart = freeze ? ",\"ms\":" + Math.max(100, Math.min(
+                        parseNum(body, "ms", 8000L), 60_000)) : "";
+                req = ("{\"method\":\"" + m + "\",\"class\":\"" + JsonLite.escape(cls) + "\"" + msPart + "}")
+                        .getBytes("UTF-8");
             } catch (Exception e) { return json(500, "enc", null); }
-            workers.dispatch(WorkerManager.ROLE_PLAYBACK, "__test_hang", req, r -> {
+            workers.dispatch(role, m, req, r -> {
                 if (r.code == 503 && "worker_killed".equals(r.err)) breaker.recordPlayerContentTimeout(cls);
                 else if (r.code == 200) breaker.recordPlayerContentSuccess(cls);
                 f.complete(json(r.code, r.err, r.data == null ? null : JsonLite.quote(r.data)));
             });
             try { return f.get(120, java.util.concurrent.TimeUnit.SECONDS); }
             catch (Exception e) { return json(500, "hang_dispatch_failed", null); }
+        }
+        if ("/__test_config".equals(path) && "POST".equalsIgnoreCase(method)) {
+            if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
+                return json(404, "not_found", null);
+            }
+            try {
+                long v = parseNum(body, "disable_recovery_ms", -1);
+                if (v > 0) WorkerManager.DISABLE_RECOVERY_MS = Math.max(500, v);
+            } catch (Exception e) { return json(400, "bad_config", null); }
+            return json(200, "ok", "{\"disable_recovery_ms\":" + WorkerManager.DISABLE_RECOVERY_MS + "}");
         }
         if (isSpiderOp(path) && "POST".equalsIgnoreCase(method)) {
             return dispatchSpider(path, body);
@@ -360,6 +378,18 @@ public class BridgeService extends Service {
         int s = i + pat.length();
         int e = body.indexOf("\"", s);
         return e < 0 ? null : body.substring(s, e);
+    }
+
+    private static long parseNum(String body, String key, long def) {
+        String pat = "\"" + key + "\":";
+        int i = body.indexOf(pat);
+        if (i < 0) return def;
+        int s = i + pat.length();
+        while (s < body.length() && (body.charAt(s) == ' ' || body.charAt(s) == '"')) s++;
+        int e = s;
+        while (e < body.length() && Character.isDigit(body.charAt(e))) e++;
+        if (e == s) return def;
+        try { return Long.parseLong(body.substring(s, e)); } catch (Exception ex) { return def; }
     }
 
     @Override

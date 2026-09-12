@@ -100,3 +100,44 @@ $health2 = Invoke-Bridge 15555 "/health"
 Assert-Match $health2 '"general":"ready"' "general alive through storm (§61)"
 Assert-Match $health2 'WextestHang' "sources_open in health (§48)"
 Write-Host "BREAKER TESTS OK"
+
+# ============ Phase C: 在途保护 + 并行排队 + disabled 自愈 (真机故障回归) ============
+# 此时 playback 已 DISABLED (Phase B 遗留), general 正常
+# C1: 真实 spider 首调会冻结 HB (native 反调试/houdini dlopen), 在途 8s 不得被 hbStale 误杀
+$frz = Invoke-Bridge 15555 "/__test_freeze" 60 -Body '{"role":"general","ms":8000}'
+Assert-Match $frz '"code":200' "in-flight HB gap must NOT kill (legit slow call > 5s)"
+# C2: 并发 5 个 2s 调用应串行排队全部应答, 不得 worker_restarting 秒拒
+$jobs = 1..5 | ForEach-Object {
+    Start-Job -ArgumentList $_ {
+        param($n)
+        $a = "D:\Program Files\Netease\MuMu\nx_main\adb.exe"
+        & $a -s emulator-5554 forward "tcp:170$n" tcp:8080 | Out-Null
+        try {
+            (Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:170$n/__test_freeze" `
+                -Method POST -Body ('{"role":"general","ms":2000}') -TimeoutSec 60).Content
+        } catch { "ERR:$_" }
+        finally { & $a -s emulator-5554 forward --remove "tcp:170$n" | Out-Null }
+    }
+}
+Wait-Job $jobs -Timeout 150 | Out-Null
+$outs = ($jobs | Receive-Job | Out-String)
+Remove-Job $jobs -Force
+Write-Host "parallel results: $outs"
+if ($outs -notmatch "worker_restarting") {
+    Write-Host "PASS[parallel queued (no BUSY-refuse)]"
+} else {
+    Write-Host "FAIL[parallel queued (no BUSY-refuse)]"; throw "parallel requests were refused"
+}
+# C3: 短冷却配置生效后, DISABLED worker 必须半开自愈
+$cfg = Invoke-Bridge 15555 "/__test_config" 5 -Body '{"disable_recovery_ms":3000}'
+Assert-Match $cfg '"code":200' "test config accepted"
+Start-Sleep 8
+$probe = Invoke-Bridge 15555 "/playerContent" 60 -Body '{"class":"Wexprobe","id":"x"}'
+Write-Host "probe after cooldown: $probe"
+if ($probe -notmatch "worker_disabled") {
+    Write-Host "PASS[disabled auto-recovery half-open (§40)]"
+} else {
+    Write-Host "FAIL[disabled auto-recovery half-open (§40)]"; throw "no recovery from DISABLED"
+}
+Wait-PlaybackReady 40 | Out-Null
+Write-Host "PHASE C TESTS OK"

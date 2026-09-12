@@ -27,6 +27,8 @@ public abstract class BaseSpiderWorker extends Service {
     private volatile int curReqId = -1;
     private volatile String curMethod = "";
     private volatile long curStartMs = 0;
+    /** §C1 验收钩子: 模拟 native 反调试冻结全进程 (含 HB 线程) */
+    private volatile boolean hbMuted = false;
     protected Thread execThread;
 
     protected abstract String role();
@@ -108,6 +110,19 @@ public abstract class BaseSpiderWorker extends Service {
             try { Thread.sleep(Long.MAX_VALUE); } catch (InterruptedException ignored) { }
             return;
         }
+        if ("__test_freeze".equals(curMethod)) {
+            // Phase C 验收: 静默 HB ms 后正常应答 → 证明"在途 + HB 间隙"不被误杀
+            int ms = 8000;
+            try { ms = Integer.parseInt(com.quantumtv.bridge.ipc.JsonLite.string(body, "ms")); } catch (Exception ignored) { }
+            Log.w(TAG, role() + " FREEZE hook (REQ " + reqId + "): HB muted " + ms + "ms");
+            hbMuted = true;
+            try { Thread.sleep(Math.max(100, Math.min(ms, 60_000))); } catch (InterruptedException ignored) { }
+            hbMuted = false;
+            send(Proto.T_RESP, reqId,
+                    respJson(reqId, 200, null, "{\"frozen_ok\":true}").getBytes(StandardCharsets.UTF_8));
+            state = WorkerState.IDLE; curReqId = -1; curMethod = ""; curStartMs = 0;
+            return;
+        }
         SpiderExec.Resp r = SpiderExec.get().invoke(curMethod, body);
         // §70/§72: 成功/失败耗时 (timeout-kill 路径无此行, 由 control 侧 timeout 日志补)
         long dur = System.currentTimeMillis() - curStartMs;
@@ -140,10 +155,12 @@ public abstract class BaseSpiderWorker extends Service {
     private void startHeartbeat() {
         Thread hb = new Thread(() -> {
             while (running && out != null) {
-                String body = "{\"state\":\"" + state.name() + "\",\"curReqId\":" + curReqId
-                        + ",\"curMethod\":\"" + curMethod + "\",\"curAgeMs\":"
-                        + (curStartMs == 0 ? 0 : System.currentTimeMillis() - curStartMs) + "}";
-                send(Proto.T_HB, 0, body.getBytes(StandardCharsets.UTF_8));
+                if (!hbMuted) {
+                    String body = "{\"state\":\"" + state.name() + "\",\"curReqId\":" + curReqId
+                            + ",\"curMethod\":\"" + curMethod + "\",\"curAgeMs\":"
+                            + (curStartMs == 0 ? 0 : System.currentTimeMillis() - curStartMs) + "}";
+                    send(Proto.T_HB, 0, body.getBytes(StandardCharsets.UTF_8));
+                }
                 try { Thread.sleep(1000); } catch (InterruptedException ignored) { return; }
             }
         }, "WorkerHB-" + role());
