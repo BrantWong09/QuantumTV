@@ -1519,65 +1519,105 @@ pub async fn search(
     Ok(results)
 }
 
-/// 按 site_type 分流获取详情: type=3 走 core spider_detail, type=1 走 CMS HTTP
+/// 详情缓存 (方案 §9: key = source_id + vod_id, TTL 10 分钟; 详情变化频率远低于搜索)。
+/// 播放页挂载/返回再进/播放中 preload 共享同一份, 不再每次打详情接口。
+static DETAIL_CACHE: std::sync::LazyLock<Cache<String, Arc<ApiSearchItem>>> =
+    std::sync::LazyLock::new(|| {
+        Cache::builder()
+            .max_capacity(300)
+            .time_to_live(std::time::Duration::from_secs(600))
+            .build()
+    });
+
+/// Detail 缓存包装: 同 key 并发调用共享一次执行 (兼 SingleFlight), 失败不入缓存
+async fn cached_detail_with<F, Fut>(key: String, fetch: F) -> Result<ApiSearchItem, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<ApiSearchItem, String>>,
+{
+    DETAIL_CACHE
+        .try_get_with(key, async { fetch().await.map(Arc::new) })
+        .await
+        .map(|v| (*v).clone())
+        .map_err(|e| (*e).clone())
+}
+
+/// 按 site_type 分流获取详情: type=3 走 core spider_detail, type=1 走 CMS HTTP。
+/// 经 DETAIL_CACHE (方案 §9/§10): 播放页返回再进/播放中 preload 不重复拉详情。
 async fn fetch_detail_item(
     site: &ApiSite,
     id: &str,
     cache_root: &std::path::Path,
 ) -> Result<ApiSearchItem, String> {
-    if site.site_type.unwrap_or(1) == 3 {
-        let class_name = site.api.strip_prefix("csp_").unwrap_or(&site.api);
-        let item = if quantumtv_core::spider::is_bridge_class(class_name) {
-            // wex Guard 类: 走 Android 桥接
-            let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
-                return Err("桥接未就绪".to_string());
+    let key = format!("detail:{}:{}", site.key, id);
+    // 闭包须 'static: 借用字段全部 clone 进 async move
+    let site_type = site.site_type.unwrap_or(1);
+    let class_owned = site.api.strip_prefix("csp_").unwrap_or(&site.api).to_string();
+    let api_owned = site.api.clone();
+    let spider_owned = site.spider.clone().unwrap_or_default();
+    let source_key = site.key.clone();
+    let id_owned = id.to_string();
+    let cache_root_owned = cache_root.to_path_buf();
+
+    cached_detail_with(key, move || async move {
+        let item = if site_type == 3 {
+            let detail = if quantumtv_core::spider::is_bridge_class(&class_owned) {
+                // wex Guard 类: 走 Android 桥接
+                let Some(bridge_url) = quantumtv_core::bridge::effective_url() else {
+                    return Err("桥接未就绪".to_string());
+                };
+                quantumtv_core::spider::spider_bridge_detail(&class_owned, &id_owned, &bridge_url)
+                    .await?
+            } else {
+                quantumtv_core::spider::spider_detail(
+                    &source_key,
+                    &id_owned,
+                    &class_owned,
+                    &spider_owned,
+                    &cache_root_owned,
+                )
+                .await?
             };
-            quantumtv_core::spider::spider_bridge_detail(class_name, id, &bridge_url).await?
+
+            ApiSearchItem {
+                vod_id: serde_json::Value::String(id_owned),
+                vod_name: detail.vod_name,
+                vod_pic: detail.vod_pic,
+                vod_remarks: detail.vod_remarks,
+                vod_play_url: detail.vod_play_url,
+                vod_play_from: detail.vod_play_from,
+                vod_class: detail.vod_class,
+                vod_year: detail.vod_year,
+                vod_content: detail.vod_content,
+                vod_douban_id: detail.vod_douban_id,
+                type_name: detail.type_name,
+            }
         } else {
-            let spider = site.spider.clone().unwrap_or_default();
-            quantumtv_core::spider::spider_detail(
-                &site.key, id, class_name, &spider, cache_root,
-            )
-            .await?
+            let client = get_video_client();
+            let url = format!("{}?ac=videolist&ids={}", api_owned, id_owned);
+            let resp = timeout(Duration::from_secs(8), client.get(&url).send())
+                .await
+                .map_err(|_| "Failed to fetch detail: timeout".to_string())?
+                .map_err(|e| format!("Failed to fetch detail: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(format!("Failed to fetch detail: {}", resp.status()));
+            }
+            let body = timeout(Duration::from_secs(5), resp.text())
+                .await
+                .map_err(|_| "Failed to read response: timeout".to_string())?
+                .map_err(|e| format!("Failed to read response: {}", e))?;
+            let search_res = serde_json::from_str::<ApiSearchResponse>(&body)
+                .map_err(|e| format!("Parse error: {}, body: {}", e, body))?;
+            search_res
+                .list
+                .into_iter()
+                .next()
+                .ok_or_else(|| "Video not found".to_string())?
         };
-
-        Ok(ApiSearchItem {
-            vod_id: serde_json::Value::String(id.to_string()),
-            vod_name: item.vod_name,
-            vod_pic: item.vod_pic,
-            vod_remarks: item.vod_remarks,
-            vod_play_url: item.vod_play_url,
-            vod_play_from: item.vod_play_from,
-            vod_class: item.vod_class,
-            vod_year: item.vod_year,
-            vod_content: item.vod_content,
-            vod_douban_id: item.vod_douban_id,
-            type_name: item.type_name,
-        })
-    } else {
-        let client = get_video_client();
-        let url = format!("{}?ac=videolist&ids={}", site.api, id);
-        let resp = timeout(Duration::from_secs(8), client.get(&url).send())
-            .await
-            .map_err(|_| "Failed to fetch detail: timeout".to_string())?
-            .map_err(|e| format!("Failed to fetch detail: {}", e))?;
-        if !resp.status().is_success() {
-            return Err(format!("Failed to fetch detail: {}", resp.status()));
-        }
-        let body = timeout(Duration::from_secs(5), resp.text())
-            .await
-            .map_err(|_| "Failed to read response: timeout".to_string())?
-            .map_err(|e| format!("Failed to read response: {}", e))?;
-        let search_res = serde_json::from_str::<ApiSearchResponse>(&body)
-            .map_err(|e| format!("Parse error: {}, body: {}", e, body))?;
-        search_res
-            .list
-            .into_iter()
-            .next()
-            .ok_or_else(|| "Video not found".to_string())
-    }
+        Ok(item)
+    })
+    .await
 }
-
 #[tauri::command]
 pub async fn get_video_detail(
     source: String,
@@ -4181,5 +4221,67 @@ mod home_catalog_tests {
             .await
             .is_err());
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // ---- 详情缓存 (方案 §9) ----
+
+    #[tokio::test]
+    async fn detail_cache_hit_avoids_refetch() {
+        // 方案 §9: 详情 TTL 5~10 分钟; key = source_id + vod_id
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let key = format!("detail:ut:{}:v1", std::process::id());
+        let first = cached_detail_with(key.clone(), {
+            let c = counter.clone();
+            let k = key.clone();
+            move || {
+                let c = c.clone();
+                let k = k.clone();
+                async move {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<ApiSearchItem, String>(ApiSearchItem {
+                        vod_id: Value::String(k),
+                        vod_name: "测试片".into(),
+                        vod_pic: String::new(),
+                        vod_remarks: None,
+                        vod_play_url: Some("第1集$http://x/1.mp4".into()),
+                        vod_play_from: None,
+                        vod_class: None,
+                        vod_year: None,
+                        vod_content: None,
+                        vod_douban_id: None,
+                        type_name: None,
+                    })
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let second = cached_detail_with(key, {
+            let c = counter.clone();
+            move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<ApiSearchItem, String>(ApiSearchItem {
+                        vod_id: Value::String("unreachable".into()),
+                        vod_name: "不应出现".into(),
+                        vod_pic: String::new(),
+                        vod_remarks: None,
+                        vod_play_url: None,
+                        vod_play_from: None,
+                        vod_class: None,
+                        vod_year: None,
+                        vod_content: None,
+                        vod_douban_id: None,
+                        type_name: None,
+                    })
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(first.vod_name, "测试片");
+        assert_eq!(second.vod_name, "测试片"); // 命中缓存, 未执行第二次 fetch
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
