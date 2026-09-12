@@ -3,6 +3,12 @@ param(
     [string]$WorkRoot = "$env:TEMP\spider-bridge"
 )
 $ErrorActionPreference = 'Stop'
+# 构建 JDK 钉死: build-tools 30.0.3 的 d8 在 Java 21+ 下读 MethodParameters 会 NPE,
+# 必须用 JDK 17 编译/运行 d8 与 apksigner。
+$jdk = if ($env:JAVA_HOME -and (Test-Path "$env:JAVA_HOME\bin\javac.exe")) { $env:JAVA_HOME } else { "D:\devtools\jdk17" }
+if (-not (Test-Path "$jdk\bin\javac.exe")) { throw "找不到构建 JDK: $jdk (需要 JDK 17)" }
+$env:JAVA_HOME = $jdk
+$env:Path = "$jdk\bin;$env:Path"
 # 构建参数: -SpiderJar 指向订阅缓存中的 spider.jar (提供 wexshinidie.guard/classes.dex)
 #           -WorkRoot 构建工作目录 (默认 %TEMP%\spider-bridge)
 $root = $WorkRoot
