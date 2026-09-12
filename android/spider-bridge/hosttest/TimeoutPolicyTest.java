@@ -8,6 +8,7 @@ public class TimeoutPolicyTest {
         t(TimeoutPolicy.hardMs("search") == 60_000L, "search 60s phase-A");
         t(TimeoutPolicy.hardMs("detail") == 60_000L, "detail 60s phase-A");
         t(TimeoutPolicy.hardMs("init") == 30_000L, "init 30s phase-A");
+        t(TimeoutPolicy.hardMs("__test_hang") == 10_000L, "test-hang 10s");
         t(TimeoutPolicy.hardMs("unknown") == 60_000L, "default 60s");
         System.out.println("TimeoutPolicyTest OK");
     }

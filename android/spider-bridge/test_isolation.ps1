@@ -1,0 +1,68 @@
+﻿# 隔离验收 (方案 §58/§60/§62/§65): 在 MuMu 上断言 playerContent 永久挂死的爆炸半径。
+# 设备无 curl → 全部 HTTP 从宿主机经 adb forward 打 control 的 8080。
+# 用法: powershell -File android\spider-bridge\test_isolation.ps1 [-Adb <path>]
+param(
+    [string]$Adb = "D:\Program Files\Netease\MuMu\nx_main\adb.exe",
+    [string]$Dev = "emulator-5554"
+)
+$ErrorActionPreference = 'Stop'
+
+function Invoke-Bridge([string]$port, [string]$path, [int]$timeoutSec = 5) {
+    try {
+        return (Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$port$path" `
+            -Method POST -Body '{}' -ContentType 'application/json' -TimeoutSec $timeoutSec).Content
+    } catch {
+        if ($_.Exception.Response) {
+            $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            return $sr.ReadToEnd()
+        }
+        return "HTTP_ERROR: $($_.Exception.Message)"
+    }
+}
+function Assert-Log([string]$pattern, [string]$label) {
+    $hit = & $adb -s $Dev logcat -d | Select-String $pattern | Select-Object -Last 1
+    if (-not $hit) { throw "FAIL[$label]: 未命中 /$pattern/" }
+    Write-Host "PASS[$label]: $($hit.Line.Substring([Math]::Max(0,$hit.Line.Length-90)))"
+}
+function Assert-Match([string]$text, [string]$pattern, [string]$label) {
+    if ($text -notmatch $pattern) { throw "FAIL[$label]: '$text' 未命中 /$pattern/" }
+    Write-Host "PASS[$label]: $pattern"
+}
+
+& $adb -s $Dev install -r "$PSScriptRoot\out\bridge.apk" | Out-Null
+& $adb -s $Dev shell am force-stop com.quantumtv.bridge
+& $adb logcat -c
+& $adb -s $Dev forward tcp:15555 tcp:8080 | Out-Null   # 观察通道 (health)
+& $adb -s $Dev forward tcp:15999 tcp:8080 | Out-Null   # 挂死请求通道 (长超时)
+& $adb -s $Dev shell am start -n com.quantumtv.bridge/.MainActivity | Out-Null
+Start-Sleep 8
+
+Assert-Log "worker=playback .*status=ready" "ready-after-spawn (§22)"
+
+# —— 制造 playback 永久挂死 (§58): 后台长超时请求, 主流程继续观察挂死窗口 ——
+$hangReq = Start-Job -ArgumentList $Dev {
+    param($d)
+    $a = "D:\Program Files\Netease\MuMu\nx_main\adb.exe"
+    & $a -s $d forward tcp:15999 tcp:8080 | Out-Null
+    try {
+        (Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:15999/__test_hang" `
+            -Method POST -Body '{}' -ContentType 'application/json' -TimeoutSec 90).Content
+    } catch { "THREW: $($_.Exception.Message)" }
+}
+Start-Sleep 13   # TEST_HANG 硬超时 10s + kill/restart 余量
+
+# ① §70: 超时 → action=kill
+Assert-Log "worker=playback .*action=kill" "hard timeout kill (§70)"
+# ② §22/§85②: 自动重启 ready
+Assert-Log "worker=playback .*status=ready" "auto restart (§22)"
+# ③ §24/§62/§65: 挂死期间 control HTTP 与 general worker 健在, 桌面 TCP 不断
+$health = Invoke-Bridge 15555 "/health"
+Assert-Match $health '"code":200' "health-decoupled (§24)"
+# ④ §35: 挂死请求有明确回包 worker_killed (而非静默 timeout)
+Wait-Job $hangReq -Timeout 90 | Out-Null
+$resp = (Receive-Job $hangReq | Out-String).Trim()
+Remove-Job $hangReq -Force
+Write-Host "hang response: $resp"
+Assert-Match $resp "worker_killed" "in-flight request answered on kill (§35)"
+
+Write-Host "`nISOLATION TESTS OK"

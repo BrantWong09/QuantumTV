@@ -168,10 +168,27 @@ public class BridgeService extends Service {
         }
     }
 
-    /** 路由分发 (同步阻塞; doDetail/doPlayerContent 由调用方决定是否投递 detailExecutor) */
+    /** 路由分发 (同步阻塞; spider 类请求经 WorkerManager 派发至独立进程) */
     String routeRequest(String method, String path, String body) {
         if ("/health".equals(path)) {
             return json(200, "ok", "{\"initialized\":" + initialized + "}");
+        }
+        if ("/__test_hang".equals(path)) {
+            // 隔离验收钩子 (§58/§60/§62): 仅 debuggable APK; playback worker 永久挂死 →
+            // 由 control watchdog 按硬超时 kill+restart, 本请求收到 worker_killed 明确回包 (§35)
+            if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
+                return json(404, "not_found", null);
+            }
+            final String cls = parseField(body, "class") == null ? "WextestHang" : parseField(body, "class");
+            java.util.concurrent.CompletableFuture<String> f = new java.util.concurrent.CompletableFuture<>();
+            byte[] req;
+            try {
+                req = ("{\"method\":\"__test_hang\",\"class\":\"" + cls + "\"}").getBytes("UTF-8");
+            } catch (Exception e) { return json(500, "enc", null); }
+            workers.dispatch(com.quantumtv.bridge.control.WorkerManager.ROLE_PLAYBACK, "__test_hang", req,
+                    r -> f.complete(json(r.code, r.err, r.data == null ? null : "\"" + r.data + "\"")));
+            try { return f.get(120, java.util.concurrent.TimeUnit.SECONDS); }
+            catch (Exception e) { return json(500, "hang_dispatch_failed", null); }
         }
         if ("/init".equals(path) && "POST".equalsIgnoreCase(method)) return doInit(body);
         if ("/search".equals(path) && "POST".equalsIgnoreCase(method)) return doSearch(body);

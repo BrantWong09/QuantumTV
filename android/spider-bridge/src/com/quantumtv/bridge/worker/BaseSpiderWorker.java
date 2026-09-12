@@ -78,7 +78,51 @@ public abstract class BaseSpiderWorker extends Service {
         return ((b[o] & 255) << 24) | ((b[o + 1] & 255) << 16) | ((b[o + 2] & 255) << 8) | (b[o + 3] & 255);
     }
 
-    protected void onFrame(int reqId, int type, byte[] payload) { }
+    protected void onFrame(int reqId, int type, byte[] payload) {
+        if (type == Proto.T_REQ) {
+            // 单执行线程: 1 process = 1 spider = 1 active call (§29/§55); 上一帧必然已结束
+            exec(reqId, new String(payload, StandardCharsets.UTF_8));
+        } else if (type == Proto.T_HANG) {
+            curReqId = reqId; curMethod = "__test_hang"; curStartMs = System.currentTimeMillis();
+            state = WorkerState.BUSY;
+            Log.w(TAG, role() + " HANG hook: sleeping forever");
+            try { Thread.sleep(Long.MAX_VALUE); } catch (InterruptedException ignored) { }
+        } else if (type == Proto.T_COOKIE) {
+            onCookie(new String(payload, StandardCharsets.UTF_8)); // Task 6
+        }
+    }
+
+    /** REQ 执行 (T6 前占位成功): 真实 spider 调用接管后替换此体。 */
+    private void exec(int reqId, String body) {
+        curReqId = reqId; curStartMs = System.currentTimeMillis(); state = WorkerState.BUSY;
+        curMethod = extract(body, "method");
+        if ("__test_hang".equals(curMethod)) {
+            // 隔离验收 (§58): 模拟 native playerContent 永久挂死——不发 RESP, 等 control kill
+            Log.w(TAG, role() + " HANG hook (REQ " + reqId + "): sleeping forever");
+            try { Thread.sleep(Long.MAX_VALUE); } catch (InterruptedException ignored) { }
+            return;
+        }
+        send(Proto.T_RESP, reqId, respJson(reqId, 200, null, "\"\"").getBytes(StandardCharsets.UTF_8));
+        state = WorkerState.IDLE; curReqId = -1; curMethod = ""; curStartMs = 0;
+    }
+
+    protected void onCookie(String json) { }
+
+    static String respJson(int reqId, int code, String err, String data) {
+        StringBuilder sb = new StringBuilder("{\"reqId\":").append(reqId).append(",\"code\":").append(code);
+        if (err != null) sb.append(",\"err\":\"").append(err.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+        if (data != null) sb.append(",\"data\":").append(data);
+        return sb.append("}").toString();
+    }
+
+    static String extract(String json, String key) {
+        String pat = "\"" + key + "\":\"";
+        int i = json.indexOf(pat);
+        if (i < 0) return "";
+        int s = i + pat.length();
+        int e = json.indexOf('"', s);
+        return e < 0 ? "" : json.substring(s, e);
+    }
 
     private void startHeartbeat() {
         Thread hb = new Thread(() -> {
