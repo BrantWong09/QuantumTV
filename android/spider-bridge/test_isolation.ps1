@@ -7,10 +7,10 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-function Invoke-Bridge([string]$port, [string]$path, [int]$timeoutSec = 5) {
+function Invoke-Bridge([string]$port, [string]$path, [int]$timeoutSec = 5, [string]$Body = '{}') {
     try {
         return (Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$port$path" `
-            -Method POST -Body '{}' -ContentType 'application/json' -TimeoutSec $timeoutSec).Content
+            -Method POST -Body $Body -ContentType 'application/json' -TimeoutSec $timeoutSec).Content
     } catch {
         if ($_.Exception.Response) {
             $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
@@ -66,3 +66,37 @@ Write-Host "hang response: $resp"
 Assert-Match $resp "worker_killed" "in-flight request answered on kill (§35)"
 
 Write-Host "`nISOLATION TESTS OK"
+
+# ================= Phase B: 类级熔断 §61/§41 =================
+# 重启 App 清掉 crash-loop/disabled 状态, 独立验证熔断
+& $adb -s $Dev shell am force-stop com.quantumtv.bridge
+& $adb logcat -c
+& $adb -s $Dev shell am start -n com.quantumtv.bridge/.MainActivity | Out-Null
+Start-Sleep 8
+
+function Wait-PlaybackReady([int]$maxSec = 30) {
+    for ($i = 0; $i -lt $maxSec; $i++) {
+        $h = Invoke-Bridge 15555 "/health" 5
+        if ($h -match '"playback":"ready"') { return }
+        Start-Sleep 1
+    }
+    throw "FAIL: playback 未在 ${maxSec}s 内 ready"
+}
+
+# 3× playerContent 挂死超时 (经 /__test_hang; 每次等 restart 完成再打下一个)
+foreach ($i in 1..3) {
+    Wait-PlaybackReady
+    $r = Invoke-Bridge 15999 "/__test_hang" 60
+    Assert-Match $r "worker_killed" "hang#$i → killed"
+}
+# 第 4 次: 同 class 的 playerContent 必须被类级熔断秒拒 (§41, 不再烧 90s)
+$blocked = Invoke-Bridge 15555 "/playerContent" 5 -Body '{"class":"WextestHang","id":"x"}'
+Assert-Match $blocked "source_circuit_open" "class breaker OPEN (§42)"
+# 其他 class 不受影响 → 走到派发层; playback 因 §40 crash-loop 已 DISABLED (证明熔断是 class 维度而非全局)
+$other = Invoke-Bridge 15555 "/playerContent" 5 -Body '{"class":"Wexother","id":"x"}'
+Assert-Match $other "worker_disabled" "other class NOT circuit-blocked (§41)"
+# health: general 健在 + sources_open 可见
+$health2 = Invoke-Bridge 15555 "/health"
+Assert-Match $health2 '"general":"ready"' "general alive through storm (§61)"
+Assert-Match $health2 'WextestHang' "sources_open in health (§48)"
+Write-Host "BREAKER TESTS OK"

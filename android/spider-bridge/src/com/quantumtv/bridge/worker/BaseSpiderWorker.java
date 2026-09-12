@@ -102,17 +102,34 @@ public abstract class BaseSpiderWorker extends Service {
             try { Thread.sleep(Long.MAX_VALUE); } catch (InterruptedException ignored) { }
             return;
         }
-        send(Proto.T_RESP, reqId, respJson(reqId, 200, null, "\"\"").getBytes(StandardCharsets.UTF_8));
+        send(Proto.T_RESP, reqId, respJson(reqId, 200, null, "").getBytes(StandardCharsets.UTF_8));
         state = WorkerState.IDLE; curReqId = -1; curMethod = ""; curStartMs = 0;
     }
 
     protected void onCookie(String json) { }
 
+    /** data 为原始字符串; 统一 JSON 转义后以字符串字面量嵌入 (与 Control stringField 的 unescape 配对) */
     static String respJson(int reqId, int code, String err, String data) {
         StringBuilder sb = new StringBuilder("{\"reqId\":").append(reqId).append(",\"code\":").append(code);
-        if (err != null) sb.append(",\"err\":\"").append(err.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
-        if (data != null) sb.append(",\"data\":").append(data);
+        if (err != null) sb.append(",\"err\":\"").append(jsonEscape(err)).append("\"");
+        if (data != null) sb.append(",\"data\":\"").append(jsonEscape(data)).append("\"");
         return sb.append("}").toString();
+    }
+
+    static String jsonEscape(String s) {
+        StringBuilder sb = new StringBuilder(s.length() + 16);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"': sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default: sb.append(c);
+            }
+        }
+        return sb.toString();
     }
 
     static String extract(String json, String key) {

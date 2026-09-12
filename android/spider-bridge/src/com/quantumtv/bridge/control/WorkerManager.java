@@ -258,8 +258,23 @@ public final class WorkerManager {
         int i = json.indexOf(pat);
         if (i < 0) return null;
         int s = i + pat.length();
-        int e = json.indexOf('"', s);
-        return e < 0 ? null : json.substring(s, e);
+        StringBuilder sb = new StringBuilder();
+        for (int p = s; p < json.length(); p++) {
+            char c = json.charAt(p);
+            if (c == '"') return sb.toString();
+            if (c == '\\' && p + 1 < json.length()) {
+                char n = json.charAt(++p);
+                switch (n) {
+                    case 'n': sb.append('\n'); break;
+                    case 'r': sb.append('\r'); break;
+                    case 't': sb.append('\t'); break;
+                    default: sb.append(n);
+                }
+                continue;
+            }
+            sb.append(c);
+        }
+        return null; // 未闭合
     }
 
     public WorkerState state(String role) {

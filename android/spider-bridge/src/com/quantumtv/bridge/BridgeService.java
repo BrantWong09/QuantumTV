@@ -36,6 +36,9 @@ public class BridgeService extends Service {
     ExecutorService detailExecutor;
     /** 控制面 Worker 生命周期管理 (T3+): spider 调用派发至独立进程 */
     public com.quantumtv.bridge.control.WorkerManager workers;
+    /** 类级 playerContent 熔断 (§41/§42): 连续 3 次超时 → 30s 内该 class 秒拒 */
+    private final com.quantumtv.bridge.control.SourceBreaker breaker =
+        new com.quantumtv.bridge.control.SourceBreaker(30_000, System::currentTimeMillis);
     private boolean initialized = false;
     /** 站点级 ext 配置, /init 时由桌面端传入; TVBoxOSC 在 getSpider 后调用 spider.init(context, ext) */
     private volatile String extConfig = "";
@@ -171,7 +174,11 @@ public class BridgeService extends Service {
     /** 路由分发 (同步阻塞; spider 类请求经 WorkerManager 派发至独立进程) */
     String routeRequest(String method, String path, String body) {
         if ("/health".equals(path)) {
-            return json(200, "ok", "{\"initialized\":" + initialized + "}");
+            // §24/§48: control 自答, 绝不触碰 spider 执行体; worker 挂死时 bridge 仍 healthy
+            return json(200, "ok", "{\"bridge\":\"healthy\",\"init\":" + initialized
+                    + ",\"workers\":{\"general\":\"" + workerLabel(com.quantumtv.bridge.control.WorkerManager.ROLE_GENERAL)
+                    + "\",\"playback\":\"" + workerLabel(com.quantumtv.bridge.control.WorkerManager.ROLE_PLAYBACK) + "\"}"
+                    + ",\"sources_open\":" + (workers == null ? "{}" : breaker.snapshot()) + "}");
         }
         if ("/__test_hang".equals(path)) {
             // 隔离验收钩子 (§58/§60/§62): 仅 debuggable APK; playback worker 永久挂死 →
@@ -186,18 +193,94 @@ public class BridgeService extends Service {
                 req = ("{\"method\":\"__test_hang\",\"class\":\"" + cls + "\"}").getBytes("UTF-8");
             } catch (Exception e) { return json(500, "enc", null); }
             workers.dispatch(com.quantumtv.bridge.control.WorkerManager.ROLE_PLAYBACK, "__test_hang", req,
-                    r -> f.complete(json(r.code, r.err, r.data == null ? null : "\"" + r.data + "\"")));
+                    r -> {
+                        // 验收钩子等价物: 按 playerContent 记入类级熔断 (§41/§61 全路径验证)
+                        if (r.code == 503 && "worker_killed".equals(r.err)) {
+                            breaker.recordPlayerContentTimeout(cls);
+                        } else if (r.code == 200) {
+                            breaker.recordPlayerContentSuccess(cls);
+                        }
+                        f.complete(json(r.code, r.err, r.data == null ? null : "\"" + esc(r.data) + "\""));
+                    });
             try { return f.get(120, java.util.concurrent.TimeUnit.SECONDS); }
             catch (Exception e) { return json(500, "hang_dispatch_failed", null); }
         }
+        if (isSpiderOp(path) && "POST".equalsIgnoreCase(method)) {
+            return dispatchSpider(path, body);
+        }
         if ("/init".equals(path) && "POST".equalsIgnoreCase(method)) return doInit(body);
-        if ("/search".equals(path) && "POST".equalsIgnoreCase(method)) return doSearch(body);
-        if ("/playerContent".equals(path) && "POST".equalsIgnoreCase(method)) return doPlayerContent(body);
-        if ("/detail".equals(path) && "POST".equalsIgnoreCase(method)) return doDetail(body);
-        if ("/home".equals(path) && "POST".equalsIgnoreCase(method)) return doHome(body);
-        if ("/category".equals(path) && "POST".equalsIgnoreCase(method)) return doCategory(body);
         if ("/setCookie".equals(path) && "POST".equalsIgnoreCase(method)) return doSetCookie(body);
         return json(404, "not_found", null);
+    }
+
+    private static boolean isSpiderOp(String path) {
+        return "/search".equals(path) || "/playerContent".equals(path) || "/detail".equals(path)
+                || "/home".equals(path) || "/category".equals(path);
+    }
+
+    /** spider 调用统一派发 (§15/§16/§44): playerContent→playback worker, 其余→general worker。 */
+    private String dispatchSpider(String path, String body) {
+        final boolean pc = "/playerContent".equals(path);
+        String role = pc ? com.quantumtv.bridge.control.WorkerManager.ROLE_PLAYBACK
+                : com.quantumtv.bridge.control.WorkerManager.ROLE_GENERAL;
+        final String cls = parseField(body, "class");
+        if (cls == null) return json(400, "missing class", null);
+        if (pc && !breaker.allowPlayerContent(cls)) {
+            Log.i(TAG, "source_circuit_open class=" + cls);
+            return json(503, "source_circuit_open", null);
+        }
+        final String m = path.substring(1);
+        java.util.concurrent.CompletableFuture<String> f = new java.util.concurrent.CompletableFuture<>();
+        byte[] req;
+        try {
+            req = ipcReq(m, cls, body).getBytes("UTF-8");
+        } catch (Exception e) { return json(500, "ipc_encode_failed", null); }
+        workers.dispatch(role, m, req, r -> {
+            if (pc) {
+                if (r.code == 503 && "worker_killed".equals(r.err)) breaker.recordPlayerContentTimeout(cls);
+                else if (r.code == 200) breaker.recordPlayerContentSuccess(cls);
+            }
+            f.complete(json(r.code, r.err, r.data == null ? null : "\"" + esc(r.data) + "\""));
+        });
+        try { return f.get(150, java.util.concurrent.TimeUnit.SECONDS); }
+        catch (Exception e) { return json(500, "dispatch_failed", null); }
+    }
+
+    /** 桌面 body → worker REQ 载荷 (§8): 保留原 method 语义的字段映射。 */
+    private static String ipcReq(String m, String cls, String body) {
+        StringBuilder sb = new StringBuilder("{\"method\":\"").append(m)
+                .append("\",\"class\":\"").append(cls).append("\"");
+        String v;
+        if ((v = parseFieldStatic(body, "keyword")) != null) sb.append(",\"keyword\":\"").append(v).append("\"");
+        if ((v = parseFieldStatic(body, "ids")) != null) sb.append(",\"ids\":\"").append(v).append("\"");
+        if ((v = parseFieldStatic(body, "id")) != null) sb.append(",\"id\":\"").append(v).append("\"");
+        if ((v = parseFieldStatic(body, "flag")) != null) sb.append(",\"flag\":\"").append(v).append("\"");
+        if ((v = parseFieldStatic(body, "tid")) != null) sb.append(",\"tid\":\"").append(v).append("\"");
+        if ((v = parseFieldStatic(body, "pg")) != null) sb.append(",\"pg\":\"").append(v).append("\"");
+        return sb.append("}").toString();
+    }
+
+    private static String parseFieldStatic(String body, String key) {
+        String pat = "\"" + key + "\":\"";
+        int i = body.indexOf(pat);
+        if (i < 0) return null;
+        int s = i + pat.length();
+        int e = body.indexOf("\"", s);
+        return e < 0 ? null : body.substring(s, e);
+    }
+
+    /** §48: worker 状态标签 (health 与控制面解耦)。 */
+    private String workerLabel(String role) {
+        if (workers == null) return "starting";
+        com.quantumtv.bridge.ipc.WorkerState s = workers.state(role);
+        switch (s) {
+            case IDLE: case BUSY: return "ready";
+            case STARTING: return "starting";
+            case SUSPECT: case KILLING: case RESTARTING: return "restarting";
+            case DEAD: return "dead";
+            case DISABLED: return "disabled";
+            default: return "unknown";
+        }
     }
 
     private void handle(Socket s) {
