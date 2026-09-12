@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::Emitter;
 
+use quantumtv_core::media::MediaResource;
 use quantumtv_core::playback::manager::PlaybackManager;
 use quantumtv_core::playback::state::{MpvEvent, PlaybackState};
 use quantumtv_core::playback::PlaybackStatus;
@@ -85,6 +86,35 @@ pub fn emit_playback_event(app: &tauri::AppHandle, state: &PlaybackState, ev: &M
         MpvEvent::ProcessDead => {}
         MpvEvent::LoadStarted | MpvEvent::StoppedByUser => {}
     }
+}
+
+// ---------------------------------------------------------------------------
+// Resolve 缓存 + SingleFlight (方案 §12/§13)
+// ---------------------------------------------------------------------------
+
+/// key = resolve:{source}:{vod_id}:{flag}:{episode_id}; TTL 10 分钟(普通 URL 5~30 分钟档)。
+/// moka try_get_with: 同 key 并发调用共享同一 Future — 只执行一次解析 (SingleFlight);
+/// 失败不入缓存 (下次播放自动重试)。临时签名 URL 的 expires_at 细化留待观测后调整。
+static RESOLVE_CACHE: std::sync::LazyLock<moka::future::Cache<String, Arc<MediaResource>>> =
+    std::sync::LazyLock::new(|| {
+        moka::future::Cache::builder()
+            .max_capacity(200)
+            .time_to_live(std::time::Duration::from_secs(600))
+            .build()
+    });
+
+pub(crate) async fn cached_resolve_with<F, Fut>(
+    key: String,
+    fetch: F,
+) -> Result<Arc<MediaResource>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<MediaResource, String>>,
+{
+    RESOLVE_CACHE
+        .try_get_with(key, async { fetch().await.map(Arc::new) })
+        .await
+        .map_err(|e| (*e).clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -295,4 +325,115 @@ fn quantum_core_resolve_input_spider(
     class_name: &str,
 ) -> quantumtv_core::resolver::ResolveInput {
     quantumtv_core::resolver::ResolveInput::spider(source, flag, episode_id, class_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quantumtv_core::media::ResourceType;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn uniq_key(tag: &str) -> String {
+        format!(
+            "resolve:{}:{}:{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[tokio::test]
+    async fn resolve_cache_hit_skips_second_resolve() {
+        // 方案 §12: Resolve 缓存命中不得再触发解析
+        let key = uniq_key("cache");
+        let counter = Arc::new(AtomicU32::new(0));
+        let r1 = cached_resolve_with(key.clone(), {
+            let c = counter.clone();
+            move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, String>(quantumtv_core::media::MediaResource::new(
+                        "ep-1",
+                        "http://example.com/1.m3u8",
+                        ResourceType::Hls,
+                    ))
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let r2 = cached_resolve_with(key, {
+            let c = counter.clone();
+            move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, String>(quantumtv_core::media::MediaResource::new(
+                        "ep-x",
+                        "http://example.com/x.m3u8",
+                        ResourceType::Hls,
+                    ))
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(r1.url, r2.url);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_singleflight_concurrent_callers_share_one_execution() {
+        // 方案 §13/§45: 同一 Episode 并发 5 次 → 实际 Resolve = 1 次
+        let key = uniq_key("flight");
+        let counter = Arc::new(AtomicU32::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let c = counter.clone();
+            let k = key.clone();
+            handles.push(tokio::spawn(async move {
+                cached_resolve_with(k, move || {
+                    let c = c.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        Ok::<_, String>(quantumtv_core::media::MediaResource::new(
+                            "ep-2",
+                            "http://example.com/2.m3u8",
+                            ResourceType::Hls,
+                        ))
+                    }
+                })
+                .await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_error_not_cached() {
+        // 解析失败不入缓存: 下次播放重试
+        let key = uniq_key("err");
+        let counter = Arc::new(AtomicU32::new(0));
+        for _ in 0..2 {
+            let c = counter.clone();
+            let r = cached_resolve_with(key.clone(), move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Err::<quantumtv_core::media::MediaResource, String>("resolve failed".into())
+                }
+            })
+            .await;
+            assert!(r.is_err());
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
 }
