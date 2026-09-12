@@ -109,6 +109,11 @@ public abstract class BaseSpiderWorker extends Service {
             return;
         }
         SpiderExec.Resp r = SpiderExec.get().invoke(curMethod, body);
+        // §70/§72: 成功/失败耗时 (timeout-kill 路径无此行, 由 control 侧 timeout 日志补)
+        long dur = System.currentTimeMillis() - curStartMs;
+        Log.i(TAG, "[SpiderPerf] role=" + role() + " pid=" + android.os.Process.myPid()
+                + " method=" + curMethod + " class=" + com.quantumtv.bridge.ipc.JsonLite.string(body, "class")
+                + " duration=" + dur + "ms status=" + (r.code == 200 ? "ok" : "code" + r.code));
         send(Proto.T_RESP, reqId,
                 respJson(reqId, r.code, r.err, r.data).getBytes(StandardCharsets.UTF_8));
         state = WorkerState.IDLE; curReqId = -1; curMethod = ""; curStartMs = 0;

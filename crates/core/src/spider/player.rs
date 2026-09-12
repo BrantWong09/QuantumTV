@@ -33,6 +33,16 @@ pub(crate) fn classify_spider_error(class_name: &str, flag: &str, err: &str) -> 
             message: "桥接连接已断开, 请确认手机/模拟器桥接在线后重试".into(),
         };
     }
+    // Worker 独立进程故障 (§36): kill/restart/disable/melt-open → "执行环境故障", 不是登录问题
+    if err.contains("worker_killed") || err.contains("worker_restarting")
+        || err.contains("worker_disabled") || err.contains("worker_unavailable")
+        || err.contains("source_circuit_open") || err.contains("bridge_circuit_open")
+    {
+        return ResolveError::NetworkError {
+            source,
+            message: "桥接执行环境故障(正在恢复), 请稍后重试".into(),
+        };
+    }
     if err.contains("InvocationTargetException")
         || err.contains("JSONException")
         || err.contains("bridge error")
@@ -372,5 +382,23 @@ mod hint_tests {
             matches!(e, ResolveError::AuthenticationRequired { .. }),
             "got: {e:?}"
         );
+    }
+
+    #[test]
+    fn worker_family_classifies_as_network_not_auth() {
+        for err in [
+            "bridge error: worker_killed",
+            "bridge error: worker_restarting",
+            "bridge error: worker_disabled",
+            "bridge error: worker_unavailable",
+            "bridge error: source_circuit_open",
+            "bridge error: bridge_circuit_open",
+        ] {
+            let r = classify_spider_error("WexmuouggGuard", "夸克原画", err);
+            assert!(
+                matches!(r, ResolveError::NetworkError { ref message, .. } if !message.contains("需要登录")),
+                "{err} -> {r:?}"
+            );
+        }
     }
 }

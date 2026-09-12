@@ -203,6 +203,7 @@ public class BridgeService extends Service {
             return json(503, "source_circuit_open", null);
         }
         final String m = path.substring(1);
+        final long t0 = System.currentTimeMillis();
         java.util.concurrent.CompletableFuture<String> f = new java.util.concurrent.CompletableFuture<>();
         byte[] req;
         try {
@@ -213,6 +214,10 @@ public class BridgeService extends Service {
                 if (r.code == 503 && "worker_killed".equals(r.err)) breaker.recordPlayerContentTimeout(cls);
                 else if (r.code == 200) breaker.recordPlayerContentSuccess(cls);
             }
+            // §70: 控制面对账 (排队+IPC+执行的总时长; 与 worker 侧差值即调度/IPC 开销)
+            Log.i(TAG, "[SpiderPerf] side=control role=" + role + " method=" + m + " class=" + cls
+                    + " duration=" + (System.currentTimeMillis() - t0) + "ms status="
+                    + (r.code == 200 ? "ok" : String.valueOf(r.err)));
             f.complete(json(r.code, r.err, r.data == null ? null : JsonLite.quote(r.data)));
         });
         try { return f.get(150, java.util.concurrent.TimeUnit.SECONDS); }
