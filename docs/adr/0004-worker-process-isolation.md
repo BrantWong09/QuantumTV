@@ -28,3 +28,4 @@
 2. **watchdog 必须单例**：误建在 per-role 循环内 → 双 watchdog 并发 kill/重复计 death，2 次 hang 即提前熔。
 3. **每个 role 只认最新连接**：worker 重连产生的双 `connectionLoop` 会互相踩 `h.out`，RESP 滞留旧 socket 90s（orphan RESP）→ 已死 worker 被二次误杀。修复：connId 代数守卫 + supersede 旧连接；kill/disconnect 一律 `failAllPending`（§35 完整化）。
 4. **DISABLED 必须有半开自愈**：冷却窗口（默认 60s，`/health` 可见）到期自动重探，否则任何一次误杀都永久砖化本会话。
+5. **进程风暴的爆炸半径不止于本机** (2026-09-13 追加): 验收脚本用生产 wex JAR 的类反复 kill native init，被上游风控判定异常，本出口 IP (`112.10.193.159`) 的播放解析接口被选择性封禁（search/detail 正常，仅 play 返回空 data / `closed`；旧 APK + 全新安装 + cookie 完整下稳定复现）。以后隔离压测必须用不触网、不被真 JAR 风控的测试类（如 `Wextest*`），或完全断网/独立 IP 的模拟器实例。
