@@ -12,8 +12,10 @@ pub const SUPPORTED: &[&str] = &["quark", "uc", "baidu"];
 pub(crate) mod baidu;
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-const QUARK_CLIENT_UA: &str =
+pub(crate) const QUARK_CLIENT_UA: &str =
     "quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4 Safari/537.36 Channel/pckk_other_ch";
+/// 浏览器 UA (供 clouddrive provider 复用)
+pub(crate) const BROWSER_UA: &str = UA;
 
 /// 换 cookie 阶段可能 302, 必须禁跟随才能读到首响 Set-Cookie
 pub(super) fn http() -> Result<reqwest::Client, String> {
@@ -206,7 +208,12 @@ async fn start_cas(drive: &str, client_id: &str) -> Result<QrSession, String> {
 /// cas token → 扫码二维码内容
 pub(crate) fn cas_qr_content(drive: &str, token: &str, client_id: &str) -> String {
     if drive == "quark" {
-        format!("https://su.quark.cn/4_eMHBJ?token={token}&client_id={client_id}&ssb=weblogin")
+        // 参数须与实测可用实现 (xiaoya quark_cookie.py) 逐字节一致: 缺 uc_biz_str 时
+        // 夸克 App 不启用 weblogin 深链, 跟随短链 302 后 token 被丢弃 → 手机端永远
+        // 显示"登录请求已过期" (2026-09-13 真机回归教训)
+        format!(
+            "https://su.quark.cn/4_eMHBJ?token={token}&client_id={client_id}&ssb=weblogin&uc_param_str=&uc_biz_str=S%3Acustom%7COPT%3ASAREA%400%7COPT%3AIMMERSIVE%401%7COPT%3ABACK_BTN_STYLE%400"
+        )
     } else {
         format!(
             "https://su.uc.cn/1_n0ZCv?uc_param_str=dsdnfrpfbivesscpgimibtbmnijblauputogpintnwktprchmt&token={token}&client_id={client_id}&uc_biz_str=S%3Acustom%7CC%3Atitlebar_fix"
@@ -305,6 +312,11 @@ mod tests {
         let quark = cas_qr_content("quark", "tk", "532");
         assert!(quark.starts_with("https://su.quark.cn/4_eMHBJ?"), "{quark}");
         assert!(quark.contains("client_id=532"));
+        // 回归 (2026-09-13): 缺 uc_biz_str/uc_param_str 时夸克 App 走普通 302,
+        // Location 丢 token → 手机端永远"登录请求已过期"
+        assert!(quark.contains("ssb=weblogin"), "{quark}");
+        assert!(quark.contains("&uc_param_str=&"), "{quark}");
+        assert!(quark.contains("uc_biz_str=S%3Acustom%7COPT%3ASAREA%400"), "{quark}");
         let uc = cas_qr_content("uc", "tk", "381");
         assert!(uc.starts_with("https://su.uc.cn/1_n0ZCv?"), "{uc}");
         assert!(uc.contains("client_id=381"));

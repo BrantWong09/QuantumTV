@@ -1,6 +1,7 @@
 pub mod analytics;
 pub mod bangumi;
 pub mod bridge;
+pub mod cloud_drive;
 pub mod config;
 pub mod content_analyzer;
 pub mod data_fusion;

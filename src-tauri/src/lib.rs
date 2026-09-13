@@ -113,6 +113,18 @@ pub fn run() {
             let conn = db_init::init_db(app.handle());
             let shared_conn = std::sync::Arc::new(std::sync::Mutex::new(conn));
 
+            // 网盘 Provider 层 (ADR 0005): 凭证加密存储 + 认证状态 + 桥接推送编排
+            if let Some(dir) = app.path().app_data_dir().ok() {
+                match commands::cloud_drive::init_state(&dir, shared_conn.clone()) {
+                    Ok(state) => {
+                        app.manage(state);
+                    }
+                    Err(e) => {
+                        log::warn!("[CloudAuth] 初始化失败: {e}");
+                    }
+                }
+            }
+
             let db = db_client::Db::from_shared(shared_conn.clone());
             if let Err(error) =
                 commands::config::initialize_source_storage(&app.state::<StorageManager>(), &db)
@@ -203,10 +215,13 @@ pub fn run() {
             commands::bridge::save_bridge_config,
             commands::bridge::get_bridge_status,
             commands::bridge::retry_bridge,
-            // 网盘账号 (夸克/UC/百度桌面扫码; 其余登录在桥接 APK 内完成)
+            // 网盘账号 (夸克/UC/百度桌面扫码 CloudDriveProvider 层; 其余登录在桥接 APK 内完成)
             commands::netdisk::netdisk_launch_login,
-            commands::netdisk::cloud_login_start,
-            commands::netdisk::cloud_login_poll,
+            commands::cloud_drive::cloud_login_start,
+            commands::cloud_drive::cloud_login_poll,
+            commands::cloud_drive::cloud_login_states,
+            commands::cloud_drive::cloud_login_logout,
+            commands::cloud_drive::cloud_login_test,
             // V2 Phase 4: playback_* 命令族 (mpv_embed_* 兼容命令已在 Phase 6 删除)
             commands::playback::playback_play,
             commands::playback::playback_play_episode,

@@ -21,6 +21,8 @@ rusqlite = { workspace = true }
 image = { workspace = true }
 moka = { workspace = true }
 log = "0.4"
+# 网盘凭证 AES-256-GCM 加密 (已在依赖闭包内, 经 rustls 引入; 不新增外部解析风险)
+ring = "0.17"
 
 [dev-dependencies]
 reqwest = { workspace = true }

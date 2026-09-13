@@ -117,6 +117,45 @@ where
         .map_err(|e| (*e).clone())
 }
 
+/// Gateway 刷新通道 (方案 §25/§26/§27): 播放地址过期/401/403 时,
+/// 按集数定位重新 playerContent 一次并顶掉缓存条目。严禁触发 Search (§45):
+/// 这里只走 SpiderResolver (playerContent 单集解析), 不经过任何 search/detail。
+struct SpiderEpisodeRefresher {
+    resolve_key: String,
+    source: String,
+    flag: String,
+    episode_id: String,
+    class: String,
+}
+
+#[async_trait::async_trait]
+impl quantumtv_core::gateway::SessionRefresher for SpiderEpisodeRefresher {
+    async fn refresh(&self) -> Result<MediaResource, String> {
+        log::info!(
+            "[播放编排] provider 刷新: source={} episode_id={}",
+            self.source,
+            quantumtv_core::spider::trunc(&self.episode_id, 60)
+        );
+        let bridge_url =
+            quantumtv_core::bridge::effective_url().ok_or_else(|| "桥接未就绪".to_string())?;
+        let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
+            quantumtv_core::spider::BridgeSpiderPlayFetcher { bridge_url },
+        ));
+        let fresh = manager
+            .resolve(&quantumtv_core::resolver::ResolveInput::spider(
+                &self.source,
+                &self.flag,
+                &self.episode_id,
+                &self.class,
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        // 顶掉过期缓存条目, 后续播放用新直链
+        RESOLVE_CACHE.invalidate(&self.resolve_key).await;
+        Ok(fresh)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tauri 命令 (新 playback_* 接口)
 // ---------------------------------------------------------------------------
@@ -257,7 +296,12 @@ pub async fn playback_play_episode(
     let class_c = site.api.strip_prefix("csp_").unwrap_or(&site.api).to_string();
     let site_type_c = site_type;
     let resolve_key = format!("resolve:{}:{}:{}:{}", source_c, vod_c, flag_c, ep_c);
-    let resource = cached_resolve_with(resolve_key, move || async move {
+    // refresher 与闭包分持有副本 (闭包会 move 掉 *_c)
+    let source_r = source.clone();
+    let flag_r = flag.clone();
+    let ep_r = episode_id.clone();
+    let class_r = class_c.clone();
+    let resource = cached_resolve_with(resolve_key.clone(), move || async move {
         if site_type_c == 3 {
             let manager = quantumtv_core::resolver::ResolverManager::with_defaults(Arc::new(
                 quantumtv_core::spider::BridgeSpiderPlayFetcher {
@@ -293,7 +337,31 @@ pub async fn playback_play_episode(
 
     // proxy_required 资源经 PlaybackGateway 包装 (opaque token, 隐藏直链+带请求头)
     if resource.proxy_required {
-        match quantumtv_core::gateway::wrap_resource(&resource).await {
+        let wrap = if site_type == 3 {
+            // 网盘直链: session 挂刷新通道, 上游 401/403/410 或到期 → 重新
+            // playerContent 一次 (§26/§27: 只重解析, 严禁 Search)
+            let provider =
+                quantumtv_core::clouddrive::types::detect_provider(&class_r, &flag_r)
+                    .map(|p| p.as_str().to_string());
+            let refresher: Arc<dyn quantumtv_core::gateway::SessionRefresher> = Arc::new(
+                SpiderEpisodeRefresher {
+                    resolve_key: resolve_key.clone(),
+                    source: source_r,
+                    flag: flag_r,
+                    episode_id: ep_r,
+                    class: class_r,
+                },
+            );
+            quantumtv_core::gateway::wrap_resource_with(
+                &resource,
+                provider.as_deref(),
+                Some(refresher),
+            )
+            .await
+        } else {
+            quantumtv_core::gateway::wrap_resource(&resource).await
+        };
+        match wrap {
             Ok(url) => resource.url = url,
             Err(e) => {
                 log::warn!(

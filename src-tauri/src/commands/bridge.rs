@@ -158,5 +158,8 @@ pub async fn startup_ensure(handle: tauri::AppHandle) {
     };
     if let Err(e) = quantumtv_core::bridge::ensure_ready_with(cfg).await {
         log::warn!("[桥接] 后台拉起失败: {}", e);
+        return;
     }
+    // 桥接就绪 → 网盘凭证恢复重推 (ADR 0005 场景 A: 重启免扫码)
+    crate::commands::cloud_drive::spawn_restore(&handle);
 }

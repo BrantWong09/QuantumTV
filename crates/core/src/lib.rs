@@ -1,6 +1,7 @@
 pub mod admin_config;
 pub mod adult;
 pub mod bridge;
+pub mod clouddrive;
 pub mod gateway;
 pub mod media;
 pub mod media_filter;

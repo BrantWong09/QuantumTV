@@ -3205,6 +3205,7 @@ dependencies = [
 name = "quantumtv"
 version = "0.9.0"
 dependencies = [
+ "async-trait",
  "env_logger",
  "image",
  "log",
@@ -3240,6 +3241,7 @@ dependencies = [
  "moka",
  "regex",
  "reqwest",
+ "ring",
  "rusqlite",
  "scraper",
  "serde",

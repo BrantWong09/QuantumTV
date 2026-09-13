@@ -112,8 +112,11 @@ async fn accept_loop(listener: TcpListener) {
                 tokio::spawn(handle_conn(stream));
             }
             Err(e) => {
-                log::warn!("[网盘代理] accept 失败: {e}");
-                break;
+                // 瞬时 accept 错误 (Windows WSAECONNABORTED/WSAEMFILE) 在播放器
+                // 试探连接/快速关闭时是常态, 绝不能 break —— 那会让网关监听永久
+                // 死亡, 所有网盘播放集体卡死 (2026-09-13 真机回归教训)。退避后继续。
+                log::warn!("[网盘代理] accept 瞬时错误 (忽略重试): {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
     }
